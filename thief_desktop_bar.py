@@ -716,7 +716,8 @@ class ThiefDesktopBar:
         self.context_menu.add_separator()
 
         # 5. 系统控制与设置
-        self.context_menu.add_command(label="🕶️ 一键老板键 (Esc)", command=self._cmd(self.toggle_boss))
+        boss_label = "🕶️ 退出老板键伪装 (Esc)" if self.is_boss_key else "🕶️ 一键老板键 (Esc)"
+        self.context_menu.add_command(label=boss_label, command=self._cmd(self.toggle_boss))
         self.context_menu.add_command(label="⚙️ 白名单/黑名单设置...", command=self._cmd(self.open_settings_dialog))
         self.context_menu.add_separator()
         self.context_menu.add_command(label="✕ 退出摸鱼状态栏", command=self._cmd(self.root.quit))
@@ -924,7 +925,8 @@ class ThiefDesktopBar:
             self._on_drag_release(event)
             return
         if not getattr(self, '_has_dragged', False):
-            self.action_next()
+            if not self.is_boss_key:
+                self.action_next()
         self._has_dragged = False
 
     def set_window_width(self, w):
@@ -1071,6 +1073,8 @@ class ThiefDesktopBar:
         ).pack(side=tk.RIGHT)
 
     def _on_mousewheel(self, event):
+        if self.is_boss_key:
+            return
         if event.delta < 0:
             self.action_next()
         else:
@@ -1078,7 +1082,6 @@ class ThiefDesktopBar:
 
     def action_next(self):
         if self.is_boss_key:
-            self.toggle_boss(False)
             return
         # 若当前长句还有未显示完全的顺延子行，先在当前单行条中显示下一行
         if hasattr(self, '_sub_chunks') and self._sub_chunk_idx < len(self._sub_chunks) - 1:
@@ -1092,7 +1095,6 @@ class ThiefDesktopBar:
 
     def action_prev(self):
         if self.is_boss_key:
-            self.toggle_boss(False)
             return
         # 若处于当前长句的后续顺延子行，倒退回上一行显示
         if hasattr(self, '_sub_chunks') and self._sub_chunk_idx > 0:

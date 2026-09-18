@@ -627,7 +627,6 @@
   // ------------------------------------------------------------------------------------
   function nextSentence() {
     if (STATE.isBossKey) {
-      toggleBossKey(false);
       return;
     }
 
@@ -647,7 +646,6 @@
 
   function prevSentence() {
     if (STATE.isBossKey) {
-      toggleBossKey(false);
       return;
     }
 
