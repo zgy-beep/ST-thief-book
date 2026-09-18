@@ -24,7 +24,7 @@
   const DEFAULT_TAG_BLACKLIST = [
     'think', 'thought', 'cot', 'scratchpad', 'reasoning', 'analysis', 'plan',
     'internal_monologue', 'system_note', 'thought_process', 'thinking', 'status',
-    'bbi_image', 'fox_hugou', 'fox_selc', 'fox_tip', 'so_seq', 'details'
+    'bbi_image', 'fox_hugou', 'fox_selc', 'fox_tip', 'fox_input', 'think_fox~', 'so_seq', 'details', 'system'
   ];
 
   // 默认白名单容器标签预设 (用于提取包裹在特定标签内的正文，如 <content>、<output>、<response>、<dialogue>)
@@ -108,7 +108,8 @@
           const cleanedBlacklist = saved.tagBlacklist
             .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
             .filter(Boolean);
-          CONFIG.tagBlacklist = cleanedBlacklist.length > 0 ? cleanedBlacklist : [...DEFAULT_TAG_BLACKLIST];
+          const merged = Array.from(new Set([...DEFAULT_TAG_BLACKLIST, ...cleanedBlacklist]));
+          CONFIG.tagBlacklist = merged;
         }
         if (Array.isArray(saved.tagWhitelist)) {
           CONFIG.tagWhitelist = saved.tagWhitelist;
@@ -210,8 +211,18 @@
       try {
         const doc = new DOMParser().parseFromString(text, 'text/html');
         doc.querySelectorAll('style, script, svg, img, video, audio, noscript, iframe, link, meta').forEach(el => el.remove());
-        doc.querySelectorAll('.mes_reasoning, .reasoning_block, .thinking, .thinking-block, details').forEach(el => el.remove());
+        doc.querySelectorAll('.mes_reasoning, .reasoning_block, .thinking, .thinking-block, details, think, thought, reasoning, status').forEach(el => el.remove());
         doc.querySelectorAll('.avatar, .avatar-container, .mes_button_menu, .badge, .extra-badges').forEach(el => el.remove());
+
+        if (Array.isArray(CONFIG.tagBlacklist) && CONFIG.tagBlacklist.length > 0) {
+          const validSelectors = CONFIG.tagBlacklist
+            .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+            .filter(t => /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(t))
+            .join(',');
+          if (validSelectors) {
+            try { doc.querySelectorAll(validSelectors).forEach(el => el.remove()); } catch (e) {}
+          }
+        }
 
         const domText = doc.body.innerText || doc.body.textContent || '';
         if (domText && domText.trim()) {
@@ -288,9 +299,11 @@
       // 闭合中括号标签: [tag ...]...[/tag]
       text = text.replace(new RegExp('\\[\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\][\\s\\S]*?\\[\\/\\s*' + escaped + '\\s*\\]', 'gi'), '');
 
-      // 冒号或指令型单标签 (常见于用户输入 [system: ...] 或 [system：...] 或 <system: ...>)
+      // 冒号或指令型单标签 (常见于用户输入 [system: ...] 或 [system：...] 或 <system: ...> 或 (system: ...) 或 {system: ...})
       text = text.replace(new RegExp('\\[\\s*' + escaped + '\\s*[:：][^\\]]*\\]', 'gi'), '');
       text = text.replace(new RegExp('<\\s*' + escaped + '\\s*[:：][^>]*>', 'gi'), '');
+      text = text.replace(new RegExp('\\(\\s*' + escaped + '\\s*[:：][^\\)]*\\)', 'gi'), '');
+      text = text.replace(new RegExp('\\{\\s*' + escaped + '\\s*[:：][^\\}]*\\}', 'gi'), '');
 
       // 流式未闭合标签: <tag ...>...$ 或 [tag ...]...$
       text = text.replace(new RegExp('<\\s*' + escaped + '(?:[\\s:][^>]*)?>[\\s\\S]*$', 'gi'), '');
@@ -330,11 +343,27 @@
           if ($mes && $mes.length > 0) {
             const $clone = $mes.clone();
             $clone.find('.mes_reasoning, .reasoning_block, .thinking, .thinking-block, details, script, style, .st-hidden, .mes_button_menu').remove();
+            if (Array.isArray(CONFIG.tagBlacklist) && CONFIG.tagBlacklist.length > 0) {
+              const validSelectors = CONFIG.tagBlacklist
+                .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+                .filter(t => /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(t))
+                .join(',');
+              if (validSelectors) {
+                try { $clone.find(validSelectors).remove(); } catch (e) {}
+              }
+            }
             const rendered = $clone.html();
             if (rendered && rendered.trim()) {
               result = cleanHtmlAndStyles(processWhitelistAndBlacklist(rendered));
             }
           }
+        } catch (e) {}
+      }
+
+      if (!result && typeof formatAsDisplayedMessage === 'function' && typeof messageId === 'number' && messageId >= 0) {
+        try {
+          const formatted = formatAsDisplayedMessage(text, { message_id: messageId });
+          result = cleanHtmlAndStyles(processWhitelistAndBlacklist(formatted));
         } catch (e) {}
       }
 
@@ -458,6 +487,7 @@
       if (!messages || messages.length === 0) return;
 
       const latest = messages[0];
+      const isNewFloor = STATE.currentMsgId !== targetId;
       STATE.cachedMessage = latest;
       STATE.currentMsgId = targetId;
 
@@ -469,12 +499,14 @@
         rawText = latest.swipes[latest.swipe_id] || rawText;
       }
 
-      const cleanText = filterThinkingAndTags(rawText, latest.message_id);
+      const cleanText = filterThinkingAndTags(rawText, targetId);
       const newSentences = splitIntoSentences(cleanText);
       STATE.sentences = newSentences;
 
       if (forceJumpToEnd) {
         STATE.currentSentenceIndex = Math.max(0, newSentences.length - 1);
+      } else if (isNewFloor) {
+        STATE.currentSentenceIndex = 0;
       } else if (STATE.currentSentenceIndex >= newSentences.length) {
         STATE.currentSentenceIndex = 0;
       }
@@ -522,7 +554,7 @@
         rawText = msg.swipes[msg.swipe_id] || rawText;
       }
 
-      const cleanText = filterThinkingAndTags(rawText, msg.message_id);
+      const cleanText = filterThinkingAndTags(rawText, targetId);
       STATE.sentences = splitIntoSentences(cleanText);
       STATE.currentSentenceIndex = delta < 0 ? Math.max(0, STATE.sentences.length - 1) : 0;
 
@@ -557,7 +589,7 @@
         rawText = msg.swipes[msg.swipe_id] || rawText;
       }
 
-      const cleanText = filterThinkingAndTags(rawText, msg.message_id);
+      const cleanText = filterThinkingAndTags(rawText, targetId);
       STATE.sentences = splitIntoSentences(cleanText);
       STATE.currentSentenceIndex = 0;
       STATE.isFloorPickerOpen = false;
@@ -744,8 +776,13 @@
       }
     } catch (err) {
       console.error('[ST-Thief-Book] 发送消息失败:', err);
-      STATE.isGenerating = false;
       flashStatusHint('发送失败: ' + (err.message || '未知错误'));
+    } finally {
+      STATE.isGenerating = false;
+      refreshLatestMessage(false);
+      setTimeout(() => refreshLatestMessage(false), 300);
+      setTimeout(() => refreshLatestMessage(false), 800);
+      setTimeout(() => refreshLatestMessage(false), 1500);
     }
   }
 
@@ -760,8 +797,12 @@
       }
     } catch (e) {
       console.error('[ST-Thief-Book] Swipe 失败:', e);
+    } finally {
       STATE.isGenerating = false;
-      renderThiefBar();
+      refreshLatestMessage(false);
+      setTimeout(() => refreshLatestMessage(false), 300);
+      setTimeout(() => refreshLatestMessage(false), 800);
+      setTimeout(() => refreshLatestMessage(false), 1500);
     }
   }
 
@@ -2547,6 +2588,19 @@
         refreshLatestMessage(false);
       });
 
+      if (tavern_events.CHARACTER_MESSAGE_RENDERED) {
+        eventOn(tavern_events.CHARACTER_MESSAGE_RENDERED, () => {
+          STATE.isGenerating = false;
+          refreshLatestMessage(false);
+        });
+      }
+
+      if (tavern_events.USER_MESSAGE_RENDERED) {
+        eventOn(tavern_events.USER_MESSAGE_RENDERED, () => {
+          refreshLatestMessage(false);
+        });
+      }
+
       if (tavern_events.MESSAGE_SWIPED) {
         eventOn(tavern_events.MESSAGE_SWIPED, () => {
           refreshLatestMessage(false);
@@ -2560,6 +2614,7 @@
             if (lastId >= 0) {
               const msgs = getChatMessages(lastId);
               if (msgs && msgs[0]) {
+                STATE.currentMsgId = lastId;
                 const raw = msgs[0].message || '';
                 const clean = filterThinkingAndTags(raw, lastId);
                 if (!clean) {

@@ -1,16 +1,15 @@
 {
-  "barWidth": 860,
-  "alpha": 0.95,
+  "barWidth": 458,
+  "alpha": 0.3,
   "theme": "vscode-dark",
   "minimalMode": false,
   "layoutMode": "double",
-  "charNameMode": "compact",
+  "charNameMode": "hidden",
   "wrapMode": "wrap",
-  "showUserMessages": false,
+  "showUserMessages": true,
   "enableWhitelist": true,
   "tagWhitelist": [
     "content",
-    "output",
     "response",
     "dialogue",
     "story",
@@ -22,6 +21,9 @@
   ],
   "tagBlacklist": [
     "think",
+    "think_fox~",
+    "fox_input",
+    "bbi_image",
     "thought",
     "cot",
     "scratchpad",
@@ -38,7 +40,8 @@
     "fox_selc",
     "fox_tip",
     "so_seq",
-    "details"
+    "details",
+    "system"
   ],
   "filterActions": false,
   "filterMode": "pure"
