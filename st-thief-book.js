@@ -40,6 +40,8 @@
     layoutMode: 'double',
     // 文本过滤模式: 'pure' (纯净模式：绝不引入美化HTML，剥离思考块与标签) | 'regex' (正则清洗模式)
     filterMode: 'pure',
+    // 是否显示用户输入消息 (默认 false：摸鱼只看AI/小说回复，自动跳过用户消息；设为 true 则允许显示和阅读用户消息)
+    showUserMessages: false,
     // 是否启用白名单提取模式：若开启且消息中存在白名单标签，则提取白名单内容并在其中剔除黑名单；若未找到则自动安全降级读取全文
     enableWhitelist: true,
     // 白名单容器列表 (若文本中有这些标签，只提取其中的正文)
@@ -99,11 +101,13 @@
       const raw = localStorage.getItem('ST_THIEF_CONFIG_V3') || localStorage.getItem('ST_THIEF_CONFIG_V2');
       if (raw) {
         const saved = JSON.parse(raw);
+        if (typeof saved.showUserMessages === 'boolean') {
+          CONFIG.showUserMessages = saved.showUserMessages;
+        }
         if (Array.isArray(saved.tagBlacklist)) {
-          // 自动剔除可能误伤正文的 card, action, panel, box, state, details 等项
-          const cleanedBlacklist = saved.tagBlacklist.filter(
-            t => !['card', 'panel', 'box', 'action', 'state', 'system', 'details', 'extra', 'var'].includes(String(t).toLowerCase())
-          );
+          const cleanedBlacklist = saved.tagBlacklist
+            .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+            .filter(Boolean);
           CONFIG.tagBlacklist = cleanedBlacklist.length > 0 ? cleanedBlacklist : [...DEFAULT_TAG_BLACKLIST];
         }
         if (Array.isArray(saved.tagWhitelist)) {
@@ -152,6 +156,7 @@
   function saveCurrentConfig() {
     try {
       const data = {
+        showUserMessages: CONFIG.showUserMessages,
         enableWhitelist: CONFIG.enableWhitelist,
         tagWhitelist: CONFIG.tagWhitelist,
         tagBlacklist: CONFIG.tagBlacklist,
@@ -179,6 +184,17 @@
   // ------------------------------------------------------------------------------------
   // 白名单提取与黑名单剥离引擎 (在白名单内剔除黑名单)
   // ------------------------------------------------------------------------------------
+  function preDecodeEntities(str) {
+    if (!str || typeof str !== 'string') return '';
+    return str
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/gi, "'")
+      .replace(/&apos;/gi, "'")
+      .replace(/&amp;/gi, '&');
+  }
+
   function cleanHtmlAndStyles(html) {
     if (!html || typeof html !== 'string') return '';
     let text = html;
@@ -207,14 +223,7 @@
     }
 
     // 3. 解码常见 HTML 实体
-    text = text
-      .replace(/&nbsp;/gi, ' ')
-      .replace(/&quot;/gi, '"')
-      .replace(/&amp;/gi, '&')
-      .replace(/&lt;/gi, '<')
-      .replace(/&gt;/gi, '>')
-      .replace(/&#39;/gi, "'")
-      .replace(/&apos;/gi, "'");
+    text = preDecodeEntities(text);
 
     // 4. 剥离残留的任意尖括号标签（替换为空格，保留标签内文字，绝不删字！）
     text = text.replace(/<[^>]+>/g, ' ');
@@ -225,9 +234,10 @@
     return text.replace(/[ \t\r]+/g, ' ').replace(/\n\s*\n/g, '\n').trim();
   }
 
-  function processWhitelistAndBlacklist(content) {
+  function processWhitelistAndBlacklist(content, forceDisableWhitelist = false) {
     if (!content || typeof content !== 'string') return '';
-    let text = content;
+    // 关键：预先解码 HTML 实体，避免 &lt;tag&gt; 绕过黑名单！
+    let text = preDecodeEntities(content);
 
     // 1. 预先清除样式、脚本与 HTML 注释
     text = text.replace(/<style[\s\S]*?<\/style>/gi, '');
@@ -237,7 +247,7 @@
 
     // 2. 白名单容器正文提取 (Whitelist Extraction)
     // 若开启白名单模式，且在消息中找到了匹配的白名单标签，则优先提取其内部正文
-    if (CONFIG.enableWhitelist && Array.isArray(CONFIG.tagWhitelist) && CONFIG.tagWhitelist.length > 0) {
+    if (!forceDisableWhitelist && CONFIG.enableWhitelist && Array.isArray(CONFIG.tagWhitelist) && CONFIG.tagWhitelist.length > 0) {
       const extracted = [];
       for (const rawTag of CONFIG.tagWhitelist) {
         const t = String(rawTag).trim().replace(/^[<\[]+|[>\]]+$/g, '');
@@ -245,14 +255,14 @@
         const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
         // 匹配闭合 XML 标签: <wtag>...</wtag>
-        const xmlRegex = new RegExp('<' + escaped + '(?:\s[^>]*)?>([\\s\\S]*?)<\\/' + escaped + '\\s*>', 'gi');
+        const xmlRegex = new RegExp('<\\s*' + escaped + '(?:[\\s:][^>]*)?>([\\s\\S]*?)<\\/\\s*' + escaped + '\\s*>', 'gi');
         let m;
         while ((m = xmlRegex.exec(text)) !== null) {
           if (m[1] && m[1].trim()) extracted.push(m[1].trim());
         }
 
         // 匹配中括号标签: [wtag]...[/wtag]
-        const bracketRegex = new RegExp('\\[' + escaped + '(?:\s[^\\]]*)?\\]([\\s\\S]*?)\\[\\/' + escaped + '\\s*\\]', 'gi');
+        const bracketRegex = new RegExp('\\[\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\]([\\s\\S]*?)\\[\\/\\s*' + escaped + '\\s*\\]', 'gi');
         while ((m = bracketRegex.exec(text)) !== null) {
           if (m[1] && m[1].trim()) extracted.push(m[1].trim());
         }
@@ -273,18 +283,22 @@
       const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
       // 闭合 XML 标签: <tag ...>...</tag> (连同内部思考细节整体彻底删除)
-      text = text.replace(new RegExp('<' + escaped + '(?:\s[^>]*)?>[\\s\\S]*?<\\/' + escaped + '\\s*>', 'gi'), '');
+      text = text.replace(new RegExp('<\\s*' + escaped + '(?:[\\s:][^>]*)?>[\\s\\S]*?<\\/\\s*' + escaped + '\\s*>', 'gi'), '');
 
       // 闭合中括号标签: [tag ...]...[/tag]
-      text = text.replace(new RegExp('\\[' + escaped + '(?:\s[^\\]]*)?\\][\\s\\S]*?\\[\\/' + escaped + '\\s*\\]', 'gi'), '');
+      text = text.replace(new RegExp('\\[\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\][\\s\\S]*?\\[\\/\\s*' + escaped + '\\s*\\]', 'gi'), '');
 
-      // 流式未闭合标签: <tag ...>...$ (AI 正在流式生成思考阶段，整块拦截屏蔽)
-      text = text.replace(new RegExp('<' + escaped + '(?:\s[^>]*)?>[\\s\\S]*$', 'gi'), '');
-      text = text.replace(new RegExp('\\[' + escaped + '(?:\s[^\\]]*)?\\][\\s\\S]*$', 'gi'), '');
+      // 冒号或指令型单标签 (常见于用户输入 [system: ...] 或 [system：...] 或 <system: ...>)
+      text = text.replace(new RegExp('\\[\\s*' + escaped + '\\s*[:：][^\\]]*\\]', 'gi'), '');
+      text = text.replace(new RegExp('<\\s*' + escaped + '\\s*[:：][^>]*>', 'gi'), '');
+
+      // 流式未闭合标签: <tag ...>...$ 或 [tag ...]...$
+      text = text.replace(new RegExp('<\\s*' + escaped + '(?:[\\s:][^>]*)?>[\\s\\S]*$', 'gi'), '');
+      text = text.replace(new RegExp('\\[\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\][\\s\\S]*$', 'gi'), '');
 
       // 游离闭合或单标签
-      text = text.replace(new RegExp('<\\/?' + escaped + '(?:\s[^>]*)?>', 'gi'), '');
-      text = text.replace(new RegExp('\\[\\/?' + escaped + '(?:\s[^\\]]*)?\\]', 'gi'), '');
+      text = text.replace(new RegExp('<\\/?\\s*' + escaped + '(?:[\\s:][^>]*)?>', 'gi'), '');
+      text = text.replace(new RegExp('\\[\\/?\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\]', 'gi'), '');
     }
 
     // 剥离 Markdown 思考代码块 ```thought ... ```
@@ -336,9 +350,10 @@
       }
     }
 
-    // 4. 终极安全保底：若过滤后变为空白，但原始消息本来有字，执行宽容保底，绝不显示空白！
+    // 4. 终极安全保底：若过滤后变为空白，但原始消息本来有字，执行宽容保底
+    // 注意：保底也必须严格遵守黑名单，绝不能无视黑名单复活被剔除的黑名单文本！
     if (!result && rawText.trim()) {
-      let safeFallback = rawText.replace(/<think(?:\s[^>]*)?>[\s\S]*?<\/think\s*>/gi, '');
+      let safeFallback = processWhitelistAndBlacklist(rawText, true);
       safeFallback = cleanHtmlAndStyles(safeFallback);
       if (safeFallback) {
         return safeFallback;
@@ -425,12 +440,26 @@
       const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : -1;
       if (lastId < 0) return;
 
-      const messages = getChatMessages(lastId, { include_swipes: true });
+      let targetId = lastId;
+      if (!CONFIG.showUserMessages) {
+        // 从最新一条消息向前寻找最近一条非用户消息 (AI/小说楼层)
+        while (targetId >= 0) {
+          const msgs = getChatMessages(targetId, { include_swipes: true });
+          if (msgs && msgs[0] && !msgs[0].is_user && msgs[0].role !== 'user') {
+            break;
+          }
+          targetId--;
+        }
+        // 如果未找到任何 AI 消息（例如纯新会话只有用户第一句输入），安全回退到 lastId
+        if (targetId < 0) targetId = lastId;
+      }
+
+      const messages = getChatMessages(targetId, { include_swipes: true });
       if (!messages || messages.length === 0) return;
 
       const latest = messages[0];
       STATE.cachedMessage = latest;
-      STATE.currentMsgId = latest.message_id;
+      STATE.currentMsgId = targetId;
 
       STATE.characterName = latest.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
       STATE.userName = typeof SillyTavern !== 'undefined' ? SillyTavern.name1 : 'User';
@@ -464,6 +493,20 @@
       if (targetId < 0) targetId = 0;
       if (targetId > lastId) targetId = lastId;
 
+      if (!CONFIG.showUserMessages) {
+        while (targetId >= 0 && targetId <= lastId) {
+          const checkMsgs = getChatMessages(targetId, { include_swipes: true });
+          if (checkMsgs && checkMsgs[0] && !checkMsgs[0].is_user && checkMsgs[0].role !== 'user') {
+            break;
+          }
+          targetId += (delta >= 0 ? 1 : -1);
+        }
+        if (targetId < 0 || targetId > lastId) {
+          flashStatusHint(delta > 0 ? '已是最新 AI 回复' : '已是最前 AI 回复');
+          return;
+        }
+      }
+
       if (targetId === STATE.currentMsgId) return;
 
       const msgs = getChatMessages(targetId, { include_swipes: true });
@@ -472,7 +515,7 @@
       const msg = msgs[0];
       STATE.cachedMessage = msg;
       STATE.currentMsgId = targetId;
-      STATE.characterName = msg.name || 'AI';
+      STATE.characterName = msg.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
 
       let rawText = msg.message || '';
       if (msg.swipes && msg.swipes.length > 0 && typeof msg.swipe_id === 'number') {
@@ -606,6 +649,15 @@
       } catch (e) {}
     }
     renderThiefBar();
+    syncToDesktop();
+  }
+
+  function toggleShowUserMessages() {
+    STATE.isContextMenuOpen = false;
+    CONFIG.showUserMessages = !CONFIG.showUserMessages;
+    saveCurrentConfig();
+    flashStatusHint(CONFIG.showUserMessages ? '已开启显示用户消息' : '已隐藏用户消息 (仅阅读AI与小说)');
+    refreshLatestMessage(false);
     syncToDesktop();
   }
 
@@ -1648,6 +1700,10 @@
                   <span>✨ 极简模式 (纯文字+背景，完全符合参考图)</span>
                 </label>
                 <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
+                  <input type="checkbox" id="setting-show-user-messages" ${CONFIG.showUserMessages ? 'checked' : ''} />
+                  <span>💬 显示用户消息 (默认关闭，仅阅读AI/小说回复)</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
                   <input type="checkbox" id="setting-filter-actions" ${CONFIG.filterActions ? 'checked' : ''} />
                   <span>过滤动作描写 (*xxx*)</span>
                 </label>
@@ -1720,6 +1776,10 @@
           </div>
           ` : ''}
           <div class="tb-menu-separator"></div>
+          <div class="tb-menu-item" id="menu-toggle-user-messages">
+            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">💬</span><span>用户消息: ${CONFIG.showUserMessages ? '✓ 允许显示' : '已过滤隐藏'}</span></div>
+            <span class="tb-menu-tag">点击切换</span>
+          </div>
           <div class="tb-menu-item" id="menu-toggle-char">
             <div class="tb-menu-item-left"><span class="tb-menu-item-icon">👤</span><span>角色名: ${CONFIG.charNameMode === 'compact' ? '精简胶囊' : (CONFIG.charNameMode === 'hidden' ? '完全隐藏' : '完整展示')}</span></div>
             <span class="tb-menu-tag">点击切换</span>
@@ -1790,6 +1850,7 @@
     // 右键上下文菜单项事件绑定
     if (STATE.isContextMenuOpen) {
       doc.getElementById('menu-toggle-minimal')?.addEventListener('click', () => { closeContextMenu(); toggleMinimalMode(); });
+      doc.getElementById('menu-toggle-user-messages')?.addEventListener('click', () => { closeContextMenu(); toggleShowUserMessages(); });
       doc.getElementById('menu-prev')?.addEventListener('click', () => { closeContextMenu(); prevSentence(); });
       doc.getElementById('menu-next')?.addEventListener('click', () => { closeContextMenu(); nextSentence(); });
       doc.getElementById('menu-floor-prev')?.addEventListener('click', () => { closeContextMenu(); changeMessageFloor(-1); });
@@ -1933,6 +1994,8 @@
         if (wrapMode) wrapMode.value = 'wrap';
         const minMode = doc.getElementById('setting-minimal-mode');
         if (minMode) minMode.checked = false;
+        const userMsg = doc.getElementById('setting-show-user-messages');
+        if (userMsg) userMsg.checked = false;
         const actions = doc.getElementById('setting-filter-actions');
         if (actions) actions.checked = false;
         const blur = doc.getElementById('setting-hover-blur');
@@ -1950,6 +2013,7 @@
         const charMode = doc.getElementById('setting-charmode');
         const wrapMode = doc.getElementById('setting-wrapmode');
         const minMode = doc.getElementById('setting-minimal-mode');
+        const userMsg = doc.getElementById('setting-show-user-messages');
         const actions = doc.getElementById('setting-filter-actions');
         const blur = doc.getElementById('setting-hover-blur');
         const mode = doc.getElementById('setting-filtermode');
@@ -1959,6 +2023,7 @@
         if (charMode) CONFIG.charNameMode = charMode.value;
         if (wrapMode) CONFIG.wrapMode = wrapMode.value;
         if (minMode) CONFIG.minimalMode = minMode.checked;
+        if (userMsg) CONFIG.showUserMessages = userMsg.checked;
         if (barW) {
           const w = parseInt(barW.value, 10);
           if (!isNaN(w) && w >= 360 && w <= 2560) {
@@ -2358,6 +2423,7 @@
           else if (data.action === 'open_settings') openSettingsModal();
           else if (data.action === 'jump_floor') jumpToMessageFloor(data.floor);
           else if (data.action === 'change_floor') changeMessageFloor(data.delta || 1);
+          else if (data.action === 'toggle_user_messages') toggleShowUserMessages();
           else if (data.action === 'toggle_char_mode') toggleCharNameMode();
           else if (data.action === 'toggle_wrap_mode') toggleWrapMode();
           else if (data.action === 'toggle_minimal_mode') toggleMinimalMode(data.minimalMode);
@@ -2372,6 +2438,7 @@
             }
           }
           else if (data.action === 'update_config' && data.config) {
+            if (typeof data.config.showUserMessages === 'boolean') CONFIG.showUserMessages = data.config.showUserMessages;
             if (typeof data.config.enableWhitelist === 'boolean') CONFIG.enableWhitelist = data.config.enableWhitelist;
             if (Array.isArray(data.config.tagWhitelist)) CONFIG.tagWhitelist = data.config.tagWhitelist;
             if (Array.isArray(data.config.tagBlacklist)) CONFIG.tagBlacklist = data.config.tagBlacklist;
@@ -2418,6 +2485,7 @@
         isGenerating: STATE.isGenerating,
         barWidth: CONFIG.barWidth,
         config: {
+          showUserMessages: CONFIG.showUserMessages,
           enableWhitelist: CONFIG.enableWhitelist,
           tagWhitelist: CONFIG.tagWhitelist,
           tagBlacklist: CONFIG.tagBlacklist,
@@ -2540,6 +2608,7 @@
     toggleFilter: toggleFilterMode,
     toggleFloorPicker: toggleFloorPicker,
     jumpFloor: jumpToMessageFloor,
+    toggleUserMessages: toggleShowUserMessages,
     toggleCharMode: toggleCharNameMode,
     toggleWrap: toggleWrapMode,
     toggleMinimal: toggleMinimalMode,

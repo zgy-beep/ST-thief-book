@@ -6,6 +6,7 @@
   "layoutMode": "double",
   "charNameMode": "compact",
   "wrapMode": "wrap",
+  "showUserMessages": false,
   "enableWhitelist": true,
   "tagWhitelist": [
     "content",

@@ -255,6 +255,7 @@ class ThiefDesktopBar:
                 'internal_monologue', 'system_note', 'thought_process', 'thinking',
                 'status', 'bbi_image', 'fox_hugou', 'fox_selc', 'fox_tip', 'so_seq', 'details'
             ],
+            'showUserMessages': False,
             'filterActions': False,
             'filterMode': 'pure'
         }
@@ -309,7 +310,7 @@ class ThiefDesktopBar:
                             self.theme_name = saved['theme']
                             self.theme = self.THEMES[self.theme_name]
                         for k in ['minimalMode', 'layoutMode', 'charNameMode', 'wrapMode',
-                                  'enableWhitelist', 'tagWhitelist', 'tagBlacklist',
+                                  'showUserMessages', 'enableWhitelist', 'tagWhitelist', 'tagBlacklist',
                                   'filterActions', 'filterMode']:
                             if k in saved:
                                 self.config[k] = saved[k]
@@ -326,6 +327,7 @@ class ThiefDesktopBar:
                 'layoutMode': self.config.get('layoutMode', 'double'),
                 'charNameMode': self.config.get('charNameMode', 'compact'),
                 'wrapMode': self.config.get('wrapMode', 'wrap'),
+                'showUserMessages': self.config.get('showUserMessages', False),
                 'enableWhitelist': self.config.get('enableWhitelist', True),
                 'tagWhitelist': self.config.get('tagWhitelist', []),
                 'tagBlacklist': self.config.get('tagBlacklist', []),
@@ -710,6 +712,10 @@ class ThiefDesktopBar:
         opacity_menu.add_separator()
         opacity_menu.add_command(label="✏️ 滑块精确微调透明度...", command=self._cmd(self.open_custom_opacity_dialog))
         self.context_menu.add_cascade(label=f"🌓 窗口透明度 ({cur_pct}%)", menu=opacity_menu)
+
+        show_user = self.config.get('showUserMessages', False)
+        user_lbl = "💬 用户消息: ✓ 显示中" if show_user else "💬 用户消息: 隐藏 (仅看AI)"
+        self.context_menu.add_command(label=user_lbl, command=self._cmd(self.toggle_show_user_messages))
 
         self.context_menu.add_command(label="🎨 切换主题 (Alt+T)", command=self._cmd(self.toggle_theme))
 
@@ -1149,6 +1155,21 @@ class ThiefDesktopBar:
         self.server.broadcast({'action': 'toggle_wrap_mode'})
         self._update_display()
 
+    def toggle_show_user_messages(self):
+        if self.is_boss_key:
+            return
+        cur = self.config.get('showUserMessages', False)
+        self.config['showUserMessages'] = not cur
+        self._save_config()
+        self.server.broadcast({
+            'action': 'update_config',
+            'config': {
+                'showUserMessages': self.config['showUserMessages']
+            }
+        })
+        hint = "已开启显示用户消息" if self.config['showUserMessages'] else "已隐藏用户消息 (仅阅读AI与小说)"
+        self.flash_hint(hint)
+
     def open_floor_jump_dialog(self):
         if self.is_boss_key:
             return
@@ -1476,6 +1497,10 @@ class ThiefDesktopBar:
         chk_act = tk.Checkbutton(opt_frame, text="过滤动作描写 (*xxx*)", variable=var_act, bg="#1e1e1e", fg="#cccccc", selectcolor="#252526", activebackground="#1e1e1e", activeforeground="#ffffff")
         chk_act.pack(side=tk.LEFT, padx=4)
 
+        var_user = tk.BooleanVar(value=bool(self.config.get('showUserMessages', False)))
+        chk_user = tk.Checkbutton(opt_frame, text="显示用户消息 (默认关闭，仅阅读AI/小说回复)", variable=var_user, bg="#1e1e1e", fg="#cccccc", selectcolor="#252526", activebackground="#1e1e1e", activeforeground="#ffffff")
+        chk_user.pack(side=tk.LEFT, padx=12)
+
         # 底部操作按钮
         btn_frame = tk.Frame(win, bg="#1e1e1e")
         btn_frame.pack(fill=tk.X, padx=14, pady=(10, 14))
@@ -1497,6 +1522,7 @@ class ThiefDesktopBar:
                 'status', 'bbi_image', 'fox_hugou', 'fox_selc', 'fox_tip', 'so_seq', 'details'
             ]))
             var_act.set(False)
+            var_user.set(False)
 
         btn_reset = tk.Button(btn_frame, text="恢复默认预设", command=reset_defaults, bg="#333333", fg="#cccccc", bd=0, padx=8, pady=4, cursor="hand2")
         btn_reset.pack(side=tk.LEFT)
@@ -1515,6 +1541,7 @@ class ThiefDesktopBar:
             self.config['tagWhitelist'] = wl_tags
             self.config['tagBlacklist'] = bl_tags
             self.config['filterActions'] = var_act.get()
+            self.config['showUserMessages'] = var_user.get()
 
             self._apply_layout_and_mode()
             self._update_display()
