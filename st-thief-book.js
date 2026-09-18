@@ -357,8 +357,11 @@
     let content = text.trim();
     if (!content) return ['(无对白内容)'];
 
+    // 根据当前窗口宽度动态评估单行最大字数容纳量 (约每字15px)
+    const lineCapChars = Math.max(18, Math.min(60, Math.floor(((CONFIG.barWidth || 840) - 180) / 16)));
+
     // 句子切分：支持在强句末标点（。！？!?；…\n）切分；
-    // 当单句较长（>=24字）遇到逗号、顿号、破折号时，也允许自然切分成小短句阅读，防止一整大段塞在单行直接跳段
+    // 当单句较长遇到逗号、顿号、破折号时，自然切分成单行小短句，超长文字顺延在下一行显示，绝不向下撑高窗口
     const rawSegments = content.split(/([。！？!?；…\n]+["”』」]?|[，,、—~～]+)/g);
     const result = [];
     let currentSentence = '';
@@ -374,20 +377,41 @@
       const curLen = currentSentence.trim().length;
 
       const shouldBreakHard = isHardPunct && curLen >= CONFIG.minSentenceLen;
-      const shouldBreakSoft = isSoftPunct && curLen >= 24;
-      const isOverMax = curLen >= CONFIG.maxSentenceLen;
+      const shouldBreakSoft = isSoftPunct && curLen >= Math.max(16, lineCapChars - 10);
+      const isOverMax = curLen >= lineCapChars;
 
       if (shouldBreakHard || shouldBreakSoft || isOverMax || i === rawSegments.length - 1) {
-        const clean = currentSentence.replace(/\r?\n+/g, ' ').trim();
+        let clean = currentSentence.replace(/\r?\n+/g, ' ').trim();
         if (clean) {
-          result.push(clean);
+          // 若单句依然超长，进一步切成单行顺延显示，绝不裁剪丢字
+          while (clean.length > lineCapChars) {
+            let splitPos = lineCapChars;
+            const lookback = Math.max(10, splitPos - 8);
+            for (let p = splitPos; p >= lookback; p--) {
+              if (/[，,、 ；;。！？!?—~～…]/.test(clean[p - 1])) {
+                splitPos = p;
+                break;
+              }
+            }
+            const chunk = clean.slice(0, splitPos).trim();
+            if (chunk) result.push(chunk);
+            clean = clean.slice(splitPos).trim();
+          }
+          if (clean) {
+            result.push(clean);
+          }
         }
         currentSentence = '';
       }
     }
 
     if (currentSentence.trim()) {
-      result.push(currentSentence.replace(/\r?\n+/g, ' ').trim());
+      let clean = currentSentence.replace(/\r?\n+/g, ' ').trim();
+      while (clean.length > lineCapChars) {
+        result.push(clean.slice(0, lineCapChars).trim());
+        clean = clean.slice(lineCapChars).trim();
+      }
+      if (clean) result.push(clean);
     }
 
     return result.length > 0 ? result : [content];
@@ -972,14 +996,14 @@
       font-size: 12.5px;
       letter-spacing: 0.2px;
       line-height: 1.4;
-      word-break: break-word;
-      word-wrap: break-word;
-      white-space: normal;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: clip;
       transition: filter 0.2s, opacity 0.15s;
     }
     .tb-sentence-text.nowrap {
       overflow: hidden;
-      text-overflow: ellipsis;
+      text-overflow: clip;
       white-space: nowrap;
     }
     body.theme-vscode-blue .tb-sentence-text { color: #ffffff; }

@@ -239,6 +239,8 @@ class ThiefDesktopBar:
         self.floor = 0
         self.is_boss_key = False
         self.is_generating = False
+        self._sub_chunks = []
+        self._sub_chunk_idx = 0
         self.config = {
             'charNameMode': 'compact',
             'wrapMode': 'wrap',
@@ -473,14 +475,14 @@ class ThiefDesktopBar:
 
             if is_single:
                 self.row2.pack_forget()
-                target_h = 30
+                self.height = 30
             else:
                 self.row2.pack(side=tk.BOTTOM, fill=tk.X)
                 self.lbl_prefix.pack_forget()
                 self.btn_send.pack_forget()
                 self.entry_reply.pack_forget()
                 self.entry_reply.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10), pady=(0, 4))
-                target_h = 56
+                self.height = 56
         else:
             # 标准 VS Code 模式
             self.center_frame.pack_forget()
@@ -497,7 +499,7 @@ class ThiefDesktopBar:
 
             if is_single:
                 self.row2.pack_forget()
-                target_h = 36
+                self.height = 36
             else:
                 self.row2.pack(side=tk.BOTTOM, fill=tk.X)
                 self.lbl_prefix.pack_forget()
@@ -506,9 +508,63 @@ class ThiefDesktopBar:
                 self.entry_reply.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6), pady=4)
                 self.btn_send.pack_forget()
                 self.btn_send.pack(side=tk.RIGHT, padx=(0, 8))
-                target_h = 68
+                self.height = 68
 
         self._update_geometry_and_wrap()
+
+    def _paginate_sentence(self, text, max_px_width):
+        """
+        单行顺延切片引擎：
+        在高度固定、单行不折行的前提下，将超过当前单行可视像素宽度的文字切分成子行，
+        在阅读翻句（'下一行'）时无缝逐段显示，绝不裁剪丢字，绝不扩展高度。
+        """
+        if not text:
+            return [""]
+        if max_px_width <= 80:
+            max_px_width = 80
+
+        # 若整句像素小于等于单行可用宽度，直接单行完整显示
+        if self.font_main.measure(text) <= max_px_width:
+            return [text]
+
+        lines = []
+        remaining = text
+        break_puncts = set("，,、 ；;。！？!?—~～…\n")
+
+        while remaining:
+            if self.font_main.measure(remaining) <= max_px_width:
+                lines.append(remaining)
+                break
+
+            # 二分查找当前单行可用像素内最多能容纳的字符数
+            low = 1
+            high = len(remaining)
+            best = 1
+            while low <= high:
+                mid = (low + high) // 2
+                if self.font_main.measure(remaining[:mid]) <= max_px_width:
+                    best = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+
+            # 优先在末尾附近的标点符号处断开，使阅读体验更自然
+            break_pos = best
+            lookback_limit = max(1, best - 8)
+            for pos in range(best, lookback_limit - 1, -1):
+                if remaining[pos - 1] in break_puncts:
+                    break_pos = pos
+                    break
+
+            chunk = remaining[:break_pos].strip()
+            if not chunk:
+                chunk = remaining[:best]
+                break_pos = best
+
+            lines.append(chunk)
+            remaining = remaining[break_pos:].strip()
+
+        return lines if lines else [text]
 
     def _update_geometry_and_wrap(self, override_x=None, override_y=None):
         if not hasattr(self, 'lbl_text') or not self.lbl_text.winfo_exists():
@@ -516,57 +572,21 @@ class ThiefDesktopBar:
 
         is_min = self.config.get('minimalMode', False)
         is_single = self.config.get('layoutMode', 'double') == 'single'
-        is_wrap = self.config.get('wrapMode', 'wrap') == 'wrap'
 
-        # 1. 动态计算文字区域可用宽度
+        # 高度恒定不变：严禁向下撑大窗口
         if is_min:
-            avail_w = max(120, self.width - 24)
+            self.height = 30 if is_single else 56
         else:
-            char_mode = self.config.get('charNameMode', 'compact')
-            char_w = 0 if char_mode == 'hidden' else (
-                self.lbl_char.winfo_reqwidth() if self.lbl_char.winfo_reqwidth() > 0 else 65
-            )
-            # 左侧导航(~140px) + 右侧徽章菜单(~80px) + 角色名 + 间距边距
-            avail_w = max(120, self.width - 240 - char_w)
+            self.height = 36 if is_single else 68
 
-        if is_wrap:
-            self.lbl_text.configure(wraplength=avail_w)
-        else:
-            self.lbl_text.configure(wraplength=0)
+        # 严格保持单行，不显示在第二行
+        self.lbl_text.configure(wraplength=0)
 
-        self.root.update_idletasks()
-        text_req_h = self.lbl_text.winfo_reqheight()
-
-        # 2. 动态自适应窗口高度，多行换行时向下撑开，绝不截断丢字
-        if is_min:
-            if is_single:
-                target_h = max(30, text_req_h + 8)
-            else:
-                target_h = max(56, text_req_h + 8 + 26)
-        else:
-            if is_single:
-                target_h = max(36, text_req_h + 12)
-            else:
-                target_h = max(68, text_req_h + 12 + 32)
-
-        # 3. 屏幕边界保护与窗口定位
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
+        # 保持当前绝对坐标（支持多显示器、副屏负坐标与超宽坐标，绝不发生跨屏漂移）
         cur_x = override_x if override_x is not None else self.root.winfo_x()
         cur_y = override_y if override_y is not None else self.root.winfo_y()
 
-        if cur_x + self.width > screen_w:
-            cur_x = max(0, screen_w - self.width)
-        if cur_x < 0:
-            cur_x = 0
-
-        if cur_y + target_h > screen_h - 25:
-            cur_y = max(0, screen_h - target_h - 40)
-        if cur_y < 0:
-            cur_y = 0
-
-        self.height = target_h
-        self.root.geometry(f"{self.width}x{target_h}+{cur_x}+{cur_y}")
+        self.root.geometry(f"{self.width}x{self.height}+{cur_x}+{cur_y}")
 
     def _on_text_configure(self, event):
         pass
@@ -865,20 +885,20 @@ class ThiefDesktopBar:
         if event.widget == getattr(self, 'entry_reply', None):
             return
         if getattr(self, '_is_resizing', False):
-            screen_w = self.root.winfo_screenwidth()
             if self._resize_mode == 'right':
                 delta = event.x_root - self._resize_start_x
-                new_w = max(360, min(screen_w - 20, self._resize_start_w + delta))
+                new_w = max(360, min(3840, self._resize_start_w + delta))
                 if new_w != self.width:
                     self.width = new_w
-                    self._update_geometry_and_wrap()
+                    self._update_display()
             elif self._resize_mode == 'left':
                 delta = event.x_root - self._resize_start_x
-                new_w = max(360, min(screen_w - 20, self._resize_start_w - delta))
+                new_w = max(360, min(3840, self._resize_start_w - delta))
                 new_x = self._resize_start_win_x + (self._resize_start_w - new_w)
                 if new_w != self.width or new_x != self.root.winfo_x():
                     self.width = new_w
                     self._update_geometry_and_wrap(override_x=new_x)
+                    self._update_display()
             return
 
         dx = abs(event.x_root - getattr(self, '_drag_start_x', event.x_root))
@@ -908,9 +928,8 @@ class ThiefDesktopBar:
         self._has_dragged = False
 
     def set_window_width(self, w):
-        screen_w = self.root.winfo_screenwidth()
-        self.width = max(360, min(screen_w - 20, int(w)))
-        self._update_geometry_and_wrap()
+        self.width = max(360, min(3840, int(w)))
+        self._update_display()
         self._save_config()
         self.server.broadcast({
             'action': 'set_window_width',
@@ -934,8 +953,7 @@ class ThiefDesktopBar:
             other_w = 320 + char_w
             min_limit = 520
 
-        screen_w = self.root.winfo_screenwidth()
-        max_limit = min(1360, screen_w - 60)
+        max_limit = 2560
 
         # 理想单行容纳长度
         ideal_w = text_w + other_w
@@ -967,9 +985,8 @@ class ThiefDesktopBar:
         )
         lbl_title.pack(anchor="w", padx=14, pady=(12, 6))
 
-        screen_w = self.root.winfo_screenwidth()
         scale = tk.Scale(
-            win, from_=360, to=min(1800, screen_w - 40), orient=tk.HORIZONTAL,
+            win, from_=360, to=2560, orient=tk.HORIZONTAL,
             bg="#1e1e1e", fg="#cccccc", activebackground="#0e639c",
             highlightthickness=0, troughcolor="#2b2b2b", bd=0,
             command=lambda val: [
@@ -1063,12 +1080,28 @@ class ThiefDesktopBar:
         if self.is_boss_key:
             self.toggle_boss(False)
             return
+        # 若当前长句还有未显示完全的顺延子行，先在当前单行条中显示下一行
+        if hasattr(self, '_sub_chunks') and self._sub_chunk_idx < len(self._sub_chunks) - 1:
+            self._sub_chunk_idx += 1
+            self._update_display()
+            return
+
+        # 当前句所有顺延行已读完，向酒馆请求下一句
+        self._sub_chunk_idx = 0
         self.server.broadcast({'action': 'next'})
 
     def action_prev(self):
         if self.is_boss_key:
             self.toggle_boss(False)
             return
+        # 若处于当前长句的后续顺延子行，倒退回上一行显示
+        if hasattr(self, '_sub_chunks') and self._sub_chunk_idx > 0:
+            self._sub_chunk_idx -= 1
+            self._update_display()
+            return
+
+        # 已处于当前句第一行，倒退回上一句
+        self._sub_chunk_idx = 0
         self.server.broadcast({'action': 'prev'})
 
     def action_floor_prev(self):
@@ -1524,12 +1557,17 @@ class ThiefDesktopBar:
                 return
 
             if data.get('type') == 'sync':
+                new_sentence = data.get('currentSentence', '')
+                new_floor = data.get('floor', 0)
+                new_cur = data.get('curIdx', 1)
+                if new_sentence != self.current_sentence or new_floor != self.floor or new_cur != self.cur_idx:
+                    self._sub_chunk_idx = 0
                 self.char_name = data.get('charName', 'AI')
                 self.user_name = data.get('userName', 'User')
-                self.floor = data.get('floor', 0)
-                self.cur_idx = data.get('curIdx', 1)
+                self.floor = new_floor
+                self.cur_idx = new_cur
                 self.total_sentences = data.get('totalSentences', 1)
-                self.current_sentence = data.get('currentSentence', '')
+                self.current_sentence = new_sentence
                 self.is_boss_key = data.get('isBossKey', False)
                 self.is_generating = data.get('isGenerating', False)
                 if 'barWidth' in data and isinstance(data['barWidth'], (int, float)):
@@ -1597,10 +1635,36 @@ class ThiefDesktopBar:
                     bg="#1e2e28" if self.theme_name == 'vscode-dark' else "#005a94"
                 )
 
-        self.lbl_text.configure(text=self.current_sentence, justify=tk.LEFT)
-        self.lbl_right_info.configure(
-            text=f"{self.cur_idx}/{self.total_sentences}"
-        )
+        # 1. 计算文字可视区域可用像素宽度
+        if is_min:
+            avail_w = max(120, self.width - 24)
+        else:
+            char_mode = self.config.get('charNameMode', 'compact')
+            char_w = 0 if char_mode == 'hidden' else (
+                self.lbl_char.winfo_reqwidth() if self.lbl_char.winfo_reqwidth() > 0 else 65
+            )
+            avail_w = max(120, self.width - 240 - char_w)
+
+        # 2. 单行顺延分页（长句不裁剪，在下一行显示，高度严格恒定）
+        self._sub_chunks = self._paginate_sentence(self.current_sentence, avail_w)
+        if self._sub_chunk_idx >= len(self._sub_chunks):
+            self._sub_chunk_idx = max(0, len(self._sub_chunks) - 1)
+        elif self._sub_chunk_idx < 0:
+            self._sub_chunk_idx = 0
+
+        display_text = self._sub_chunks[self._sub_chunk_idx] if self._sub_chunks else self.current_sentence
+        self.lbl_text.configure(text=display_text, wraplength=0, justify=tk.LEFT)
+
+        # 3. 进度指示：若当前句分多行顺延显示，展示 (当前行/总行)
+        if len(self._sub_chunks) > 1:
+            self.lbl_right_info.configure(
+                text=f"{self.cur_idx}/{self.total_sentences} ({self._sub_chunk_idx + 1}/{len(self._sub_chunks)})"
+            )
+        else:
+            self.lbl_right_info.configure(
+                text=f"{self.cur_idx}/{self.total_sentences}"
+            )
+
         self.lbl_prefix.configure(text=" >")
         self._update_geometry_and_wrap()
 
