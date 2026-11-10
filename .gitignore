@@ -4,5 +4,8 @@ __pycache__/
 .vscode/
 .idea/
 *.log
+*.tmp
+thief_bar.pid
+thief_bar_bridge.token
 
 楼层示例.txt

@@ -32,26 +32,67 @@ import select
 import struct
 import base64
 import hashlib
+import hmac
+import ipaddress
+import secrets
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
+from urllib.parse import urlparse
 
 WS_HOST = '127.0.0.1'
 WS_PORT = 18899
 MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+WS_MAX_PAYLOAD = 1024 * 1024
+WS_HANDSHAKE_LIMIT = 8192
+PID_FILENAME = 'thief_bar.pid'
 
 # ------------------------------------------------------------------------------------
 # 零依赖轻量 RFC 6455 WebSocket 服务端实现
 # ------------------------------------------------------------------------------------
 class SimpleWebSocketServer:
-    def __init__(self, host, port, on_message_callback):
+    def __init__(self, host, port, on_message_callback, token=''):
         self.host = host
         self.port = port
         self.on_message = on_message_callback
-        self.clients = set()
+        self.token = token
+        self.clients = {}  # sock -> 是否已通过 hello 认证
         self.server_sock = None
         self.running = False
         self.lock = threading.Lock()
+
+    @staticmethod
+    def _origin_allowed(origin):
+        # 浏览器 WS 不受 CORS 约束，必须自行挡掉公网页面；本地/私网/null(沙箱 iframe) 放行后再由 token 认证把关
+        if not origin or origin == 'null':
+            return True
+        try:
+            host = urlparse(origin).hostname
+        except Exception:
+            return False
+        if not host:
+            return False
+        if host == 'localhost':
+            return True
+        try:
+            return ipaddress.ip_address(host).is_private
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _encode_text_frame(text):
+        payload = text.encode('utf-8')
+        length = len(payload)
+        if length <= 125:
+            header = bytes([0x81, length])
+        elif length <= 65535:
+            header = struct.pack(">BBH", 0x81, 126, length)
+        else:
+            header = struct.pack(">BBQ", 0x81, 127, length)
+        return header + payload
+
+    def _send_json(self, sock, data_dict):
+        sock.sendall(self._encode_text_frame(json.dumps(data_dict, ensure_ascii=False)))
 
     def start(self):
         self.running = True
@@ -80,13 +121,17 @@ class SimpleWebSocketServer:
                 break
 
     def _handle_client(self, sock):
+        authenticated = False
         try:
+            sock.settimeout(5)
             req = b""
             while b"\r\n\r\n" not in req:
                 chunk = sock.recv(1024)
                 if not chunk:
                     return
                 req += chunk
+                if len(req) > WS_HANDSHAKE_LIMIT:
+                    return
 
             headers = {}
             lines = req.decode('utf-8', errors='ignore').split("\r\n")
@@ -94,6 +139,10 @@ class SimpleWebSocketServer:
                 if ":" in line:
                     k, v = line.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
+
+            if not self._origin_allowed(headers.get('origin')):
+                print(f"[WebSocket Server] 拒绝非本地来源: {headers.get('origin')}", flush=True)
+                return
 
             sec_key = headers.get('sec-websocket-key')
             if not sec_key:
@@ -113,9 +162,10 @@ class SimpleWebSocketServer:
             sock.sendall(resp.encode('utf-8'))
 
             with self.lock:
-                self.clients.add(sock)
-            print("[WebSocket Server] 酒馆助手前端已连接！")
+                self.clients[sock] = False
+            print("[WebSocket Server] 客户端已连接，等待 hello 认证...", flush=True)
 
+            sock.settimeout(10)
             while self.running:
                 head = sock.recv(2)
                 if not head or len(head) < 2:
@@ -136,6 +186,10 @@ class SimpleWebSocketServer:
                 elif payload_len == 127:
                     payload_len = struct.unpack(">Q", sock.recv(8))[0]
 
+                if payload_len > WS_MAX_PAYLOAD:
+                    print("[WebSocket Server] 帧超过 1MB 上限，断开连接", flush=True)
+                    break
+
                 masks = sock.recv(4) if masked else None
                 payload = b""
                 while len(payload) < payload_len:
@@ -153,6 +207,22 @@ class SimpleWebSocketServer:
                 if opcode == 0x1:
                     try:
                         text = payload.decode('utf-8')
+                        if not authenticated:
+                            data = json.loads(text)
+                            token = data.get('token')
+                            if (data.get('action') == 'hello' and isinstance(token, str)
+                                    and hmac.compare_digest(token.encode('utf-8'), self.token.encode('utf-8'))):
+                                authenticated = True
+                                with self.lock:
+                                    self.clients[sock] = True
+                                sock.settimeout(None)
+                                self._send_json(sock, {'action': 'hello_ok'})
+                                print("[WebSocket Server] 酒馆助手前端认证成功！", flush=True)
+                            else:
+                                self._send_json(sock, {'action': 'hello_fail'})
+                                print("[WebSocket Server] hello 认证失败，断开连接", flush=True)
+                                break
+                            continue
                         self.on_message(text)
                     except Exception as err:
                         print(f"[WebSocket Server] 解析消息异常: {err}")
@@ -161,8 +231,7 @@ class SimpleWebSocketServer:
             pass
         finally:
             with self.lock:
-                if sock in self.clients:
-                    self.clients.remove(sock)
+                self.clients.pop(sock, None)
             try:
                 sock.close()
             except Exception:
@@ -170,27 +239,18 @@ class SimpleWebSocketServer:
             print("[WebSocket Server] 客户端连接断开")
 
     def broadcast(self, data_dict):
-        text = json.dumps(data_dict, ensure_ascii=False)
-        payload = text.encode('utf-8')
-        length = len(payload)
-
-        if length <= 125:
-            header = bytes([0x81, length])
-        elif length <= 65535:
-            header = struct.pack(">BBH", 0x81, 126, length)
-        else:
-            header = struct.pack(">BBQ", 0x81, 127, length)
-
-        frame = header + payload
+        frame = self._encode_text_frame(json.dumps(data_dict, ensure_ascii=False))
         with self.lock:
             dead = []
-            for c in self.clients:
+            for c, authed in self.clients.items():
+                if not authed:
+                    continue
                 try:
                     c.sendall(frame)
                 except Exception:
                     dead.append(c)
             for d in dead:
-                self.clients.remove(d)
+                self.clients.pop(d, None)
 
 
 # ------------------------------------------------------------------------------------
@@ -262,11 +322,13 @@ class ThiefDesktopBar:
 
         self.width = 860
         self.height = 68
+        self.bridge_token = ''
         try:
             self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thief_bar_config.json")
         except Exception:
             self.config_file = os.path.join(os.path.expanduser("~"), ".st_thief_bar_config.json")
         self._load_config()
+        self._load_or_create_bridge_token()
 
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
@@ -292,7 +354,7 @@ class ThiefDesktopBar:
         self._setup_ui()
         self._bind_events()
 
-        self.server = SimpleWebSocketServer(WS_HOST, WS_PORT, self._on_ws_message)
+        self.server = SimpleWebSocketServer(WS_HOST, WS_PORT, self._on_ws_message, token=self.bridge_token)
         self.server.start()
 
     def _load_config(self):
@@ -317,30 +379,57 @@ class ThiefDesktopBar:
         except Exception as e:
             print(f"[Load Config Error]: {e}", flush=True)
 
-    def _save_config(self):
+    def _load_or_create_bridge_token(self):
+        # 密钥独立于 config 存放：config 会进 git，密钥不能跟着泄露
+        self.token_file = os.path.join(os.path.dirname(self.config_file), 'thief_bar_bridge.token')
         try:
-            data = {
-                'barWidth': self.width,
-                'alpha': self.alpha,
-                'theme': self.theme_name,
-                'minimalMode': self.config.get('minimalMode', False),
-                'layoutMode': self.config.get('layoutMode', 'double'),
-                'charNameMode': self.config.get('charNameMode', 'compact'),
-                'wrapMode': self.config.get('wrapMode', 'wrap'),
-                'showUserMessages': self.config.get('showUserMessages', False),
-                'enableWhitelist': self.config.get('enableWhitelist', True),
-                'tagWhitelist': self.config.get('tagWhitelist', []),
-                'tagBlacklist': self.config.get('tagBlacklist', []),
-                'filterActions': self.config.get('filterActions', False),
-                'filterMode': self.config.get('filterMode', 'pure')
-            }
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            if os.path.exists(self.token_file):
+                with open(self.token_file, 'r', encoding='utf-8') as f:
+                    self.bridge_token = f.read().strip()
+        except Exception:
+            pass
+        if not self.bridge_token:
+            self.bridge_token = secrets.token_hex(16)
+            try:
+                self._atomic_write_text(self.token_file, self.bridge_token)
+            except Exception as err:
+                print(f"[Bridge Token] 写入密钥文件失败（本次会话仍可使用）: {err}", flush=True)
+
+    @staticmethod
+    def _atomic_write_text(path, text):
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    @classmethod
+    def _atomic_write_json(cls, path, data):
+        cls._atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+    def _save_config(self):
+        data = {
+            'barWidth': self.width,
+            'alpha': self.alpha,
+            'theme': self.theme_name,
+            'minimalMode': self.config.get('minimalMode', False),
+            'layoutMode': self.config.get('layoutMode', 'double'),
+            'charNameMode': self.config.get('charNameMode', 'compact'),
+            'wrapMode': self.config.get('wrapMode', 'wrap'),
+            'showUserMessages': self.config.get('showUserMessages', False),
+            'enableWhitelist': self.config.get('enableWhitelist', True),
+            'tagWhitelist': self.config.get('tagWhitelist', []),
+            'tagBlacklist': self.config.get('tagBlacklist', []),
+            'filterActions': self.config.get('filterActions', False),
+            'filterMode': self.config.get('filterMode', 'pure')
+        }
+        try:
+            self._atomic_write_json(self.config_file, data)
         except Exception:
             try:
                 home_cfg = os.path.join(os.path.expanduser("~"), ".st_thief_bar_config.json")
-                with open(home_cfg, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                self._atomic_write_json(home_cfg, data)
                 self.config_file = home_cfg
             except Exception as err:
                 print(f"[Save Config Error]: {err}", flush=True)
@@ -769,6 +858,10 @@ class ThiefDesktopBar:
         self.context_menu.add_command(
             label="设置...",
             command=self._cmd(self.open_settings_dialog)
+        )
+        self.context_menu.add_command(
+            label="复制桥接密钥 (填入网页端设置)",
+            command=self._cmd(self.copy_bridge_token)
         )
         self.context_menu.add_separator()
         self.context_menu.add_command(
@@ -1380,6 +1473,26 @@ class ThiefDesktopBar:
         self._apply_theme()
         self._save_config()
 
+    def copy_bridge_token(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.bridge_token)
+        except Exception:
+            pass
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.wm_attributes("-topmost", True)
+        top.configure(bg="#252526")
+        tk.Label(
+            top, text=f"桥接密钥已复制: {self.bridge_token}",
+            fg="#cccccc", bg="#252526", font=self.font_main, padx=12, pady=8
+        ).pack()
+        top.update_idletasks()
+        x = self.root.winfo_x() + max(0, (self.width - top.winfo_reqwidth()) // 2)
+        y = max(0, self.root.winfo_y() - top.winfo_reqheight() - 8)
+        top.geometry(f"+{x}+{y}")
+        top.after(2500, top.destroy)
+
     def set_opacity(self, alpha):
         self.alpha = max(0.15, min(1.0, alpha))
         self.root.wm_attributes("-alpha", self.alpha)
@@ -1674,6 +1787,24 @@ class ThiefDesktopBar:
         btn_save = tk.Button(btn_frame, text="💾 保存并同步生效", command=save_settings, bg="#0e639c", fg="#ffffff", bd=0, padx=14, pady=4, cursor="hand2")
         btn_save.pack(side=tk.RIGHT)
 
+    _BOOL_CONFIG_KEYS = {'minimalMode', 'showUserMessages', 'enableWhitelist', 'filterActions', 'privacyMode'}
+    _ENUM_CONFIG_KEYS = {
+        'layoutMode': {'single', 'double'},
+        'charNameMode': {'compact', 'hidden', 'full'},
+        'wrapMode': {'wrap', 'single'},
+        'filterMode': {'pure', 'regex'}
+    }
+
+    def _merge_sync_config(self, incoming):
+        for k, v in incoming.items():
+            if k in self._BOOL_CONFIG_KEYS and isinstance(v, bool):
+                self.config[k] = v
+            elif k in self._ENUM_CONFIG_KEYS and isinstance(v, str) and v in self._ENUM_CONFIG_KEYS[k]:
+                self.config[k] = v
+            elif k in ('tagWhitelist', 'tagBlacklist') and isinstance(v, list):
+                cleaned = [t.strip() for t in v[:100] if isinstance(t, str) and t.strip() and len(t) <= 64]
+                self.config[k] = cleaned
+
     def _on_ws_message(self, text):
         try:
             data = json.loads(text)
@@ -1694,7 +1825,7 @@ class ThiefDesktopBar:
                     self.config['privacyMode'] = not self.config.get('privacyMode', False)
                 self._save_config()
                 if not self.config['privacyMode']:
-                    self.root.wm_attributes("-alpha", self.alpha)
+                    self.root.after(0, lambda: self.root.wm_attributes("-alpha", self.alpha))
                 else:
                     self.root.after(50, self._check_privacy_mouse_leave)
                 return
@@ -1734,7 +1865,7 @@ class ThiefDesktopBar:
                 if 'config' in data and isinstance(data['config'], dict):
                     old_min = self.config.get('minimalMode')
                     old_layout = self.config.get('layoutMode')
-                    self.config.update(data['config'])
+                    self._merge_sync_config(data['config'])
                     if 'barWidth' in data['config'] and isinstance(data['config']['barWidth'], (int, float)):
                         w = int(data['config']['barWidth'])
                         if 360 <= w <= 2560 and w != self.width:
@@ -1825,8 +1956,25 @@ class ThiefDesktopBar:
         self.lbl_prefix.configure(text=" >")
         self._update_geometry_and_wrap()
 
+    def _pid_file_path(self):
+        return os.path.join(os.path.dirname(self.config_file), PID_FILENAME)
+
     def run(self):
-        self.root.mainloop()
+        pid_path = self._pid_file_path()
+        try:
+            with open(pid_path, 'w', encoding='utf-8') as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+        try:
+            self.root.mainloop()
+        finally:
+            try:
+                with open(pid_path, 'r', encoding='utf-8') as f:
+                    if f.read().strip() == str(os.getpid()):
+                        os.remove(pid_path)
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

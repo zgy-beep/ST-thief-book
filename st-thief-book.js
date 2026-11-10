@@ -1,6 +1,6 @@
 /**
  * ======================================================================================
- * ST-Thief-Book: 酒馆助手（Tavern Helper）隐蔽摸鱼阅读与回复工具 (v2.3 自定义黑名单设置版)
+ * ST-Thief-Book: 酒馆助手（Tavern Helper）隐蔽摸鱼阅读与回复工具 (v3.1 桥接安全加固版)
  * 仿 VS Code 知名摸鱼插件 Thief-Book 设计
  *
  * 核心升级：
@@ -75,6 +75,8 @@
     maxSentenceLen: 42,
     // WebSocket 桌面同步端口
     wsPort: 18899,
+    // 桌面端桥接密钥 (桌面端右键菜单 → 复制桥接密钥)
+    bridgeToken: '',
     // 老板键伪装文本模板
     bossTemplates: [
       '⎇ main*  ✓ 0 ⨉ 0  |  TypeScript 5.4.5  UTF-8  LF  Ln 142, Col 8  Ready',
@@ -99,6 +101,7 @@
     wsClient: null,
     wsReconnectTimer: null,
     wsConnecting: false,
+    wsAuthenticated: false,
     isHostInpage: false,
     inpageContainer: null
   };
@@ -139,6 +142,23 @@
     return w;
   }
 
+  // 配置枚举合法值与标签列表清洗（本地加载与 WS update_config 共用同一防线）
+  const CONFIG_ENUMS = {
+    filterMode: ['pure', 'regex'],
+    charNameMode: ['compact', 'hidden', 'full'],
+    wrapMode: ['wrap', 'single'],
+    layoutMode: ['single', 'double'],
+    theme: ['vscode-dark', 'vscode-blue', 'terminal']
+  };
+
+  function sanitizeTagList(arr) {
+    if (!Array.isArray(arr)) return null;
+    const cleaned = arr.slice(0, 100)
+      .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+      .filter(t => t && t.length <= 64);
+    return Array.from(new Set(cleaned));
+  }
+
   // 读取持久化配置
   function loadSavedConfig() {
     try {
@@ -152,14 +172,16 @@
           CONFIG.showUserMessages = saved.showUserMessages;
         }
         if (Array.isArray(saved.tagBlacklist)) {
-          const cleanedBlacklist = saved.tagBlacklist
-            .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-            .filter(Boolean);
+          const cleanedBlacklist = sanitizeTagList(saved.tagBlacklist) || [];
           const merged = Array.from(new Set([...DEFAULT_TAG_BLACKLIST, ...cleanedBlacklist]));
           CONFIG.tagBlacklist = merged;
         }
         if (Array.isArray(saved.tagWhitelist)) {
-          CONFIG.tagWhitelist = saved.tagWhitelist;
+          const cleanedWhitelist = sanitizeTagList(saved.tagWhitelist);
+          if (cleanedWhitelist) CONFIG.tagWhitelist = cleanedWhitelist;
+        }
+        if (typeof saved.bridgeToken === 'string') {
+          CONFIG.bridgeToken = saved.bridgeToken.slice(0, 128);
         }
         if (typeof saved.enableWhitelist === 'boolean') {
           CONFIG.enableWhitelist = saved.enableWhitelist;
@@ -170,22 +192,22 @@
         if (typeof saved.hoverBlur === 'boolean') {
           CONFIG.hoverBlur = saved.hoverBlur;
         }
-        if (saved.filterMode) {
+        if (CONFIG_ENUMS.filterMode.includes(saved.filterMode)) {
           CONFIG.filterMode = saved.filterMode;
         }
-        if (saved.theme) {
+        if (CONFIG_ENUMS.theme.includes(saved.theme)) {
           CONFIG.theme = saved.theme;
         }
         if (typeof saved.opacity === 'number') {
-          CONFIG.opacity = saved.opacity;
+          CONFIG.opacity = Math.max(0.15, Math.min(1, saved.opacity));
         }
-        if (saved.layoutMode) {
+        if (CONFIG_ENUMS.layoutMode.includes(saved.layoutMode)) {
           CONFIG.layoutMode = saved.layoutMode;
         }
-        if (saved.charNameMode) {
+        if (CONFIG_ENUMS.charNameMode.includes(saved.charNameMode)) {
           CONFIG.charNameMode = saved.charNameMode;
         }
-        if (saved.wrapMode) {
+        if (CONFIG_ENUMS.wrapMode.includes(saved.wrapMode)) {
           CONFIG.wrapMode = saved.wrapMode;
         }
         if (typeof saved.minimalMode === 'boolean') {
@@ -208,6 +230,7 @@
     try {
       const data = {
         enableDesktopSync: CONFIG.enableDesktopSync,
+        bridgeToken: CONFIG.bridgeToken,
         showUserMessages: CONFIG.showUserMessages,
         enableWhitelist: CONFIG.enableWhitelist,
         tagWhitelist: CONFIG.tagWhitelist,
@@ -1258,9 +1281,12 @@
     let deskStatusText = '未开启';
     let deskBtnStyle = 'background:#252526; color:#888888; border:1px solid #3c3c3c;';
     if (CONFIG.enableDesktopSync) {
-      if (STATE.wsClient) {
+      if (STATE.wsAuthenticated) {
         deskStatusText = '● 已连接';
         deskBtnStyle = 'background:#1b3a24; color:#81c784; border:1px solid #2e7d32;';
+      } else if (STATE.wsClient) {
+        deskStatusText = '○ 待认证 (填密钥)';
+        deskBtnStyle = 'background:#3d3322; color:#ffd54f; border:1px solid #8d6e63;';
       } else {
         deskStatusText = '○ 未连接 (重试)';
         deskBtnStyle = 'background:#3d3322; color:#ffd54f; border:1px solid #8d6e63;';
@@ -1391,7 +1417,13 @@
                 ${deskStatusText}
               </button>
             </div>
-            <div class="st-thief-hint">默认保持纯网页模式。仅在启动本地 start_desktop.bat 时开启同步。</div>
+            <div style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+              <span style="font-size:12px; color:#cccccc; white-space:nowrap;">桥接密钥</span>
+              <input type="text" id="setting-bridge-token" value="${escapeHtml(CONFIG.bridgeToken)}"
+                     placeholder="桌面端右键菜单 → 复制桥接密钥，粘贴到此处"
+                     style="flex:1; background:#1e1e1e; color:#cccccc; border:1px solid #3c3c3c; border-radius:3px; padding:4px 8px; font-size:12px; font-family:Consolas,monospace;" />
+            </div>
+            <div class="st-thief-hint">默认保持纯网页模式。仅在启动本地 start_desktop.bat 时开启同步；首次同步需填入桌面端桥接密钥完成配对。</div>
           </div>
         </div>
 
@@ -1501,6 +1533,8 @@
       if (barW) barW.value = '840';
       const deskSync = modal.querySelector('#setting-enable-desktopsync');
       if (deskSync) deskSync.checked = false;
+      const bridgeToken = modal.querySelector('#setting-bridge-token');
+      if (bridgeToken) bridgeToken.value = '';
     });
 
     modal.querySelector('#btn-reconnect-desktop')?.addEventListener('click', () => {
@@ -1565,6 +1599,10 @@
       if (blur) CONFIG.hoverBlur = blur.checked;
       if (mode) CONFIG.filterMode = mode.value;
 
+      const tokenInput = modal.querySelector('#setting-bridge-token');
+      const tokenChanged = tokenInput && tokenInput.value.trim().slice(0, 128) !== CONFIG.bridgeToken;
+      if (tokenInput) CONFIG.bridgeToken = tokenInput.value.trim().slice(0, 128);
+
       if (deskSync) {
         const oldState = CONFIG.enableDesktopSync;
         CONFIG.enableDesktopSync = deskSync.checked;
@@ -1572,6 +1610,9 @@
           initDesktopBridge(true);
         } else if (oldState && !CONFIG.enableDesktopSync) {
           stopDesktopBridge();
+        } else if (CONFIG.enableDesktopSync && tokenChanged) {
+          stopDesktopBridge();
+          initDesktopBridge(true);
         }
       }
 
@@ -2633,7 +2674,7 @@
           </div>
           <div class="tb-menu-item" id="menu-toggle-desktopsync">
             <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.enableDesktopSync ? '✓' : ''}</span><span>桌面端同步</span></div>
-            <span class="tb-menu-shortcut">${CONFIG.enableDesktopSync ? (STATE.wsClient ? '已连接' : '未连接') : '未开启'}</span>
+            <span class="tb-menu-shortcut">${CONFIG.enableDesktopSync ? (STATE.wsAuthenticated ? '已连接' : (STATE.wsClient ? '待认证' : '未连接')) : '未开启'}</span>
           </div>
           <div class="tb-menu-separator"></div>
           <div class="tb-menu-item" id="menu-boss">
@@ -3647,6 +3688,7 @@
       STATE.wsClient = null;
     }
     STATE.wsConnecting = false;
+    STATE.wsAuthenticated = false;
   }
 
   function toggleDesktopSync(forcedState) {
@@ -3691,15 +3733,31 @@
       ws.onopen = () => {
         STATE.wsConnecting = false;
         STATE.wsClient = ws;
-        console.log('[ST-Thief-Book] 成功连接到 Python 桌面摸鱼客户端');
-        flashStatusHint('🟢 成功连接到 Python 桌面摸鱼客户端');
+        STATE.wsAuthenticated = false;
+        console.log('[ST-Thief-Book] 已连接桌面端，发送 hello 认证...');
+        try {
+          ws.send(JSON.stringify({ action: 'hello', token: CONFIG.bridgeToken }));
+        } catch (e) {}
         renderThiefBar();
-        syncToDesktop();
       };
 
       ws.onmessage = e => {
         try {
           const data = JSON.parse(e.data);
+          if (data.action === 'hello_ok') {
+            STATE.wsAuthenticated = true;
+            console.log('[ST-Thief-Book] 桌面端桥接认证成功');
+            flashStatusHint('🟢 桌面端认证成功，同步已开启');
+            renderThiefBar();
+            syncToDesktop();
+            return;
+          }
+          if (data.action === 'hello_fail') {
+            STATE.wsAuthenticated = false;
+            flashStatusHint('⚠️ 桥接密钥错误：桌面端右键 → 复制桥接密钥，填入脚本设置');
+            return;
+          }
+          if (!STATE.wsAuthenticated) return;
           if (data.action === 'next') nextSentence();
           else if (data.action === 'prev') prevSentence();
           else if (data.action === 'boss') toggleBossKey();
@@ -3726,17 +3784,19 @@
           else if (data.action === 'update_config' && data.config) {
             if (typeof data.config.showUserMessages === 'boolean') CONFIG.showUserMessages = data.config.showUserMessages;
             if (typeof data.config.enableWhitelist === 'boolean') CONFIG.enableWhitelist = data.config.enableWhitelist;
-            if (Array.isArray(data.config.tagWhitelist)) CONFIG.tagWhitelist = data.config.tagWhitelist;
-            if (Array.isArray(data.config.tagBlacklist)) CONFIG.tagBlacklist = data.config.tagBlacklist;
+            const wl = sanitizeTagList(data.config.tagWhitelist);
+            if (wl) CONFIG.tagWhitelist = wl;
+            const bl = sanitizeTagList(data.config.tagBlacklist);
+            if (bl) CONFIG.tagBlacklist = bl;
             if (typeof data.config.filterActions === 'boolean') CONFIG.filterActions = data.config.filterActions;
-            if (data.config.filterMode) CONFIG.filterMode = data.config.filterMode;
-            if (data.config.charNameMode) CONFIG.charNameMode = data.config.charNameMode;
-            if (data.config.wrapMode) CONFIG.wrapMode = data.config.wrapMode;
+            if (CONFIG_ENUMS.filterMode.includes(data.config.filterMode)) CONFIG.filterMode = data.config.filterMode;
+            if (CONFIG_ENUMS.charNameMode.includes(data.config.charNameMode)) CONFIG.charNameMode = data.config.charNameMode;
+            if (CONFIG_ENUMS.wrapMode.includes(data.config.wrapMode)) CONFIG.wrapMode = data.config.wrapMode;
             if (typeof data.config.minimalMode === 'boolean') CONFIG.minimalMode = data.config.minimalMode;
             if (typeof data.config.privacyMode === 'boolean') CONFIG.privacyMode = data.config.privacyMode;
-            if (data.config.layoutMode) CONFIG.layoutMode = data.config.layoutMode;
-            if (typeof data.config.opacity === 'number') CONFIG.opacity = data.config.opacity;
-            if (typeof data.config.barWidth === 'number') CONFIG.barWidth = data.config.barWidth;
+            if (CONFIG_ENUMS.layoutMode.includes(data.config.layoutMode)) CONFIG.layoutMode = data.config.layoutMode;
+            if (typeof data.config.opacity === 'number') CONFIG.opacity = Math.max(0.15, Math.min(1, data.config.opacity));
+            if (typeof data.config.barWidth === 'number') CONFIG.barWidth = Math.max(360, Math.min(2560, data.config.barWidth));
             saveCurrentConfig();
             refreshLatestMessage(false);
           }
@@ -3748,6 +3808,7 @@
       ws.onclose = () => {
         STATE.wsClient = null;
         STATE.wsConnecting = false;
+        STATE.wsAuthenticated = false;
         renderThiefBar();
 
         // 只有当用户依然开启了桌面同步时，才温和安排重连，若未开启则完全静默
@@ -3764,6 +3825,7 @@
       ws.onerror = () => {
         STATE.wsClient = null;
         STATE.wsConnecting = false;
+        STATE.wsAuthenticated = false;
         if (isManual) {
           flashStatusHint('⚠️ 桌面端未开启，请先运行 start_desktop.bat');
         }
@@ -3771,11 +3833,12 @@
     } catch (e) {
       STATE.wsClient = null;
       STATE.wsConnecting = false;
+      STATE.wsAuthenticated = false;
     }
   }
 
   function syncToDesktop() {
-    if (!CONFIG.enableDesktopSync || !STATE.wsClient || STATE.wsClient.readyState !== WebSocket.OPEN) return;
+    if (!CONFIG.enableDesktopSync || !STATE.wsAuthenticated || !STATE.wsClient || STATE.wsClient.readyState !== WebSocket.OPEN) return;
 
     try {
       const payload = {

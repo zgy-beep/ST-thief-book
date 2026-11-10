@@ -640,11 +640,16 @@ def listen():
 
     def _restart():
         import subprocess
+        pid = 0
         hit = find_bar_window()
         if hit:
+            pid = _pid_from_hwnd(hit[0])
+        if not pid:
+            pid = _pid_of_bar()
+        if pid:
             try:
-                subprocess.Popen(["taskkill", "/F", "/PID",
-                                  str(_pid_of_bar())], creationflags=0x08000000)
+                subprocess.Popen(["taskkill", "/F", "/PID", str(pid)],
+                                 creationflags=0x08000000)
             except Exception:
                 pass
         time.sleep(0.3)
@@ -689,17 +694,33 @@ def listen():
         time.sleep(0.05)
 
 
+def _pid_from_hwnd(hwnd):
+    """窗口句柄直接归属摸鱼条进程，是最精确的 PID 来源。"""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
 def _pid_of_bar():
-    """通过 WS 端口找不出 PID，退化为按进程命令行匹配。"""
+    """窗口找不到时读 pidfile 兜底，并验证该 PID 的命令行仍是摸鱼条，防止 stale PID 误杀。"""
+    try:
+        with open(os.path.join(APP_DIR, "thief_bar.pid"), "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except Exception:
+        return 0
+    if pid <= 0:
+        return 0
     import subprocess
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             "(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*thief_desktop_bar.py*' } | Select-Object -First 1).ProcessId"],
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
             capture_output=True, text=True, timeout=8, creationflags=0x08000000)
-        return int(out.stdout.strip() or 0)
+        if 'thief_desktop_bar.py' in out.stdout:
+            return pid
     except Exception:
-        return 0
+        pass
+    return 0
 
 
 def main(argv):
