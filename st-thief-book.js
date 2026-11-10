@@ -102,6 +102,7 @@
     wsReconnectTimer: null,
     wsConnecting: false,
     wsAuthenticated: false,
+    streamRenderTimer: null,
     isHostInpage: false,
     inpageContainer: null
   };
@@ -276,10 +277,7 @@
     let text = html;
 
     // 1. 彻底剔除样式表与脚本内容（防止 CSS 规则如 .bubble { color: red; } 变为文本！）
-    text = text.replace(/<style[\s\S]*?<\/style>/gi, '');
-    text = text.replace(/<script[\s\S]*?<\/script>/gi, '');
-    text = text.replace(/<svg[\s\S]*?<\/svg>/gi, '');
-    text = text.replace(/<!--[\s\S]*?-->/g, '');
+    text = text.replace(HTML_JUNK_RE, '');
 
     // 2. 利用 DOMParser 剔除明确的 UI 干扰元素
     if (text.includes('<') || text.includes('&')) {
@@ -289,14 +287,9 @@
         doc.querySelectorAll('.mes_reasoning, .reasoning_block, .thinking, .thinking-block, details, think, thought, reasoning, status').forEach(el => el.remove());
         doc.querySelectorAll('.avatar, .avatar-container, .mes_button_menu, .badge, .extra-badges').forEach(el => el.remove());
 
-        if (Array.isArray(CONFIG.tagBlacklist) && CONFIG.tagBlacklist.length > 0) {
-          const validSelectors = CONFIG.tagBlacklist
-            .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-            .filter(t => /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(t))
-            .join(',');
-          if (validSelectors) {
-            try { doc.querySelectorAll(validSelectors).forEach(el => el.remove()); } catch (e) {}
-          }
+        const validSelectors = getFilterRegexes().selector;
+        if (validSelectors) {
+          try { doc.querySelectorAll(validSelectors).forEach(el => el.remove()); } catch (e) {}
         }
 
         const domText = doc.body.innerText || doc.body.textContent || '';
@@ -320,73 +313,77 @@
     return text.replace(/[ \t\r]+/g, ' ').replace(/\n\s*\n/g, '\n').trim();
   }
 
+  // 样式/脚本/注释合并为单遍扫描；{0,100000}? 上限防恶意未闭合长文引发 O(n²) 回溯
+  const HTML_JUNK_RE = /<style[\s\S]{0,100000}?<\/style>|<script[\s\S]{0,100000}?<\/script>|<svg[\s\S]{0,100000}?<\/svg>|<!--[\s\S]{0,100000}?-->/gi;
+
+  // 过滤正则缓存：标签列表不变时直接复用；所有标签合并为 alternation，10 遍扫描替代 标签数×10 遍
+  let _filterCache = { key: null };
+  function getFilterRegexes() {
+    const cleanTag = t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, '');
+    const wl = (CONFIG.tagWhitelist || []).map(cleanTag).filter(Boolean);
+    const bl = (CONFIG.tagBlacklist || []).map(cleanTag).filter(Boolean);
+    const key = wl.join(',') + '|' + bl.join(',');
+    if (_filterCache.key === key) return _filterCache;
+
+    const esc = t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // 长标签优先，避免 think 词干抢先匹配 thinking
+    const alt = tags => tags.slice().sort((a, b) => b.length - a.length).map(esc).join('|');
+    const wlAlt = alt(wl);
+    const blAlt = alt(bl);
+    const B = '{0,100000}?';
+    const cache = { key, wlXml: null, wlBracket: null, bl: [], selector: '' };
+    if (wlAlt) {
+      cache.wlXml = new RegExp('<\\s*(' + wlAlt + ')(?:[\\s:][^>]*)?>([\\s\\S]' + B + ')<\\/\\s*\\1\\s*>', 'gi');
+      cache.wlBracket = new RegExp('\\[\\s*(' + wlAlt + ')(?:[\\s:][^\\]]*)?\\]([\\s\\S]' + B + ')\\[\\/\\s*\\1\\s*\\]', 'gi');
+    }
+    if (blAlt) {
+      cache.bl = [
+        // 闭合 XML / 中括号标签（连同内部内容整体删除，\1 回引保证同标签闭合）
+        new RegExp('<\\s*(' + blAlt + ')(?:[\\s:][^>]*)?>[\\s\\S]' + B + '<\\/\\s*\\1\\s*>', 'gi'),
+        new RegExp('\\[\\s*(' + blAlt + ')(?:[\\s:][^\\]]*)?\\][\\s\\S]' + B + '\\[\\/\\s*\\1\\s*\\]', 'gi'),
+        // 冒号指令型单标签 [system: ...] <system: ...> (system: ...) {system: ...}
+        new RegExp('\\[\\s*(?:' + blAlt + ')\\s*[:：][^\\]]*\\]', 'gi'),
+        new RegExp('<\\s*(?:' + blAlt + ')\\s*[:：][^>]*>', 'gi'),
+        new RegExp('\\(\\s*(?:' + blAlt + ')\\s*[:：][^\\)]*\\)', 'gi'),
+        new RegExp('\\{\\s*(?:' + blAlt + ')\\s*[:：][^\\}]*\\}', 'gi'),
+        // 流式未闭合标签：删除自 opening tag 至文末
+        new RegExp('<\\s*(?:' + blAlt + ')(?:[\\s:][^>]*)?>[\\s\\S]*$', 'gi'),
+        new RegExp('\\[\\s*(?:' + blAlt + ')(?:[\\s:][^\\]]*)?\\][\\s\\S]*$', 'gi'),
+        // 游离闭合或单标签
+        new RegExp('<\\/?\\s*(?:' + blAlt + ')(?:[\\s:][^>]*)?>', 'gi'),
+        new RegExp('\\[\\/?\\s*(?:' + blAlt + ')(?:[\\s:][^\\]]*)?\\]', 'gi')
+      ];
+    }
+    cache.selector = bl.filter(t => /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(t)).join(',');
+    _filterCache = cache;
+    return cache;
+  }
+
   function processWhitelistAndBlacklist(content, forceDisableWhitelist = false) {
     if (!content || typeof content !== 'string') return '';
     // 关键：预先解码 HTML 实体，避免 &lt;tag&gt; 绕过黑名单！
     let text = preDecodeEntities(content);
+    text = text.replace(HTML_JUNK_RE, '');
 
-    // 1. 预先清除样式、脚本与 HTML 注释
-    text = text.replace(/<style[\s\S]*?<\/style>/gi, '');
-    text = text.replace(/<script[\s\S]*?<\/script>/gi, '');
-    text = text.replace(/<svg[\s\S]*?<\/svg>/gi, '');
-    text = text.replace(/<!--[\s\S]*?-->/g, '');
+    const rx = getFilterRegexes();
 
-    // 2. 白名单容器正文提取 (Whitelist Extraction)
-    // 若开启白名单模式，且在消息中找到了匹配的白名单标签，则优先提取其内部正文
-    if (!forceDisableWhitelist && CONFIG.enableWhitelist && Array.isArray(CONFIG.tagWhitelist) && CONFIG.tagWhitelist.length > 0) {
+    // 白名单容器正文提取：未匹配任何白名单时回退为全文，绝不丢弃正文
+    if (!forceDisableWhitelist && CONFIG.enableWhitelist && rx.wlXml) {
       const extracted = [];
-      for (const rawTag of CONFIG.tagWhitelist) {
-        const t = String(rawTag).trim().replace(/^[<\[]+|[>\]]+$/g, '');
-        if (!t) continue;
-        const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-        // 匹配闭合 XML 标签: <wtag>...</wtag>
-        const xmlRegex = new RegExp('<\\s*' + escaped + '(?:[\\s:][^>]*)?>([\\s\\S]*?)<\\/\\s*' + escaped + '\\s*>', 'gi');
-        let m;
-        while ((m = xmlRegex.exec(text)) !== null) {
-          if (m[1] && m[1].trim()) extracted.push(m[1].trim());
-        }
-
-        // 匹配中括号标签: [wtag]...[/wtag]
-        const bracketRegex = new RegExp('\\[\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\]([\\s\\S]*?)\\[\\/\\s*' + escaped + '\\s*\\]', 'gi');
-        while ((m = bracketRegex.exec(text)) !== null) {
-          if (m[1] && m[1].trim()) extracted.push(m[1].trim());
-        }
+      for (const m of text.matchAll(rx.wlXml)) {
+        if (m[2] && m[2].trim()) extracted.push(m[2].trim());
       }
-
-      // 如果成功提取到了白名单标签内的正文，以白名单提取内容为基准！
-      // 若未匹配到任何白名单标签，则自动回退为全文，绝不丢弃正文！
+      for (const m of text.matchAll(rx.wlBracket)) {
+        if (m[2] && m[2].trim()) extracted.push(m[2].trim());
+      }
       if (extracted.length > 0) {
         text = extracted.join('\n');
       }
     }
 
-    // 3. 在白名单内容（或全文）中，彻底剥离黑名单及其内部思考过程 (Blacklist Stripping)
-    const btags = CONFIG.tagBlacklist || [];
-    for (const rawTag of btags) {
-      const t = String(rawTag).trim().replace(/^[<\[]+|[>\]]+$/g, '');
-      if (!t) continue;
-      const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-      // 闭合 XML 标签: <tag ...>...</tag> (连同内部思考细节整体彻底删除)
-      text = text.replace(new RegExp('<\\s*' + escaped + '(?:[\\s:][^>]*)?>[\\s\\S]*?<\\/\\s*' + escaped + '\\s*>', 'gi'), '');
-
-      // 闭合中括号标签: [tag ...]...[/tag]
-      text = text.replace(new RegExp('\\[\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\][\\s\\S]*?\\[\\/\\s*' + escaped + '\\s*\\]', 'gi'), '');
-
-      // 冒号或指令型单标签 (常见于用户输入 [system: ...] 或 [system：...] 或 <system: ...> 或 (system: ...) 或 {system: ...})
-      text = text.replace(new RegExp('\\[\\s*' + escaped + '\\s*[:：][^\\]]*\\]', 'gi'), '');
-      text = text.replace(new RegExp('<\\s*' + escaped + '\\s*[:：][^>]*>', 'gi'), '');
-      text = text.replace(new RegExp('\\(\\s*' + escaped + '\\s*[:：][^\\)]*\\)', 'gi'), '');
-      text = text.replace(new RegExp('\\{\\s*' + escaped + '\\s*[:：][^\\}]*\\}', 'gi'), '');
-
-      // 流式未闭合标签: <tag ...>...$ 或 [tag ...]...$
-      text = text.replace(new RegExp('<\\s*' + escaped + '(?:[\\s:][^>]*)?>[\\s\\S]*$', 'gi'), '');
-      text = text.replace(new RegExp('\\[\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\][\\s\\S]*$', 'gi'), '');
-
-      // 游离闭合或单标签
-      text = text.replace(new RegExp('<\\/?\\s*' + escaped + '(?:[\\s:][^>]*)?>', 'gi'), '');
-      text = text.replace(new RegExp('\\[\\/?\\s*' + escaped + '(?:[\\s:][^\\]]*)?\\]', 'gi'), '');
+    // 黑名单及其内部思考过程彻底剥离
+    for (const re of rx.bl) {
+      text = text.replace(re, '');
     }
 
     // 剥离 Markdown 思考代码块 ```thought ... ```
@@ -418,14 +415,9 @@
           if ($mes && $mes.length > 0) {
             const $clone = $mes.clone();
             $clone.find('.mes_reasoning, .reasoning_block, .thinking, .thinking-block, details, script, style, .st-hidden, .mes_button_menu').remove();
-            if (Array.isArray(CONFIG.tagBlacklist) && CONFIG.tagBlacklist.length > 0) {
-              const validSelectors = CONFIG.tagBlacklist
-                .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-                .filter(t => /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(t))
-                .join(',');
-              if (validSelectors) {
-                try { $clone.find(validSelectors).remove(); } catch (e) {}
-              }
+            const validSelectors = getFilterRegexes().selector;
+            if (validSelectors) {
+              try { $clone.find(validSelectors).remove(); } catch (e) {}
             }
             const rendered = $clone.html();
             if (rendered && rendered.trim()) {
@@ -2423,6 +2415,123 @@
     }
   `;
 
+  // 事件委托：container 本体不随 innerHTML 重建销毁，所有点击/按键只需绑定一次
+  function bindContainerDelegates(container, doc) {
+    const clickActions = {
+      'tb-text-wrapper': () => nextSentence(),
+      'tb-char-badge': () => toggleCharNameMode(),
+      'btn-floor-prev': () => changeMessageFloor(-1),
+      'btn-floor-next': () => changeMessageFloor(1),
+      'btn-floor-picker': () => toggleFloorPicker(),
+      'btn-context-menu': (e, el) => {
+        if (STATE.isContextMenuOpen) {
+          closeContextMenu();
+        } else {
+          const rect = el.getBoundingClientRect();
+          openContextMenu(rect.left - 200, rect.bottom + 4);
+        }
+      },
+      'btn-inpage-close': () => closeThiefBar(),
+      'btn-boss': () => toggleBossKey(false),
+      'btn-send': () => {
+        const input = doc.getElementById('tb-input');
+        if (input) { const val = input.value; input.value = ''; submitReply(val); }
+      },
+      'menu-toggle-minimal': () => { closeContextMenu(); toggleMinimalMode(); },
+      'menu-toggle-privacy': () => { closeContextMenu(); togglePrivacyMode(); },
+      'menu-toggle-user-messages': () => { closeContextMenu(); toggleShowUserMessages(); },
+      'menu-prev': () => { closeContextMenu(); prevSentence(); },
+      'menu-next': () => { closeContextMenu(); nextSentence(); },
+      'menu-floor-prev': () => { closeContextMenu(); changeMessageFloor(-1); },
+      'menu-floor-next': () => { closeContextMenu(); changeMessageFloor(1); },
+      'menu-floor-jump': () => { closeContextMenu(); toggleFloorPicker(true); },
+      'menu-swipe': () => { closeContextMenu(); swipeMessage(); },
+      'menu-stop': () => { closeContextMenu(); stopGeneration(); },
+      'menu-toggle-char': () => { closeContextMenu(); toggleCharNameMode(); },
+      'menu-toggle-wrap': () => { closeContextMenu(); toggleWrapMode(); },
+      'menu-toggle-width': () => { closeContextMenu(); cycleBarWidth(); },
+      'menu-toggle-filter': () => { closeContextMenu(); toggleFilterMode(); },
+      'menu-toggle-desktopsync': () => { closeContextMenu(); toggleDesktopSync(); },
+      'menu-toggle-layout': () => { closeContextMenu(); toggleLayoutMode(); },
+      'menu-boss': () => { closeContextMenu(); toggleBossKey(true); },
+      'menu-settings': () => { closeContextMenu(); openSettingsModal(); },
+      'menu-inpage-close': () => { closeContextMenu(); closeThiefBar(); },
+      'btn-close-floor-popover': () => toggleFloorPicker(false),
+      'btn-floor-first': () => jumpToMessageFloor(0),
+      'btn-floor-pop-prev': () => changeMessageFloor(-1),
+      'btn-floor-pop-next': () => changeMessageFloor(1),
+      'btn-floor-last': () => {
+        const lid = typeof getLastMessageId === 'function' ? getLastMessageId() : Math.max(0, STATE.currentMsgId);
+        jumpToMessageFloor(lid);
+      },
+      'btn-floor-go': () => {
+        const floorInput = doc.getElementById('tb-floor-input');
+        const val = floorInput ? parseInt(floorInput.value, 10) : NaN;
+        if (!isNaN(val)) jumpToMessageFloor(val);
+      }
+    };
+
+    container.addEventListener('click', e => {
+      let el = e.target;
+      while (el && el !== container) {
+        if (el.id && clickActions[el.id]) {
+          e.stopPropagation();
+          clickActions[el.id](e, el);
+          return;
+        }
+        el = el.parentElement;
+      }
+    });
+
+    container.addEventListener('dblclick', e => {
+      if (e.target.closest && e.target.closest('#tb-drag-handle')) {
+        e.stopPropagation();
+        if (STATE.isHostInpage && STATE.inpageContainer) {
+          STATE.inpageContainer.style.bottom = 'max(0px, env(safe-area-inset-bottom, 0px))';
+          try { localStorage.removeItem('ST_THIEF_INPAGE_BOTTOM'); } catch (err) {}
+          flashStatusHint('摸鱼条已贴底复位');
+        }
+      }
+    });
+
+    container.addEventListener('keydown', e => {
+      const t = e.target;
+      if (t.id === 'tb-input') {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const val = t.value;
+          t.value = '';
+          submitReply(val);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          t.value = '';
+          t.blur();
+        }
+      } else if (t.id === 'tb-floor-input') {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const val = parseInt(t.value, 10);
+          if (!isNaN(val)) jumpToMessageFloor(val);
+        } else if (e.key === 'Escape') {
+          toggleFloorPicker(false);
+        }
+      }
+    });
+
+    container.addEventListener('focusin', e => {
+      if (e.target.id === 'tb-input') {
+        const targetEl = STATE.isHostInpage ? STATE.inpageContainer : doc.body;
+        if (targetEl) targetEl.classList.add('tb-privacy-active');
+      }
+    });
+    container.addEventListener('focusout', e => {
+      if (e.target.id === 'tb-input') {
+        const targetEl = STATE.isHostInpage ? STATE.inpageContainer : doc.body;
+        if (targetEl) targetEl.classList.remove('tb-privacy-active');
+      }
+    });
+  }
+
   function renderThiefBar() {
     if (!STATE.thiefWindow || !STATE.thiefWindow.document) return;
     const doc = STATE.thiefWindow.document;
@@ -2457,6 +2566,7 @@
         doc.body.appendChild(container);
       }
       bindWindowEvents(STATE.thiefWindow);
+      bindContainerDelegates(container, doc);
     }
 
     if (STATE.isHostInpage && STATE.inpageContainer) {
@@ -2468,6 +2578,37 @@
         STATE.inpageContainer.style.opacity = CONFIG.opacity;
       }
     }
+
+    const totalSentences = STATE.sentences.length;
+    const currentSentence = STATE.sentences[STATE.currentSentenceIndex] || '(空)';
+    const curIdx = totalSentences > 0 ? STATE.currentSentenceIndex + 1 : 0;
+    const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : Math.max(0, STATE.currentMsgId);
+    const displayFloor = STATE.currentMsgId >= 0 ? STATE.currentMsgId : 0;
+
+    // 差量渲染：结构签名未变时只更新文本节点，不重建 DOM、不触碰回复框（生成期间打字不丢失）
+    const structureSig = [STATE.isBossKey, STATE.isGenerating, CONFIG.layoutMode, CONFIG.charNameMode,
+      CONFIG.wrapMode, STATE.isFloorPickerOpen, STATE.isContextMenuOpen, STATE.isHostInpage].join('|');
+    if (container._tbSig === structureSig && container.firstChild) {
+      if (STATE.isBossKey) return;
+      if (!STATE.isFloorPickerOpen && !STATE.isContextMenuOpen) {
+        const textEl = doc.getElementById('tb-text');
+        if (textEl && textEl.textContent !== currentSentence) textEl.textContent = currentSentence;
+        const progressEl = doc.getElementById('tb-progress');
+        const progressText = `${curIdx}/${totalSentences}`;
+        if (progressEl && progressEl.textContent !== progressText) progressEl.textContent = progressText;
+        const floorBadge = doc.getElementById('btn-floor-picker');
+        if (floorBadge) {
+          floorBadge.textContent = `#${displayFloor} ▾`;
+          floorBadge.title = `当前: 第 #${displayFloor} 楼 / 共 ${lastId} 楼\n[点击] 打开楼层快速跳转面板`;
+        }
+        const charBadge = doc.getElementById('tb-char-badge');
+        if (charBadge && CONFIG.charNameMode !== 'hidden' && charBadge.textContent.trim() !== STATE.characterName) {
+          charBadge.textContent = STATE.characterName;
+        }
+        return;
+      }
+    }
+    container._tbSig = structureSig;
 
     // 1. 老板键伪装模式
     if (STATE.isBossKey) {
@@ -2497,17 +2638,10 @@
             : ''
         }
       `;
-      doc.getElementById('btn-boss')?.addEventListener('click', () => toggleBossKey(false));
       return;
     }
 
     // 2. 正常阅读模式
-    const totalSentences = STATE.sentences.length;
-    const currentSentence = STATE.sentences[STATE.currentSentenceIndex] || '(空)';
-    const curIdx = totalSentences > 0 ? STATE.currentSentenceIndex + 1 : 0;
-    const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : Math.max(0, STATE.currentMsgId);
-    const displayFloor = STATE.currentMsgId >= 0 ? STATE.currentMsgId : 0;
-
     const leftIconHtml = STATE.isGenerating
       ? `<span class="tb-drag-handle" id="tb-drag-handle" title="按住拖拽调节摸鱼条上下高度 (双击贴底复位)">⠿</span> <span class="tb-spin-icon" title="AI 生成中...">⟳</span> <span style="color:#dcdcaa;font-size:11px;">Building...</span>`
       : `
@@ -2692,6 +2826,12 @@
       `;
     }
 
+    // 全量重建前保留回复草稿与焦点，重建后恢复
+    const oldInput = doc.getElementById('tb-input');
+    const draft = oldInput ? oldInput.value : '';
+    const hadFocus = !!(oldInput && doc.activeElement === oldInput);
+    const selStart = hadFocus ? oldInput.selectionStart : 0;
+
     container.innerHTML = `
       <div class="tb-row-reading">
         <div class="tb-section-left">${leftIconHtml}</div>
@@ -2703,129 +2843,14 @@
       ${contextMenuHtml}
     `;
 
-    doc.getElementById('tb-text-wrapper')?.addEventListener('click', nextSentence);
-    doc.getElementById('tb-char-badge')?.addEventListener('click', e => {
-      e.stopPropagation();
-      toggleCharNameMode();
-    });
-    doc.getElementById('btn-floor-prev')?.addEventListener('click', e => {
-      e.stopPropagation();
-      changeMessageFloor(-1);
-    });
-    doc.getElementById('btn-floor-next')?.addEventListener('click', e => {
-      e.stopPropagation();
-      changeMessageFloor(1);
-    });
-    doc.getElementById('btn-floor-picker')?.addEventListener('click', e => {
-      e.stopPropagation();
-      toggleFloorPicker();
-    });
-    doc.getElementById('btn-context-menu')?.addEventListener('click', e => {
-      e.stopPropagation();
-      if (STATE.isContextMenuOpen) {
-        closeContextMenu();
-      } else {
-        const rect = e.target.getBoundingClientRect();
-        openContextMenu(rect.left - 200, rect.bottom + 4);
-      }
-    });
-    doc.getElementById('btn-inpage-close')?.addEventListener('click', e => {
-      e.stopPropagation();
-      closeThiefBar();
-    });
-    doc.getElementById('tb-drag-handle')?.addEventListener('dblclick', e => {
-      e.stopPropagation();
-      if (STATE.isHostInpage && STATE.inpageContainer) {
-        STATE.inpageContainer.style.bottom = 'max(0px, env(safe-area-inset-bottom, 0px))';
-        try { localStorage.removeItem('ST_THIEF_INPAGE_BOTTOM'); } catch (err) {}
-        flashStatusHint('摸鱼条已贴底复位');
-      }
-    });
-
-    // 右键上下文菜单项事件绑定
-    if (STATE.isContextMenuOpen) {
-      doc.getElementById('menu-toggle-minimal')?.addEventListener('click', () => { closeContextMenu(); toggleMinimalMode(); });
-      doc.getElementById('menu-toggle-privacy')?.addEventListener('click', () => { closeContextMenu(); togglePrivacyMode(); });
-      doc.getElementById('menu-toggle-user-messages')?.addEventListener('click', () => { closeContextMenu(); toggleShowUserMessages(); });
-      doc.getElementById('menu-prev')?.addEventListener('click', () => { closeContextMenu(); prevSentence(); });
-      doc.getElementById('menu-next')?.addEventListener('click', () => { closeContextMenu(); nextSentence(); });
-      doc.getElementById('menu-floor-prev')?.addEventListener('click', () => { closeContextMenu(); changeMessageFloor(-1); });
-      doc.getElementById('menu-floor-next')?.addEventListener('click', () => { closeContextMenu(); changeMessageFloor(1); });
-      doc.getElementById('menu-floor-jump')?.addEventListener('click', () => { closeContextMenu(); toggleFloorPicker(true); });
-      doc.getElementById('menu-swipe')?.addEventListener('click', () => { closeContextMenu(); swipeMessage(); });
-      doc.getElementById('menu-stop')?.addEventListener('click', () => { closeContextMenu(); stopGeneration(); });
-      doc.getElementById('menu-toggle-char')?.addEventListener('click', () => { closeContextMenu(); toggleCharNameMode(); });
-      doc.getElementById('menu-toggle-wrap')?.addEventListener('click', () => { closeContextMenu(); toggleWrapMode(); });
-      doc.getElementById('menu-toggle-width')?.addEventListener('click', () => { closeContextMenu(); cycleBarWidth(); });
-      doc.getElementById('menu-toggle-filter')?.addEventListener('click', () => { closeContextMenu(); toggleFilterMode(); });
-      doc.getElementById('menu-toggle-desktopsync')?.addEventListener('click', () => { closeContextMenu(); toggleDesktopSync(); });
-      doc.getElementById('menu-toggle-layout')?.addEventListener('click', () => { closeContextMenu(); toggleLayoutMode(); });
-      doc.getElementById('menu-boss')?.addEventListener('click', () => { closeContextMenu(); toggleBossKey(true); });
-      doc.getElementById('menu-settings')?.addEventListener('click', () => { closeContextMenu(); openSettingsModal(); });
-      doc.getElementById('menu-inpage-close')?.addEventListener('click', () => { closeContextMenu(); closeThiefBar(); });
-    }
-
-    const input = doc.getElementById('tb-input');
-    const sendBtn = doc.getElementById('btn-send');
-
-    if (input) {
-      input.addEventListener('focus', () => {
-        const targetEl = STATE.isHostInpage ? STATE.inpageContainer : doc.body;
-        if (targetEl) targetEl.classList.add('tb-privacy-active');
-      });
-      input.addEventListener('blur', () => {
-        const targetEl = STATE.isHostInpage ? STATE.inpageContainer : doc.body;
-        if (targetEl) targetEl.classList.remove('tb-privacy-active');
-      });
-      input.addEventListener('keydown', e => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          const val = input.value;
-          input.value = '';
-          submitReply(val);
-        } else if (e.key === 'Escape') {
-          e.preventDefault();
-          input.value = '';
-          input.blur();
-        }
-      });
-    }
-
-    if (sendBtn && input) {
-      sendBtn.addEventListener('click', () => {
-        const val = input.value;
-        input.value = '';
-        submitReply(val);
-      });
-    }
-
-    // 楼层跳转快速浮窗事件绑定
-    if (STATE.isFloorPickerOpen) {
-      doc.getElementById('btn-close-floor-popover')?.addEventListener('click', () => toggleFloorPicker(false));
-      doc.getElementById('btn-floor-first')?.addEventListener('click', () => jumpToMessageFloor(0));
-      doc.getElementById('btn-floor-pop-prev')?.addEventListener('click', () => changeMessageFloor(-1));
-      doc.getElementById('btn-floor-pop-next')?.addEventListener('click', () => changeMessageFloor(1));
-      doc.getElementById('btn-floor-last')?.addEventListener('click', () => jumpToMessageFloor(lastId));
-
-      const floorInput = doc.getElementById('tb-floor-input');
-      const floorGo = doc.getElementById('btn-floor-go');
-      if (floorInput && floorGo) {
-        const doJump = () => {
-          const val = parseInt(floorInput.value, 10);
-          if (!isNaN(val)) jumpToMessageFloor(val);
-        };
-        floorGo.addEventListener('click', doJump);
-        floorInput.addEventListener('keydown', e => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            doJump();
-          } else if (e.key === 'Escape') {
-            toggleFloorPicker(false);
-          }
-        });
+    const newInput = doc.getElementById('tb-input');
+    if (newInput) {
+      newInput.value = draft;
+      if (hadFocus) {
+        newInput.focus();
+        try { newInput.setSelectionRange(selStart, selStart); } catch (e) {}
       }
     }
-
   }
 
   // ------------------------------------------------------------------------------------
@@ -3094,10 +3119,20 @@
     } catch (e) {}
   }
 
+  let entranceObserver = null;
+  let entranceRetryTimer = null;
+  let entranceViewportCleanup = null;
+
   function injectSillyTavernEntrance() {
     try {
       const topDoc = getSafeTopDoc();
       if (!topDoc || topDoc.getElementById('st-thief-floating-btn')) return;
+
+      // 重注入前先卸载旧按钮遗留的视口监听，防止多次注入后监听器累积泄漏
+      if (entranceViewportCleanup) {
+        entranceViewportCleanup();
+        entranceViewportCleanup = null;
+      }
 
       const btn = topDoc.createElement('div');
       btn.id = 'st-thief-floating-btn';
@@ -3373,6 +3408,14 @@
         topWin.visualViewport.addEventListener('resize', onViewportChange);
         topWin.visualViewport.addEventListener('scroll', onViewportChange);
       }
+      entranceViewportCleanup = () => {
+        topWin.removeEventListener('resize', onViewportChange);
+        topWin.removeEventListener('orientationchange', onViewportChange);
+        if (topWin.visualViewport) {
+          topWin.visualViewport.removeEventListener('resize', onViewportChange);
+          topWin.visualViewport.removeEventListener('scroll', onViewportChange);
+        }
+      };
 
       console.log('[ST-Thief-Book] 成功在酒馆主界面注入“🐟”精简图标入口 (右键直接设置 / 移动超高效)');
     } catch (e) {
@@ -3380,13 +3423,31 @@
     }
   }
 
+  // 事件驱动补注入：按钮是 body 直接子节点，只需盯 body 的 childList；
+  // 宿主重绘移除入口时自动补回，替代原先每 3 秒一次的 setInterval 轮询
+  function ensureSillyTavernEntrance() {
+    injectSillyTavernEntrance();
+    const topDoc = getSafeTopDoc();
+    if (!topDoc || !topDoc.body) {
+      entranceRetryTimer = setTimeout(ensureSillyTavernEntrance, 1000);
+      return;
+    }
+    if (entranceObserver) return;
+    entranceObserver = new MutationObserver(() => {
+      if (!topDoc.getElementById('st-thief-floating-btn')) injectSillyTavernEntrance();
+    });
+    entranceObserver.observe(topDoc.body, { childList: true });
+  }
+
   function setupHostGlobalShortcuts() {
     try {
       const topDoc = getSafeTopDoc();
-      if (topDoc._tbHostShortcutsBound) return;
-      topDoc._tbHostShortcutsBound = true;
+      // 脚本重载时旧 handler 闭包已随旧 iframe 销毁，必须先卸载再绑新实例
+      if (topDoc._tbHostKeydownHandler) {
+        topDoc.removeEventListener('keydown', topDoc._tbHostKeydownHandler);
+      }
 
-      topDoc.addEventListener('keydown', e => {
+      const handler = e => {
         if (e.altKey && (e.key === 'm' || e.key === 'M')) {
           e.preventDefault();
           toggleThiefBar();
@@ -3418,7 +3479,9 @@
             toggleBossKey();
           }
         }
-      });
+      };
+      topDoc._tbHostKeydownHandler = handler;
+      topDoc.addEventListener('keydown', handler);
 
       // 当用户从桌面切回酒馆窗口且开启了桌面同步时，顺手轻量探测连接一次
       window.addEventListener('focus', () => {
@@ -3936,26 +3999,31 @@
       }
 
       if (tavern_events.STREAM_TOKEN_RECEIVED) {
+        //  trailing-edge 节流：token 高频到达时最多每 150ms 全量刷新一次，GENERATION_ENDED 会兜底最终态
         eventOn(tavern_events.STREAM_TOKEN_RECEIVED, () => {
-          try {
-            const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : -1;
-            if (lastId >= 0) {
-              const msgs = getChatMessages(lastId);
-              if (msgs && msgs[0]) {
-                STATE.currentMsgId = lastId;
-                const raw = msgs[0].message || '';
-                const clean = filterThinkingAndTags(raw, lastId);
-                if (!clean) {
-                  STATE.sentences = ['(AI 正在思考中，思考完成后将自动切入小说正文...)'];
-                  STATE.currentSentenceIndex = 0;
-                } else {
-                  STATE.sentences = splitIntoSentences(clean);
+          if (STATE.streamRenderTimer) return;
+          STATE.streamRenderTimer = setTimeout(() => {
+            STATE.streamRenderTimer = null;
+            try {
+              const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : -1;
+              if (lastId >= 0) {
+                const msgs = getChatMessages(lastId);
+                if (msgs && msgs[0]) {
+                  STATE.currentMsgId = lastId;
+                  const raw = msgs[0].message || '';
+                  const clean = filterThinkingAndTags(raw, lastId);
+                  if (!clean) {
+                    STATE.sentences = ['(AI 正在思考中，思考完成后将自动切入小说正文...)'];
+                    STATE.currentSentenceIndex = 0;
+                  } else {
+                    STATE.sentences = splitIntoSentences(clean);
+                  }
+                  renderThiefBar();
+                  syncToDesktop();
                 }
-                renderThiefBar();
-                syncToDesktop();
               }
-            }
-          } catch (e) {}
+            } catch (e) {}
+          }, 150);
         });
       }
     }
@@ -3968,13 +4036,35 @@
     console.log('[ST-Thief-Book] 插件正在初始化...');
     loadSavedConfig();
     initTavernEvents();
-    injectSillyTavernEntrance();
-    setInterval(injectSillyTavernEntrance, 3000);
+    ensureSillyTavernEntrance();
     setupHostGlobalShortcuts();
     initDesktopBridge();
     refreshLatestMessage(false);
     console.log('[ST-Thief-Book] 初始化完成！已在主界面右下角注入悬浮按钮。');
   }
+
+  // 脚本被禁用/重载时（Tavern Helper 销毁本 iframe）清理宿主侧残留，避免死按钮与泄漏的监听器
+  window.addEventListener('unload', () => {
+    if (entranceRetryTimer) clearTimeout(entranceRetryTimer);
+    if (entranceObserver) {
+      entranceObserver.disconnect();
+      entranceObserver = null;
+    }
+    if (entranceViewportCleanup) {
+      entranceViewportCleanup();
+      entranceViewportCleanup = null;
+    }
+    try {
+      const topDoc = getSafeTopDoc();
+      if (topDoc) {
+        topDoc.getElementById('st-thief-floating-btn')?.remove();
+        if (topDoc._tbHostKeydownHandler) {
+          topDoc.removeEventListener('keydown', topDoc._tbHostKeydownHandler);
+          topDoc._tbHostKeydownHandler = null;
+        }
+      }
+    } catch (e) {}
+  });
 
   setTimeout(init, 500);
 

@@ -66,6 +66,7 @@ SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_STATE = 0x1, 0x2, 0x4, 0x8
+NIN_POPUPOPEN = 0x0406  # Vista+：悬停 tooltip 即将展示前 shell 会投递，借此按需刷新提示
 MF_STRING, MF_SEPARATOR = 0x0000, 0x0800
 TPM_RIGHTBUTTON, TPM_RETURNCMD = 0x0002, 0x0100
 IDI_APPLICATION = 32512
@@ -524,6 +525,7 @@ class Tray:
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.nid)):
             raise ctypes.WinError()
         self.visible = True
+        self._last_tip = self.nid.szTip
 
     def _load_icon(self):
         h = make_bar_icon(32)
@@ -552,7 +554,11 @@ class Tray:
         return f"摸鱼条 · {state}   {HOTKEY_RECALL[1]}=召回  {HOTKEY_STEALTH[1]}=隐身"
 
     def update_tip(self):
-        self.nid.szTip = self._tip_text()
+        text = self._tip_text()
+        if text == getattr(self, '_last_tip', None):
+            return
+        self._last_tip = text
+        self.nid.szTip = text
         # 保持 NIF_ICON，避免某些系统在 NIM_MODIFY 后把图标清空
         self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         self.nid.hIcon = self.icon
@@ -579,6 +585,10 @@ class Tray:
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == WM_TRAY:
             ev = lparam & 0xFFFF
+            # 悬停 tooltip 即将展示：同步刷新提示文本，替代原先每 2 秒一次的 EnumWindows 轮询
+            if ev == NIN_POPUPOPEN:
+                self.update_tip()
+                return 0
             # 同一个物理点击，Win11 的 shell 会重复投递 2~3 次 0x0202（还夹着 0x0203），
             # 不去重就会出现"点一下闪两下 = 看起来没反应"。这里做 400ms 去抖。
             if ev in (WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP):
@@ -665,33 +675,24 @@ def listen():
     except Exception as err:
         log(f"[tray] 托盘不可用: {err}")
 
-    def _tick():
-        if tray:
-            tray.update_tip()
-
     msg = wintypes.MSG()
-    last_tip = 0.0
     while True:
-        # 非阻塞取消息，顺便每 2 秒刷新一次托盘提示
-        while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-            if msg.message == WM_HOTKEY:
-                if msg.wParam == 1:
-                    recall()
-                elif msg.wParam == 2:
-                    stealth("toggle", verbose=False)
-                if tray:
-                    tray.update_tip()
-            elif msg.message == 0x0012:  # WM_QUIT
-                if tray:
-                    tray.remove()
-                return 0
-            else:
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-        if time.time() - last_tip > 2.0:
-            last_tip = time.time()
-            _tick()
-        time.sleep(0.05)
+        # 阻塞式取消息：空闲时线程挂起零 CPU；托盘提示由 NIN_POPUPOPEN 与交互动作按需刷新
+        ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+        if ret <= 0:  # 0 = WM_QUIT，-1 = 错误
+            if tray:
+                tray.remove()
+            return 0
+        if msg.message == WM_HOTKEY:
+            if msg.wParam == 1:
+                recall()
+            elif msg.wParam == 2:
+                stealth("toggle", verbose=False)
+            if tray:
+                tray.update_tip()
+        else:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
 
 
 def _pid_from_hwnd(hwnd):

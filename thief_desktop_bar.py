@@ -27,6 +27,7 @@ import sys
 import os
 import time
 import json
+import queue
 import socket
 import select
 import struct
@@ -56,7 +57,7 @@ class SimpleWebSocketServer:
         self.port = port
         self.on_message = on_message_callback
         self.token = token
-        self.clients = {}  # sock -> 是否已通过 hello 认证
+        self.clients = {}  # sock -> {'authed': bool, 'queue': queue.Queue}；发送统一走队列，避免慢客户端拖住广播
         self.server_sock = None
         self.running = False
         self.lock = threading.Lock()
@@ -162,7 +163,7 @@ class SimpleWebSocketServer:
             sock.sendall(resp.encode('utf-8'))
 
             with self.lock:
-                self.clients[sock] = False
+                self.clients[sock] = {'authed': False, 'queue': queue.Queue(maxsize=256)}
             print("[WebSocket Server] 客户端已连接，等待 hello 认证...", flush=True)
 
             sock.settimeout(10)
@@ -178,7 +179,15 @@ class SimpleWebSocketServer:
                 if opcode == 0x8:
                     break
                 elif opcode == 0x9:
-                    sock.sendall(bytes([0x8A, 0x00]))
+                    # 认证后发送统一由 sender 线程负责，pong 也走队列，避免两线程交错写帧
+                    info = self.clients.get(sock)
+                    if authenticated and info is not None:
+                        try:
+                            info['queue'].put_nowait(b"\x8a\x00")
+                        except queue.Full:
+                            break
+                    else:
+                        sock.sendall(b"\x8a\x00")
                     continue
 
                 if payload_len == 126:
@@ -214,9 +223,13 @@ class SimpleWebSocketServer:
                                     and hmac.compare_digest(token.encode('utf-8'), self.token.encode('utf-8'))):
                                 authenticated = True
                                 with self.lock:
-                                    self.clients[sock] = True
+                                    info = self.clients.get(sock)
+                                    if info is not None:
+                                        info['authed'] = True
                                 sock.settimeout(None)
+                                # hello_ok 必须先于 sender 线程启动发出，保证帧顺序
                                 self._send_json(sock, {'action': 'hello_ok'})
+                                threading.Thread(target=self._client_sender, args=(sock,), daemon=True).start()
                                 print("[WebSocket Server] 酒馆助手前端认证成功！", flush=True)
                             else:
                                 self._send_json(sock, {'action': 'hello_fail'})
@@ -230,27 +243,72 @@ class SimpleWebSocketServer:
         except Exception:
             pass
         finally:
-            with self.lock:
-                self.clients.pop(sock, None)
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._drop_client(sock)
             print("[WebSocket Server] 客户端连接断开")
+
+    def _drop_client(self, sock):
+        with self.lock:
+            info = self.clients.pop(sock, None)
+        if info is not None:
+            try:
+                info['queue'].put_nowait(None)  # 唤醒 sender 线程退出
+            except queue.Full:
+                pass
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _send_frame_with_timeout(sock, frame, timeout=5.0):
+        # 接收线程在同一个 sock 上阻塞 recv，不能用 settimeout（会互相影响），改用 select 控制发送时限
+        deadline = time.monotonic() + timeout
+        view = memoryview(frame)
+        while len(view) > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                _, wlist, _ = select.select([], [sock], [], remaining)
+                if not wlist:
+                    return False
+                sent = sock.send(view)
+                if sent <= 0:
+                    return False
+                view = view[sent:]
+            except Exception:
+                return False
+        return True
+
+    def _client_sender(self, sock):
+        while self.running:
+            info = self.clients.get(sock)
+            if info is None:
+                break
+            try:
+                frame = info['queue'].get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if frame is None:
+                break
+            if not self._send_frame_with_timeout(sock, frame):
+                self._drop_client(sock)
+                break
 
     def broadcast(self, data_dict):
         frame = self._encode_text_frame(json.dumps(data_dict, ensure_ascii=False))
         with self.lock:
-            dead = []
-            for c, authed in self.clients.items():
-                if not authed:
-                    continue
-                try:
-                    c.sendall(frame)
-                except Exception:
-                    dead.append(c)
-            for d in dead:
-                self.clients.pop(d, None)
+            targets = [(s, info) for s, info in self.clients.items() if info['authed']]
+        for sock, info in targets:
+            try:
+                info['queue'].put_nowait(frame)
+            except queue.Full:
+                # 慢客户端积压超过 256 帧直接丢弃，保护广播线程与其他客户端
+                self._drop_client(sock)
 
 
 # ------------------------------------------------------------------------------------
@@ -677,7 +735,10 @@ class ThiefDesktopBar:
         cur_x = override_x if override_x is not None else self.root.winfo_x()
         cur_y = override_y if override_y is not None else self.root.winfo_y()
 
-        self.root.geometry(f"{self.width}x{self.height}+{cur_x}+{cur_y}")
+        geo = f"{self.width}x{self.height}+{cur_x}+{cur_y}"
+        if getattr(self, '_last_geometry', None) != geo:
+            self._last_geometry = geo
+            self.root.geometry(geo)
 
     def _on_text_configure(self, event):
         pass
@@ -1934,7 +1995,13 @@ class ThiefDesktopBar:
             avail_w = max(120, self.width - 240 - char_w)
 
         # 2. 单行顺延分页（长句不裁剪，在下一行显示，高度严格恒定）
-        self._sub_chunks = self._paginate_sentence(self.current_sentence, avail_w)
+        # 翻子行/进度刷新时句子与宽度不变，直接命中缓存，避免重复二分测量
+        cache = getattr(self, '_paginate_cache', None)
+        if cache is not None and cache[0] == self.current_sentence and cache[1] == avail_w:
+            self._sub_chunks = cache[2]
+        else:
+            self._sub_chunks = self._paginate_sentence(self.current_sentence, avail_w)
+            self._paginate_cache = (self.current_sentence, avail_w, self._sub_chunks)
         if self._sub_chunk_idx >= len(self._sub_chunks):
             self._sub_chunk_idx = max(0, len(self._sub_chunks) - 1)
         elif self._sub_chunk_idx < 0:
