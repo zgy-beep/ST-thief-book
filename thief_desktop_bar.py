@@ -47,6 +47,23 @@ MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 WS_MAX_PAYLOAD = 1024 * 1024
 WS_HANDSHAKE_LIMIT = 8192
 PID_FILENAME = 'thief_bar.pid'
+BOSS_REPLY_TEXT = "Compiled successfully in 1240 ms. Watching for file changes..."
+
+
+def _enable_dpi_awareness():
+    # 必须在 tk.Tk() 之前：PER_MONITOR_AWARE_V2 让 Tk 按真实 DPI 渲染，避免高分屏/副屏被系统位图拉伸模糊
+    if not sys.platform.startswith('win'):
+        return
+    import ctypes
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 # ------------------------------------------------------------------------------------
 # 零依赖轻量 RFC 6455 WebSocket 服务端实现
@@ -339,6 +356,7 @@ class ThiefDesktopBar:
     }
 
     def __init__(self):
+        _enable_dpi_awareness()
         self.root = tk.Tk()
         self.root.title("VS Code Status Bar")
 
@@ -394,8 +412,8 @@ class ThiefDesktopBar:
         pos_y = max(0, screen_h - self.height - 45)
         self.root.geometry(f"{self.width}x{self.height}+{pos_x}+{pos_y}")
 
-        self.font_main = tkfont.Font(family="Segoe UI", size=9)
-        self.font_bold = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+        self.font_main = tkfont.Font(family="Microsoft YaHei UI", size=9)
+        self.font_bold = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
         self.font_mono = tkfont.Font(family="Consolas", size=9)
 
         self._drag_start_x = 0
@@ -1524,6 +1542,8 @@ class ThiefDesktopBar:
 
     def _submit_reply(self, event=None):
         text = self.entry_reply.get().strip()
+        if self.is_boss_key and text == BOSS_REPLY_TEXT:
+            return
         if text:
             self.server.broadcast({'action': 'reply', 'text': text})
             self.entry_reply.delete(0, tk.END)
@@ -1939,6 +1959,20 @@ class ThiefDesktopBar:
             print(f"[UI Sync Error]: {e}")
 
     def _update_display(self):
+        # 老板键进出在此统一收口（本地切换与 WS 同步都会走到）：进入存草稿，退出恢复
+        was_boss = getattr(self, '_displayed_boss_key', False)
+        if self.is_boss_key != was_boss:
+            if self.is_boss_key:
+                self._boss_reply_draft = self.entry_reply.get()
+            else:
+                # 伪装文本未被改动才恢复草稿，否则保留用户在老板键期间新输入的内容
+                if self.entry_reply.get() == BOSS_REPLY_TEXT:
+                    self.entry_reply.delete(0, tk.END)
+                    draft = getattr(self, '_boss_reply_draft', '')
+                    if draft:
+                        self.entry_reply.insert(0, draft)
+                self._boss_reply_draft = ''
+            self._displayed_boss_key = self.is_boss_key
         if self.is_boss_key:
             self.lbl_branch.configure(text="⎇ main*  ✓ 0 ⨉ 0")
             if hasattr(self, 'lbl_floor'):
@@ -1948,8 +1982,10 @@ class ThiefDesktopBar:
             self.lbl_text.configure(text="TypeScript 5.4.5  UTF-8  LF  Ln 142, Col 8  Ready", wraplength=0)
             self.lbl_right_info.configure(text="Ln 142, Col 8")
             self.lbl_prefix.configure(text=" [webpack]")
-            self.entry_reply.delete(0, tk.END)
-            self.entry_reply.insert(0, "Compiled successfully in 1240 ms. Watching for file changes...")
+            # 仅进入时（或输入框被发送清空后）重写伪装文本，避免同步刷新冲掉用户正在输入的内容
+            if not was_boss or not self.entry_reply.get():
+                self.entry_reply.delete(0, tk.END)
+                self.entry_reply.insert(0, BOSS_REPLY_TEXT)
             self._update_geometry_and_wrap()
             return
 

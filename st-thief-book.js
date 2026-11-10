@@ -1104,6 +1104,37 @@
         color: #ffa593;
         border-color: #f48771;
       }
+      #st-thief-standalone-settings-modal .st-thief-current-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        align-items: center;
+      }
+      #st-thief-standalone-settings-modal .tb-cur-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        padding: 1px 3px 1px 6px;
+        background: #252526;
+        border: 1px solid #3c3c3c;
+        border-radius: 3px;
+        font-size: 10px;
+        user-select: none;
+      }
+      #st-thief-standalone-settings-modal .tb-cur-wl { color: #4ec9b0; }
+      #st-thief-standalone-settings-modal .tb-cur-bl { color: #f48771; }
+      #st-thief-standalone-settings-modal .tb-cur-x {
+        cursor: pointer;
+        color: #888888;
+        padding: 0 3px;
+        border-radius: 2px;
+        font-weight: bold;
+        transition: all 0.12s;
+      }
+      #st-thief-standalone-settings-modal .tb-cur-x:hover {
+        color: #ffffff;
+        background: #e06c75;
+      }
       #st-thief-standalone-settings-modal .st-thief-hint {
         font-size: 10px;
         color: #777777;
@@ -1302,6 +1333,7 @@
               <span id="btn-clear-whitelist" class="st-thief-btn-link">清空白名单</span>
             </div>
             <textarea id="setting-whitelist" class="st-thief-textarea" placeholder="输入标签名，以英文逗号分隔">${whitelistVal}</textarea>
+            <div class="st-thief-current-chips" id="current-whitelist-chips"></div>
             <div class="st-thief-chips-row">
               <span class="st-thief-chips-label">快选:</span>
               <span class="tb-wl-chip" data-tag="content">+content</span>
@@ -1323,6 +1355,7 @@
               <span id="btn-clear-blacklist" class="st-thief-btn-link">清空黑名单</span>
             </div>
             <textarea id="setting-blacklist" class="st-thief-textarea" placeholder="输入黑名单标签，以英文逗号分隔">${blacklistVal}</textarea>
+            <div class="st-thief-current-chips" id="current-blacklist-chips"></div>
             <div class="st-thief-chips-row">
               <span class="st-thief-chips-label">快选:</span>
               <span class="tb-bl-chip" data-tag="think">+think</span>
@@ -1447,6 +1480,35 @@
       e.stopPropagation();
     });
 
+    const parseTags = val => val.split(/[,，\n]/).map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, '')).filter(Boolean);
+
+    // 当前标签 chips 与 textarea 同步：点 × 移除，输入/快选/清空/重置后自动刷新
+    function syncCurrentChips() {
+      [['#setting-whitelist', '#current-whitelist-chips', 'wl'], ['#setting-blacklist', '#current-blacklist-chips', 'bl']].forEach(([areaSel, rowSel, kind]) => {
+        const area = modal.querySelector(areaSel);
+        const row = modal.querySelector(rowSel);
+        if (!area || !row) return;
+        const tags = parseTags(area.value);
+        row.innerHTML = '<span class="st-thief-chips-label">当前:</span>' + (tags.length
+          ? tags.map(t => `<span class="tb-cur-chip tb-cur-${kind}">${escapeHtml(t)}<span class="tb-cur-x" data-tag="${escapeHtml(t)}" title="点击移除 ${escapeHtml(t)}">×</span></span>`).join('')
+          : '<span class="st-thief-chips-label">(空)</span>');
+      });
+    }
+
+    card?.addEventListener('click', e => {
+      const x = e.target.closest('.tb-cur-x');
+      if (!x) return;
+      const row = x.closest('.st-thief-current-chips');
+      const area = modal.querySelector(row && row.id === 'current-whitelist-chips' ? '#setting-whitelist' : '#setting-blacklist');
+      if (!area) return;
+      const tag = x.getAttribute('data-tag');
+      area.value = parseTags(area.value).filter(t => t !== tag).join(', ');
+      syncCurrentChips();
+    });
+    card?.addEventListener('input', e => {
+      if (e.target.id === 'setting-whitelist' || e.target.id === 'setting-blacklist') syncCurrentChips();
+    });
+
     modal.querySelector('#btn-standalone-close-settings')?.addEventListener('click', closeSettingsModal);
     modal.querySelector('#btn-cancel-settings')?.addEventListener('click', closeSettingsModal);
 
@@ -1455,6 +1517,7 @@
       if (area) {
         area.value = '';
         area.focus();
+        syncCurrentChips();
       }
     });
 
@@ -1463,6 +1526,7 @@
       if (area) {
         area.value = '';
         area.focus();
+        syncCurrentChips();
       }
     });
 
@@ -1471,13 +1535,11 @@
         const tag = chip.getAttribute('data-tag');
         const area = modal.querySelector('#setting-whitelist');
         if (!tag || !area) return;
-        const curTags = area.value
-          .split(/[,，\n]/)
-          .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-          .filter(Boolean);
+        const curTags = parseTags(area.value);
         if (!curTags.includes(tag)) {
           curTags.push(tag);
           area.value = curTags.join(', ');
+          syncCurrentChips();
         }
       });
     });
@@ -1487,16 +1549,16 @@
         const tag = chip.getAttribute('data-tag');
         const area = modal.querySelector('#setting-blacklist');
         if (!tag || !area) return;
-        const curTags = area.value
-          .split(/[,，\n]/)
-          .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-          .filter(Boolean);
+        const curTags = parseTags(area.value);
         if (!curTags.includes(tag)) {
           curTags.push(tag);
           area.value = curTags.join(', ');
+          syncCurrentChips();
         }
       });
     });
+
+    syncCurrentChips();
 
     modal.querySelector('#btn-reset-settings')?.addEventListener('click', () => {
       const wlArea = modal.querySelector('#setting-whitelist');
@@ -1527,6 +1589,7 @@
       if (deskSync) deskSync.checked = false;
       const bridgeToken = modal.querySelector('#setting-bridge-token');
       if (bridgeToken) bridgeToken.value = '';
+      syncCurrentChips();
     });
 
     modal.querySelector('#btn-reconnect-desktop')?.addEventListener('click', () => {
@@ -1643,20 +1706,45 @@
       -webkit-font-smoothing: antialiased;
     }
 
+    /* 主题令牌：所有组件颜色统一消费 CSS 变量，换肤只改这三组定义 */
     body.theme-vscode-dark, #st-thief-inpage-container.theme-vscode-dark {
-      background-color: #181818;
-      color: #cccccc;
-      border-top: 1px solid #2d2d2d;
+      --tb-bg: #181818; --tb-fg: #cccccc; --tb-border: #2d2d2d;
+      --tb-text: #f1f1f1; --tb-muted: #858585;
+      --tb-accent: #4ec9b0; --tb-accent-strong: #73e6cf;
+      --tb-accent-bg: rgba(78, 201, 176, 0.12); --tb-accent-border: rgba(78, 201, 176, 0.3);
+      --tb-link: #9cdcfe; --tb-focus: #007acc;
+      --tb-btn: #0e639c; --tb-btn-hover: #1177bb;
+      --tb-menu-bg: #1f1f1f; --tb-menu-border: #454545; --tb-menu-hover: #094771;
+      --tb-bg-minimal: #121212;
+      background-color: var(--tb-bg);
+      color: var(--tb-fg);
+      border-top: 1px solid var(--tb-border);
     }
     body.theme-vscode-blue, #st-thief-inpage-container.theme-vscode-blue {
-      background-color: #007acc;
-      color: #ffffff;
-      border-top: 1px solid #0062a3;
+      --tb-bg: #007acc; --tb-fg: #ffffff; --tb-border: #0062a3;
+      --tb-text: #ffffff; --tb-muted: #858585;
+      --tb-accent: #ffe699; --tb-accent-strong: #fff3c4;
+      --tb-accent-bg: rgba(255, 230, 153, 0.15); --tb-accent-border: rgba(255, 230, 153, 0.35);
+      --tb-link: #9cdcfe; --tb-focus: #007acc;
+      --tb-btn: #0e639c; --tb-btn-hover: #1177bb;
+      --tb-menu-bg: #1f1f1f; --tb-menu-border: #454545; --tb-menu-hover: #094771;
+      --tb-bg-minimal: #0d283d;
+      background-color: var(--tb-bg);
+      color: var(--tb-fg);
+      border-top: 1px solid var(--tb-border);
     }
     body.theme-terminal, #st-thief-inpage-container.theme-terminal {
-      background-color: #0c0c0c;
-      color: #00ff66;
-      border-top: 1px solid #1a1a1a;
+      --tb-bg: #0c0c0c; --tb-fg: #00ff66; --tb-border: #1a1a1a;
+      --tb-text: #00ff66; --tb-muted: #3d8f5f;
+      --tb-accent: #00ff66; --tb-accent-strong: #66ff99;
+      --tb-accent-bg: rgba(0, 255, 102, 0.1); --tb-accent-border: rgba(0, 255, 102, 0.3);
+      --tb-link: #00cc55; --tb-focus: #00ff66;
+      --tb-btn: #0f3d24; --tb-btn-hover: #1a5c38;
+      --tb-menu-bg: #0c0c0c; --tb-menu-border: #1f4d33; --tb-menu-hover: #0f3d24;
+      --tb-bg-minimal: #000000;
+      background-color: var(--tb-bg);
+      color: var(--tb-fg);
+      border-top: 1px solid var(--tb-border);
       font-family: Consolas, 'Courier New', monospace;
     }
 
@@ -1714,7 +1802,7 @@
       font-size: 11px;
     }
     .tb-git-branch {
-      color: #858585;
+      color: var(--tb-muted, #858585);
       font-family: Consolas, monospace;
       padding: 1px 4px;
       border-radius: 3px;
@@ -1738,8 +1826,8 @@
       transition: all 0.15s ease;
     }
     .tb-floor-nav-wrap:hover {
-      border-color: #007acc;
-      background: rgba(0, 122, 204, 0.1);
+      border-color: var(--tb-focus, #007acc);
+      background: var(--tb-accent-bg, rgba(0, 122, 204, 0.1));
     }
     .tb-floor-btn-step {
       display: inline-flex;
@@ -1766,14 +1854,14 @@
       font-family: Consolas, monospace;
       font-size: 11px;
       font-weight: 600;
-      color: #9cdcfe;
+      color: var(--tb-link, #9cdcfe);
       cursor: pointer;
       user-select: none;
       transition: all 0.12s ease;
       border-radius: 2px;
     }
     .tb-floor-num-badge:hover {
-      background: #0e639c;
+      background: var(--tb-btn, #0e639c);
       color: #ffffff;
     }
 
@@ -1808,18 +1896,19 @@
       font-size: 11px;
       font-weight: 600;
       border-radius: 3px;
-      background: rgba(78, 201, 176, 0.12);
-      color: #4ec9b0;
-      border: 1px solid rgba(78, 201, 176, 0.3);
+      background: var(--tb-accent-bg, rgba(78, 201, 176, 0.12));
+      color: var(--tb-accent, #4ec9b0);
+      border: 1px solid var(--tb-accent-border, rgba(78, 201, 176, 0.3));
       cursor: pointer;
       user-select: none;
       flex-shrink: 0;
       transition: all 0.15s ease;
     }
     .tb-char-badge:hover {
-      background: rgba(78, 201, 176, 0.22);
-      border-color: #4ec9b0;
-      color: #73e6cf;
+      background: var(--tb-accent-bg, rgba(78, 201, 176, 0.22));
+      border-color: var(--tb-accent, #4ec9b0);
+      color: var(--tb-accent-strong, #73e6cf);
+      filter: brightness(1.15);
     }
     .tb-char-compact {
       max-width: 68px;
@@ -1844,23 +1933,19 @@
       transition: all 0.15s ease;
     }
     .tb-char-hidden-pill:hover {
-      background: rgba(78, 201, 176, 0.2);
-      color: #4ec9b0;
-    }
-    body.theme-vscode-blue .tb-char-badge {
-      background: rgba(255, 230, 153, 0.15);
-      color: #ffe699;
-      border-color: rgba(255, 230, 153, 0.35);
+      background: var(--tb-accent-bg, rgba(78, 201, 176, 0.2));
+      color: var(--tb-accent, #4ec9b0);
     }
 
     .tb-sentence-text {
-      color: #f1f1f1;
+      flex: 1;
+      min-width: 0;
+      color: var(--tb-text, #f1f1f1);
       font-size: 12.5px;
       letter-spacing: 0.2px;
       line-height: 1.4;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: clip;
+      white-space: normal;
+      overflow-wrap: break-word;
       transition: filter 0.2s, opacity 0.15s;
     }
     .tb-sentence-text.nowrap {
@@ -1868,7 +1953,6 @@
       text-overflow: clip;
       white-space: nowrap;
     }
-    body.theme-vscode-blue .tb-sentence-text { color: #ffffff; }
 
     body.tb-blur-mode .tb-sentence-text { filter: blur(4px); }
     body.tb-blur-mode:hover .tb-sentence-text { filter: blur(0); }
@@ -1891,25 +1975,9 @@
     body.tb-privacy-mode.tb-privacy-active {
       opacity: var(--tb-user-opacity, 0.95) !important;
       pointer-events: auto;
+      background-color: var(--tb-bg, #181818) !important;
+      border-top: 1px solid var(--tb-border, #2d2d2d) !important;
       transition: opacity 0.15s ease-out, background-color 0.15s ease-out;
-    }
-    body.tb-privacy-mode.theme-vscode-dark:hover,
-    body.tb-privacy-mode.theme-vscode-dark.tb-mouse-over,
-    body.tb-privacy-mode.theme-vscode-dark.tb-privacy-active {
-      background-color: #181818 !important;
-      border-top: 1px solid #2d2d2d !important;
-    }
-    body.tb-privacy-mode.theme-vscode-blue:hover,
-    body.tb-privacy-mode.theme-vscode-blue.tb-mouse-over,
-    body.tb-privacy-mode.theme-vscode-blue.tb-privacy-active {
-      background-color: #007acc !important;
-      border-top: 1px solid #0062a3 !important;
-    }
-    body.tb-privacy-mode.theme-terminal:hover,
-    body.tb-privacy-mode.theme-terminal.tb-mouse-over,
-    body.tb-privacy-mode.theme-terminal.tb-privacy-active {
-      background-color: #0c0c0c !important;
-      border-top: 1px solid #1a1a1a !important;
     }
 
     #st-thief-inpage-container.tb-privacy-mode {
@@ -1929,26 +1997,10 @@
     #st-thief-inpage-container.tb-privacy-mode.tb-privacy-active {
       opacity: var(--tb-user-opacity, 0.95) !important;
       pointer-events: auto;
+      background-color: var(--tb-bg, #181818) !important;
+      border-top: 1px solid var(--tb-border, #2d2d2d) !important;
       box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.7);
       transition: opacity 0.15s ease-out;
-    }
-    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-dark:hover,
-    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-dark.tb-mouse-over,
-    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-dark.tb-privacy-active {
-      background-color: #181818 !important;
-      border-top: 1px solid #2d2d2d !important;
-    }
-    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-blue:hover,
-    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-blue.tb-mouse-over,
-    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-blue.tb-privacy-active {
-      background-color: #007acc !important;
-      border-top: 1px solid #0062a3 !important;
-    }
-    #st-thief-inpage-container.tb-privacy-mode.theme-terminal:hover,
-    #st-thief-inpage-container.tb-privacy-mode.theme-terminal.tb-mouse-over,
-    #st-thief-inpage-container.tb-privacy-mode.theme-terminal.tb-privacy-active {
-      background-color: #0c0c0c !important;
-      border-top: 1px solid #1a1a1a !important;
     }
 
     /* 移动端/触屏环境豁免：触屏无 hover 特性，防止隐私模式导致移动端完全不可见 */
@@ -1957,17 +2009,9 @@
       #st-thief-inpage-container.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active) {
         opacity: var(--tb-user-opacity, 0.95) !important;
       }
-      #st-thief-inpage-container.tb-privacy-mode.theme-vscode-dark {
-        background-color: #181818 !important;
-        border-top: 1px solid #2d2d2d !important;
-      }
-      #st-thief-inpage-container.tb-privacy-mode.theme-vscode-blue {
-        background-color: #007acc !important;
-        border-top: 1px solid #0062a3 !important;
-      }
-      #st-thief-inpage-container.tb-privacy-mode.theme-terminal {
-        background-color: #0c0c0c !important;
-        border-top: 1px solid #1a1a1a !important;
+      #st-thief-inpage-container.tb-privacy-mode {
+        background-color: var(--tb-bg, #181818) !important;
+        border-top: 1px solid var(--tb-border, #2d2d2d) !important;
       }
     }
 
@@ -1983,7 +2027,7 @@
     .tb-progress-badge {
       font-family: Consolas, monospace;
       font-size: 11px;
-      color: #858585;
+      color: var(--tb-muted, #858585);
       background: rgba(255, 255, 255, 0.05);
       padding: 1px 6px;
       border-radius: 3px;
@@ -1994,7 +2038,7 @@
     .tb-menu-trigger {
       font-size: 15px;
       font-weight: bold;
-      color: #9cdcfe;
+      color: var(--tb-link, #9cdcfe);
       padding: 1px 6px;
       border-radius: 3px;
       cursor: pointer;
@@ -2010,15 +2054,15 @@
     #tb-context-menu {
       position: fixed;
       z-index: 999999;
-      background: #1f1f1f;
-      border: 1px solid #454545;
+      background: var(--tb-menu-bg, #1f1f1f);
+      border: 1px solid var(--tb-menu-border, #454545);
       border-radius: 5px;
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.75);
       padding: 4px 0;
       min-width: 230px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Consolas, sans-serif;
       font-size: 12px;
-      color: #cccccc;
+      color: var(--tb-fg, #cccccc);
       user-select: none;
       animation: tbMenuFade 0.1s ease-out;
     }
@@ -2035,7 +2079,7 @@
       transition: background 0.1s;
     }
     .tb-menu-item:hover {
-      background: #094771;
+      background: var(--tb-menu-hover, #094771);
       color: #ffffff;
     }
     .tb-menu-item-left {
@@ -2053,14 +2097,14 @@
       width: 14px;
       text-align: center;
       font-size: 11px;
-      color: #4ec9b0;
+      color: var(--tb-accent, #4ec9b0);
       font-weight: bold;
       display: inline-block;
       flex-shrink: 0;
     }
     .tb-menu-shortcut {
       font-size: 10px;
-      color: #858585;
+      color: var(--tb-muted, #858585);
       margin-left: 14px;
       font-family: Consolas, monospace;
     }
@@ -2077,7 +2121,7 @@
       padding: 1px 5px;
       border-radius: 2px;
       background: rgba(255, 255, 255, 0.08);
-      color: #4ec9b0;
+      color: var(--tb-accent, #4ec9b0);
       margin-left: 6px;
     }
     .tb-menu-item:hover .tb-menu-tag {
@@ -2114,7 +2158,7 @@
       gap: 6px;
     }
     .tb-reply-prefix {
-      color: #4ec9b0;
+      color: var(--tb-accent, #4ec9b0);
       font-family: Consolas, monospace;
       font-weight: bold;
       font-size: 13px;
@@ -2134,13 +2178,13 @@
       transition: all 0.15s ease;
     }
     .tb-reply-input:focus {
-      border-color: #007acc;
+      border-color: var(--tb-focus, #007acc);
       background: rgba(0, 0, 0, 0.4);
-      box-shadow: 0 0 0 1px #007acc;
+      box-shadow: 0 0 0 1px var(--tb-focus, #007acc);
     }
     .tb-send-btn {
       padding: 2px 10px;
-      background: #0e639c;
+      background: var(--tb-btn, #0e639c);
       color: #ffffff;
       border-radius: 3px;
       cursor: pointer;
@@ -2150,7 +2194,7 @@
       transition: all 0.15s ease;
     }
     .tb-send-btn:hover {
-      background: #1177bb;
+      background: var(--tb-btn-hover, #1177bb);
       box-shadow: 0 1px 4px rgba(0, 122, 204, 0.4);
     }
     .tb-send-btn:active {
@@ -2208,13 +2252,13 @@
       transform: scale(0.95);
     }
     .tb-pop-btn.tb-pop-primary {
-      background: #0e639c;
-      border-color: #1177bb;
+      background: var(--tb-btn, #0e639c);
+      border-color: var(--tb-btn-hover, #1177bb);
       color: #ffffff;
       font-weight: 600;
     }
     .tb-pop-btn.tb-pop-primary:hover {
-      background: #1177bb;
+      background: var(--tb-btn-hover, #1177bb);
     }
 
     /* 设置模态弹窗 (视口自适应居中) */
@@ -2346,19 +2390,7 @@
     /* 极简模式 (纯文字+背景，完全符合参考图规范) */
     body.minimal-mode {
       border: none !important;
-      background: #141414;
-    }
-    body.minimal-mode.theme-vscode-dark {
-      background-color: #121212 !important;
-      border: none !important;
-    }
-    body.minimal-mode.theme-vscode-blue {
-      background-color: #0d283d !important;
-      border: none !important;
-    }
-    body.minimal-mode.theme-terminal {
-      background-color: #000000 !important;
-      border: none !important;
+      background-color: var(--tb-bg-minimal, #141414) !important;
     }
     body.minimal-mode .tb-section-left {
       display: none !important;
@@ -2532,6 +2564,30 @@
     });
   }
 
+  // 折行模式下窗口高度跟随正文实际行数；单行模式恢复基准高度。页内模式容器高度自适应，无需处理
+  function adjustWrapHeight(doc) {
+    if (STATE.isHostInpage || STATE.isBossKey) return;
+    if (STATE.isFloorPickerOpen || STATE.isSettingsOpen || STATE.isContextMenuOpen) return;
+    const win = STATE.thiefWindow;
+    if (!win || win.closed || typeof win.resizeTo !== 'function') return;
+    let contentH;
+    if (CONFIG.wrapMode === 'wrap') {
+      const readingRow = doc.querySelector('.tb-row-reading');
+      if (!readingRow) return;
+      const replyRow = doc.querySelector('.tb-row-reply');
+      contentH = readingRow.offsetHeight + (replyRow ? replyRow.offsetHeight : 0);
+      contentH = Math.max(CONFIG.layoutMode === 'double' ? 62 : 32, Math.min(300, contentH));
+    } else {
+      contentH = CONFIG.minimalMode
+        ? (CONFIG.layoutMode === 'double' ? 56 : 30)
+        : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
+    }
+    const target = contentH + 35;
+    if (Math.abs((win.outerHeight || 0) - target) > 2) {
+      try { win.resizeTo(CONFIG.barWidth, target); } catch (e) {}
+    }
+  }
+
   function renderThiefBar() {
     if (!STATE.thiefWindow || !STATE.thiefWindow.document) return;
     const doc = STATE.thiefWindow.document;
@@ -2592,7 +2648,11 @@
       if (STATE.isBossKey) return;
       if (!STATE.isFloorPickerOpen && !STATE.isContextMenuOpen) {
         const textEl = doc.getElementById('tb-text');
-        if (textEl && textEl.textContent !== currentSentence) textEl.textContent = currentSentence;
+        if (textEl && textEl.textContent !== currentSentence) {
+          textEl.textContent = currentSentence;
+          if (textEl.animate) textEl.animate([{ opacity: 0.35 }, { opacity: 1 }], { duration: 140, easing: 'ease-out' });
+          if (CONFIG.wrapMode === 'wrap') adjustWrapHeight(doc);
+        }
         const progressEl = doc.getElementById('tb-progress');
         const progressText = `${curIdx}/${totalSentences}`;
         if (progressEl && progressEl.textContent !== progressText) progressEl.textContent = progressText;
@@ -2648,9 +2708,9 @@
         <span class="tb-drag-handle" id="tb-drag-handle" title="按住拖拽调节摸鱼条上下高度 (双击贴底复位)">⠿</span>
         <span class="tb-git-branch" title="Git 分支">⎇ main*</span>
         <div class="tb-floor-nav-wrap" title="楼层导航 (点击跳转)">
-          <span class="tb-floor-btn-step" id="btn-floor-prev" title="上一楼 (快捷键: PageUp)">▲</span>
-          <span class="tb-floor-num-badge" id="btn-floor-picker" title="当前: 第 #${displayFloor} 楼 / 共 ${lastId} 楼\n[点击] 打开楼层快速跳转面板">#${displayFloor} ▾</span>
-          <span class="tb-floor-btn-step" id="btn-floor-next" title="下一楼 (快捷键: PageDown)">▼</span>
+          <span class="tb-floor-btn-step" id="btn-floor-prev" role="button" aria-label="上一楼" title="上一楼 (快捷键: PageUp)">▲</span>
+          <span class="tb-floor-num-badge" id="btn-floor-picker" role="button" aria-label="打开楼层快速跳转面板" title="当前: 第 #${displayFloor} 楼 / 共 ${lastId} 楼\n[点击] 打开楼层快速跳转面板">#${displayFloor} ▾</span>
+          <span class="tb-floor-btn-step" id="btn-floor-next" role="button" aria-label="下一楼" title="下一楼 (快捷键: PageDown)">▼</span>
         </div>
       `;
 
@@ -2668,7 +2728,7 @@
 
     const isNowrap = CONFIG.wrapMode === 'single';
     const centerHtml = `
-      <div class="tb-section-center" id="tb-text-wrapper" title="点击阅读下一句 (也可按 ←/→ 翻句，滚轮滚动)">
+      <div class="tb-section-center" id="tb-text-wrapper" role="button" aria-label="点击阅读下一句" title="点击阅读下一句 (也可按 ←/→ 翻句，滚轮滚动)">
         ${charBadgeHtml}
         <span class="tb-sentence-text ${isNowrap ? 'nowrap' : ''}" id="tb-text">${escapeHtml(currentSentence)}</span>
       </div>
@@ -2677,8 +2737,8 @@
     const rightHtml = `
       <div class="tb-section-right">
         <span class="tb-progress-badge" id="tb-progress" title="当前阅读进度">${curIdx}/${totalSentences}</span>
-        <span class="tb-menu-trigger" id="btn-context-menu" title="功能菜单 (鼠标右键任意处也可唤出)">⋮</span>
-        ${STATE.isHostInpage ? `<span class="tb-menu-trigger tb-close-btn" id="btn-inpage-close" title="收起摸鱼条" style="color:#e06c75; font-size:12px; margin-left:2px; font-weight:bold;">✕</span>` : ''}
+        <span class="tb-menu-trigger" id="btn-context-menu" role="button" aria-label="功能菜单" aria-haspopup="menu" aria-expanded="${STATE.isContextMenuOpen}" title="功能菜单 (鼠标右键任意处也可唤出)">⋮</span>
+        ${STATE.isHostInpage ? `<span class="tb-menu-trigger tb-close-btn" id="btn-inpage-close" role="button" aria-label="收起摸鱼条" title="收起摸鱼条" style="color:#e06c75; font-size:12px; margin-left:2px; font-weight:bold;">✕</span>` : ''}
       </div>
     `;
 
@@ -2687,8 +2747,8 @@
       replyRowHtml = `
         <div class="tb-row-reply">
           <span class="tb-reply-prefix">&gt;</span>
-          <input type="text" class="tb-reply-input" id="tb-input" placeholder="输入回复并按 Enter 发送..." />
-          <span class="tb-send-btn" id="btn-send">发送</span>
+          <input type="text" class="tb-reply-input" id="tb-input" aria-label="回复输入框，回车发送" placeholder="输入回复并按 Enter 发送..." />
+          <span class="tb-send-btn" id="btn-send" role="button" aria-label="发送回复">发送</span>
         </div>
       `;
     }
@@ -2697,7 +2757,7 @@
     let floorPopoverHtml = '';
     if (STATE.isFloorPickerOpen) {
       floorPopoverHtml = `
-        <div id="tb-floor-popover">
+        <div id="tb-floor-popover" role="dialog" aria-label="快速楼层跳转">
           <div class="tb-floor-popover-card">
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #333; padding-bottom:3px; margin-bottom:5px;">
               <span style="font-weight:600; color:#4ec9b0; font-size:11px;">📖 快速楼层跳转 (当前: #${displayFloor} / 共 ${lastId} 楼)</span>
@@ -2742,84 +2802,84 @@
         posStyle = `left: ${posX}px; top: ${posY}px;`;
       }
       contextMenuHtml = `
-        <div id="tb-context-menu" style="${posStyle}">
-          <div class="tb-menu-item" id="menu-toggle-minimal">
+        <div id="tb-context-menu" role="menu" aria-label="摸鱼条功能菜单" style="${posStyle}">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-minimal">
             <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.minimalMode ? '✓' : ''}</span><span>极简模式</span></div>
             <span class="tb-menu-shortcut">${CONFIG.minimalMode ? '已开启' : ''}</span>
           </div>
-          <div class="tb-menu-item" id="menu-toggle-privacy">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-privacy">
             <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.privacyMode ? '✓' : ''}</span><span>隐私模式 (悬停显示)</span></div>
             <span class="tb-menu-shortcut">${CONFIG.privacyMode ? '已开启' : ''}</span>
           </div>
-          <div class="tb-menu-item" id="menu-toggle-layout">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-layout">
             <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.layoutMode === 'double' ? '✓' : ''}</span><span>双行布局 (含回复框)</span></div>
             <span class="tb-menu-shortcut">${CONFIG.layoutMode === 'double' ? '双行' : '单行'}</span>
           </div>
           <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" id="menu-prev">
+          <div class="tb-menu-item" role="menuitem" id="menu-prev">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>上一句</span></div>
             <span class="tb-menu-shortcut">←</span>
           </div>
-          <div class="tb-menu-item" id="menu-next">
+          <div class="tb-menu-item" role="menuitem" id="menu-next">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>下一句</span></div>
             <span class="tb-menu-shortcut">→</span>
           </div>
-          <div class="tb-menu-item" id="menu-swipe">
+          <div class="tb-menu-item" role="menuitem" id="menu-swipe">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>重新生成</span></div>
             <span class="tb-menu-shortcut">Alt+S</span>
           </div>
           ${STATE.isGenerating ? `
-          <div class="tb-menu-item" id="menu-stop" style="color:#f44747;">
+          <div class="tb-menu-item" role="menuitem" id="menu-stop" style="color:#f44747;">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>中止生成</span></div>
             <span class="tb-menu-shortcut">Alt+X</span>
           </div>
           ` : ''}
           <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" id="menu-floor-prev">
+          <div class="tb-menu-item" role="menuitem" id="menu-floor-prev">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>上一楼</span></div>
             <span class="tb-menu-shortcut">PageUp</span>
           </div>
-          <div class="tb-menu-item" id="menu-floor-next">
+          <div class="tb-menu-item" role="menuitem" id="menu-floor-next">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>下一楼</span></div>
             <span class="tb-menu-shortcut">PageDown</span>
           </div>
-          <div class="tb-menu-item" id="menu-floor-jump">
+          <div class="tb-menu-item" role="menuitem" id="menu-floor-jump">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>跳转楼层...</span></div>
             <span class="tb-menu-shortcut">#${displayFloor}</span>
           </div>
           <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" id="menu-toggle-wrap">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-wrap">
             <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.wrapMode === 'wrap' ? '✓' : ''}</span><span>自动折行全显</span></div>
           </div>
-          <div class="tb-menu-item" id="menu-toggle-user-messages">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-user-messages">
             <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.showUserMessages ? '✓' : ''}</span><span>显示用户消息</span></div>
           </div>
-          <div class="tb-menu-item" id="menu-toggle-width">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-width">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>窗口长度</span></div>
             <span class="tb-menu-shortcut">${CONFIG.barWidth}px</span>
           </div>
-          <div class="tb-menu-item" id="menu-toggle-char">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-char">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>角色名模式</span></div>
             <span class="tb-menu-shortcut">${CONFIG.charNameMode === 'compact' ? '精简' : (CONFIG.charNameMode === 'hidden' ? '隐藏' : '完整')}</span>
           </div>
-          <div class="tb-menu-item" id="menu-toggle-filter">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-filter">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>过滤模式</span></div>
             <span class="tb-menu-shortcut">${CONFIG.filterMode === 'pure' ? '纯净' : '正则'}</span>
           </div>
-          <div class="tb-menu-item" id="menu-toggle-desktopsync">
+          <div class="tb-menu-item" role="menuitem" id="menu-toggle-desktopsync">
             <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.enableDesktopSync ? '✓' : ''}</span><span>桌面端同步</span></div>
             <span class="tb-menu-shortcut">${CONFIG.enableDesktopSync ? (STATE.wsAuthenticated ? '已连接' : (STATE.wsClient ? '待认证' : '未连接')) : '未开启'}</span>
           </div>
           <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" id="menu-boss">
+          <div class="tb-menu-item" role="menuitem" id="menu-boss">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>老板键 (伪装)</span></div>
             <span class="tb-menu-shortcut">Esc</span>
           </div>
-          <div class="tb-menu-item" id="menu-settings">
+          <div class="tb-menu-item" role="menuitem" id="menu-settings">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>设置...</span></div>
           </div>
           <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" id="menu-inpage-close" style="color:#e06c75;">
+          <div class="tb-menu-item" role="menuitem" id="menu-inpage-close" style="color:#e06c75;">
             <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>退出摸鱼条</span></div>
           </div>
         </div>
@@ -2851,6 +2911,7 @@
         try { newInput.setSelectionRange(selStart, selStart); } catch (e) {}
       }
     }
+    adjustWrapHeight(doc);
   }
 
   // ------------------------------------------------------------------------------------
@@ -3691,7 +3752,7 @@
           STATE.thiefWindow = null;
         });
         pipWin.addEventListener('resize', () => {
-          if (pipWin.innerWidth && pipWin.innerWidth >= 360) {
+          if (pipWin.innerWidth && pipWin.innerWidth >= 360 && pipWin.innerWidth !== CONFIG.barWidth) {
             CONFIG.barWidth = pipWin.innerWidth;
             saveCurrentConfig();
             syncToDesktop();
