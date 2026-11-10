@@ -36,6 +36,8 @@
   // 配置与状态管理
   // ------------------------------------------------------------------------------------
   const CONFIG = {
+    // 是否启用本地 Python 桌面端 (WebSocket) 同步 (默认 false：纯网页模式，不默认主动开启，杜绝连接报错)
+    enableDesktopSync: false,
     // 布局模式: 'double' (双行边看边回) | 'single' (32px极窄单行)
     layoutMode: 'double',
     // 文本过滤模式: 'pure' (纯净模式：绝不引入美化HTML，剥离思考块与标签) | 'regex' (正则清洗模式)
@@ -56,6 +58,8 @@
     wrapMode: 'wrap',
     // 极简模式: true (纯文字+背景无边框，极度隐蔽) | false (标准 VS Code 状态栏)
     minimalMode: false,
+    // 隐私模式: true (鼠标悬浮在窗口上方时才显示，移开时窗口隐藏) | false (常驻显示)
+    privacyMode: false,
     // 尺寸配置
     doubleHeight: 74,
     singleHeight: 40,
@@ -92,8 +96,48 @@
     isContextMenuOpen: false,
     contextMenuPos: { x: 0, y: 0 },
     thiefWindow: null,
-    wsClient: null
+    wsClient: null,
+    wsReconnectTimer: null,
+    wsConnecting: false,
+    isHostInpage: false,
+    inpageContainer: null
   };
+
+  // 检查是否处于手机/移动端窄屏环境
+  function isMobileDevice() {
+    try {
+      if (typeof navigator !== 'undefined') {
+        const ua = navigator.userAgent || '';
+        if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(ua)) {
+          return true;
+        }
+      }
+      if (typeof window !== 'undefined') {
+        const topWin = window.top || window;
+        if (topWin.matchMedia && topWin.matchMedia('(max-width: 768px)').matches) {
+          return true;
+        }
+        if (topWin.innerWidth <= 768) {
+          return true;
+        }
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // 获取当前屏幕实际可用宽度 (移动端自适应，绝不截断溢出)
+  function getEffectiveBarWidth() {
+    let w = CONFIG.barWidth || 840;
+    try {
+      const topWin = window.top || window;
+      const vp = topWin.visualViewport;
+      const curW = (vp ? vp.width : topWin.innerWidth) || (topWin.screen ? topWin.screen.width : 0);
+      if (curW > 0 && curW < w) {
+        w = Math.max(260, Math.floor(curW));
+      }
+    } catch (e) {}
+    return w;
+  }
 
   // 读取持久化配置
   function loadSavedConfig() {
@@ -101,6 +145,9 @@
       const raw = localStorage.getItem('ST_THIEF_CONFIG_V3') || localStorage.getItem('ST_THIEF_CONFIG_V2');
       if (raw) {
         const saved = JSON.parse(raw);
+        if (typeof saved.enableDesktopSync === 'boolean') {
+          CONFIG.enableDesktopSync = saved.enableDesktopSync;
+        }
         if (typeof saved.showUserMessages === 'boolean') {
           CONFIG.showUserMessages = saved.showUserMessages;
         }
@@ -144,6 +191,9 @@
         if (typeof saved.minimalMode === 'boolean') {
           CONFIG.minimalMode = saved.minimalMode;
         }
+        if (typeof saved.privacyMode === 'boolean') {
+          CONFIG.privacyMode = saved.privacyMode;
+        }
         if (typeof saved.barWidth === 'number' && saved.barWidth >= 360) {
           CONFIG.barWidth = saved.barWidth;
         }
@@ -157,6 +207,7 @@
   function saveCurrentConfig() {
     try {
       const data = {
+        enableDesktopSync: CONFIG.enableDesktopSync,
         showUserMessages: CONFIG.showUserMessages,
         enableWhitelist: CONFIG.enableWhitelist,
         tagWhitelist: CONFIG.tagWhitelist,
@@ -168,6 +219,7 @@
         charNameMode: CONFIG.charNameMode,
         wrapMode: CONFIG.wrapMode,
         minimalMode: CONFIG.minimalMode,
+        privacyMode: CONFIG.privacyMode,
         opacity: CONFIG.opacity,
         layoutMode: CONFIG.layoutMode,
         barWidth: CONFIG.barWidth
@@ -401,8 +453,9 @@
     let content = text.trim();
     if (!content) return ['(无对白内容)'];
 
-    // 根据当前窗口宽度动态评估单行最大字数容纳量 (约每字15px)
-    const lineCapChars = Math.max(18, Math.min(60, Math.floor(((CONFIG.barWidth || 840) - 180) / 16)));
+    // 根据当前窗口/视口实际宽度动态评估单行最大字数容纳量 (适配手机端与小屏)
+    const effectiveBarW = getEffectiveBarWidth();
+    const lineCapChars = Math.max(12, Math.min(60, Math.floor((effectiveBarW - 140) / 16)));
 
     // 句子切分：支持在强句末标点（。！？!?；…\n）切分；
     // 当单句较长遇到逗号、顿号、破折号时，自然切分成单行小短句，超长文字顺延在下一行显示，绝不向下撑高窗口
@@ -604,7 +657,7 @@
 
   function toggleFloorPicker(forcedState) {
     STATE.isFloorPickerOpen = typeof forcedState === 'boolean' ? forcedState : !STATE.isFloorPickerOpen;
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isSettingsOpen) {
+    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
       const baseH = CONFIG.minimalMode
         ? (CONFIG.layoutMode === 'double' ? 56 : 30)
         : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
@@ -672,7 +725,7 @@
     CONFIG.minimalMode = typeof forcedState === 'boolean' ? forcedState : !CONFIG.minimalMode;
     saveCurrentConfig();
     flashStatusHint(`极简模式: ${CONFIG.minimalMode ? '✨ 已开启 (纯文字+背景)' : '📋 已关闭 (标准状态栏)'}`);
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isSettingsOpen) {
+    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
       const baseH = CONFIG.minimalMode
         ? (CONFIG.layoutMode === 'double' ? 56 : 30)
         : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
@@ -680,6 +733,15 @@
         STATE.thiefWindow.resizeTo(CONFIG.barWidth, baseH + 35);
       } catch (e) {}
     }
+    renderThiefBar();
+    syncToDesktop();
+  }
+
+  function togglePrivacyMode(forcedState) {
+    STATE.isContextMenuOpen = false;
+    CONFIG.privacyMode = typeof forcedState === 'boolean' ? forcedState : !CONFIG.privacyMode;
+    saveCurrentConfig();
+    flashStatusHint(`隐私模式: ${CONFIG.privacyMode ? '👻 已开启 (移开隐藏 / 悬浮显示)' : '👁️ 已关闭 (常驻显示)'}`);
     renderThiefBar();
     syncToDesktop();
   }
@@ -834,7 +896,7 @@
     STATE.isContextMenuOpen = false;
     CONFIG.layoutMode = CONFIG.layoutMode === 'double' ? 'single' : 'double';
     saveCurrentConfig();
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isSettingsOpen) {
+    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
       const baseH = CONFIG.minimalMode
         ? (CONFIG.layoutMode === 'double' ? 56 : 30)
         : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
@@ -854,30 +916,683 @@
     refreshLatestMessage(false);
   }
 
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function ensureStandaloneSettingsStyles(topDoc) {
+    if (!topDoc || topDoc.getElementById('st-thief-standalone-settings-style')) return;
+    const style = topDoc.createElement('style');
+    style.id = 'st-thief-standalone-settings-style';
+    style.textContent = `
+      #st-thief-standalone-settings-modal {
+        position: fixed;
+        top: 0; left: 0; right: 0; bottom: 0;
+        width: 100vw; height: 100vh;
+        background: rgba(0, 0, 0, 0.75);
+        backdrop-filter: blur(5px);
+        -webkit-backdrop-filter: blur(5px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10000000;
+        padding: 16px;
+        box-sizing: border-box;
+        animation: stThiefFadeIn 0.15s ease-out;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, Consolas, sans-serif;
+        color: #cccccc;
+      }
+      @keyframes stThiefFadeIn {
+        from { opacity: 0; transform: scale(0.98); }
+        to { opacity: 1; transform: scale(1); }
+      }
+      #st-thief-standalone-settings-modal * {
+        box-sizing: border-box;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-card {
+        background: #1e1e1e;
+        color: #cccccc;
+        border: 1px solid #333333;
+        border-radius: 8px;
+        width: 100%;
+        max-width: 680px;
+        max-height: 90vh;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.85);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px 16px;
+        background: #252526;
+        border-bottom: 1px solid #333333;
+        user-select: none;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: #cccccc;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-close {
+        cursor: pointer;
+        font-size: 16px;
+        line-height: 1;
+        color: #888888;
+        padding: 4px 8px;
+        border-radius: 4px;
+        transition: all 0.15s;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-close:hover {
+        background: rgba(255, 255, 255, 0.12);
+        color: #ffffff;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-body {
+        padding: 14px 16px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-body::-webkit-scrollbar {
+        width: 6px;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-body::-webkit-scrollbar-thumb {
+        background: #333333;
+        border-radius: 3px;
+      }
+      #st-thief-standalone-settings-modal .st-thief-section {
+        background: #252526;
+        border: 1px solid #2d2d2d;
+        border-radius: 6px;
+        padding: 10px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      #st-thief-standalone-settings-modal .st-thief-section-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      #st-thief-standalone-settings-modal .st-thief-section-title {
+        font-size: 11px;
+        font-weight: 600;
+        color: #cccccc;
+      }
+      #st-thief-standalone-settings-modal .st-thief-btn-link {
+        font-size: 11px;
+        color: #888888;
+        cursor: pointer;
+        text-decoration: underline;
+        transition: color 0.15s;
+      }
+      #st-thief-standalone-settings-modal .st-thief-btn-link:hover {
+        color: #cccccc;
+      }
+      #st-thief-standalone-settings-modal .st-thief-textarea {
+        width: 100%;
+        height: 38px;
+        background: #181818;
+        color: #cccccc;
+        border: 1px solid #3c3c3c;
+        border-radius: 4px;
+        padding: 5px 8px;
+        font-family: Consolas, 'Courier New', monospace;
+        font-size: 11px;
+        resize: none;
+        outline: none;
+        line-height: 1.4;
+        transition: border-color 0.15s;
+      }
+      #st-thief-standalone-settings-modal .st-thief-textarea:focus {
+        border-color: #007acc;
+      }
+      #st-thief-standalone-settings-modal .st-thief-chips-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        align-items: center;
+      }
+      #st-thief-standalone-settings-modal .st-thief-chips-label {
+        font-size: 10px;
+        color: #777777;
+      }
+      #st-thief-standalone-settings-modal .tb-wl-chip,
+      #st-thief-standalone-settings-modal .tb-bl-chip {
+        padding: 2px 7px;
+        background: #1e1e1e;
+        border: 1px solid #3c3c3c;
+        border-radius: 3px;
+        font-size: 10px;
+        cursor: pointer;
+        user-select: none;
+        transition: all 0.15s;
+      }
+      #st-thief-standalone-settings-modal .tb-wl-chip { color: #4ec9b0; }
+      #st-thief-standalone-settings-modal .tb-wl-chip:hover {
+        background: #1e3a35;
+        color: #73e6cf;
+        border-color: #4ec9b0;
+      }
+      #st-thief-standalone-settings-modal .tb-bl-chip { color: #f48771; }
+      #st-thief-standalone-settings-modal .tb-bl-chip:hover {
+        background: #3c2420;
+        color: #ffa593;
+        border-color: #f48771;
+      }
+      #st-thief-standalone-settings-modal .st-thief-hint {
+        font-size: 10px;
+        color: #777777;
+        line-height: 1.3;
+      }
+      #st-thief-standalone-settings-modal .st-thief-form-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px 16px;
+      }
+      @media (max-width: 600px) {
+        #st-thief-standalone-settings-modal .st-thief-form-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+      #st-thief-standalone-settings-modal .st-thief-form-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #st-thief-standalone-settings-modal .st-thief-form-item label {
+        font-size: 11px;
+        color: #9cdcfe;
+        font-weight: 500;
+        width: 70px;
+        flex-shrink: 0;
+        text-align: right;
+      }
+      #st-thief-standalone-settings-modal .st-thief-form-item select,
+      #st-thief-standalone-settings-modal .st-thief-form-item input[type="number"] {
+        flex: 1;
+        background: #181818;
+        color: #cccccc;
+        border: 1px solid #3c3c3c;
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 11px;
+        outline: none;
+        transition: border-color 0.15s;
+      }
+      #st-thief-standalone-settings-modal .st-thief-form-item select:focus,
+      #st-thief-standalone-settings-modal .st-thief-form-item input[type="number"]:focus {
+        border-color: #007acc;
+      }
+      #st-thief-standalone-settings-modal .st-thief-checkbox-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap: 8px 12px;
+        padding-top: 6px;
+        border-top: 1px solid #2d2d2d;
+      }
+      #st-thief-standalone-settings-modal .st-thief-checkbox-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: #cccccc;
+        cursor: pointer;
+        user-select: none;
+      }
+      #st-thief-standalone-settings-modal .st-thief-checkbox-item input[type="checkbox"] {
+        cursor: pointer;
+        accent-color: #007acc;
+        width: 14px;
+        height: 14px;
+      }
+      #st-thief-standalone-settings-modal .st-thief-status-btn {
+        padding: 3px 10px;
+        font-size: 11px;
+        border-radius: 3px;
+        cursor: pointer;
+        transition: all 0.15s;
+        white-space: nowrap;
+      }
+      #st-thief-standalone-settings-modal .st-thief-settings-footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px 16px;
+        background: #181818;
+        border-top: 1px solid #2d2d2d;
+        user-select: none;
+      }
+      #st-thief-standalone-settings-modal .tb-btn-primary {
+        padding: 5px 18px;
+        background: #0e639c;
+        color: #ffffff;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+        transition: background 0.15s;
+      }
+      #st-thief-standalone-settings-modal .tb-btn-primary:hover {
+        background: #1177bb;
+      }
+      #st-thief-standalone-settings-modal .tb-btn-secondary {
+        padding: 5px 14px;
+        background: #2a2a2a;
+        color: #cccccc;
+        border: 1px solid #444;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 11px;
+        transition: background 0.15s;
+      }
+      #st-thief-standalone-settings-modal .tb-btn-secondary:hover {
+        background: #333333;
+      }
+      #st-thief-standalone-settings-modal .tb-btn-danger {
+        padding: 5px 12px;
+        background: #2a2a2a;
+        color: #999999;
+        border: 1px solid #3a3a3a;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 11px;
+        transition: all 0.15s;
+      }
+      #st-thief-standalone-settings-modal .tb-btn-danger:hover {
+        background: #333333;
+        color: #cccccc;
+      }
+    `;
+    topDoc.head.appendChild(style);
+  }
+
   function openSettingsModal() {
     STATE.isSettingsOpen = true;
-    if (!STATE.thiefWindow || STATE.thiefWindow.closed) {
-      openThiefBar();
-      return;
+    const topDoc = getSafeTopDoc();
+    if (!topDoc || !topDoc.body) return;
+
+    ensureStandaloneSettingsStyles(topDoc);
+
+    let modal = topDoc.getElementById('st-thief-standalone-settings-modal');
+    if (!modal) {
+      modal = topDoc.createElement('div');
+      modal.id = 'st-thief-standalone-settings-modal';
+      topDoc.body.appendChild(modal);
     }
-    try {
-      STATE.thiefWindow.resizeTo(CONFIG.barWidth, 500);
-    } catch (e) {}
-    renderThiefBar();
+
+    const wlList = Array.isArray(CONFIG.tagWhitelist) ? CONFIG.tagWhitelist : DEFAULT_TAG_WHITELIST;
+    const blList = Array.isArray(CONFIG.tagBlacklist) ? CONFIG.tagBlacklist : DEFAULT_TAG_BLACKLIST;
+    const whitelistVal = escapeHtml(wlList.join(', '));
+    const blacklistVal = escapeHtml(blList.join(', '));
+    const barWidthVal = CONFIG.barWidth || 840;
+
+    const wlChecked = CONFIG.enableWhitelist ? 'checked' : '';
+    const minChecked = CONFIG.minimalMode ? 'checked' : '';
+    const privacyChecked = CONFIG.privacyMode ? 'checked' : '';
+    const userMsgChecked = CONFIG.showUserMessages ? 'checked' : '';
+    const actChecked = CONFIG.filterActions ? 'checked' : '';
+    const blurChecked = CONFIG.hoverBlur ? 'checked' : '';
+    const deskSyncChecked = CONFIG.enableDesktopSync ? 'checked' : '';
+
+    const filterModePure = CONFIG.filterMode === 'pure' ? 'selected' : '';
+    const filterModeRegex = CONFIG.filterMode === 'regex' ? 'selected' : '';
+
+    const charModeCompact = CONFIG.charNameMode === 'compact' ? 'selected' : '';
+    const charModeHidden = CONFIG.charNameMode === 'hidden' ? 'selected' : '';
+    const charModeFull = CONFIG.charNameMode === 'full' ? 'selected' : '';
+
+    const wrapModeWrap = CONFIG.wrapMode === 'wrap' ? 'selected' : '';
+    const wrapModeSingle = CONFIG.wrapMode === 'single' ? 'selected' : '';
+
+    let deskStatusText = '未开启';
+    let deskBtnStyle = 'background:#252526; color:#888888; border:1px solid #3c3c3c;';
+    if (CONFIG.enableDesktopSync) {
+      if (STATE.wsClient) {
+        deskStatusText = '● 已连接';
+        deskBtnStyle = 'background:#1b3a24; color:#81c784; border:1px solid #2e7d32;';
+      } else {
+        deskStatusText = '○ 未连接 (重试)';
+        deskBtnStyle = 'background:#3d3322; color:#ffd54f; border:1px solid #8d6e63;';
+      }
+    }
+
+    modal.innerHTML = `
+      <div class="st-thief-settings-card" id="st-thief-settings-card">
+        <div class="st-thief-settings-header">
+          <div class="st-thief-settings-title">ST-Thief-Book 设置与规则过滤</div>
+          <span class="st-thief-settings-close" id="btn-standalone-close-settings" title="关闭设置 (Esc)">✕</span>
+        </div>
+        <div class="st-thief-settings-body">
+          <!-- 1. 白名单提取容器 -->
+          <div class="st-thief-section">
+            <div class="st-thief-section-header">
+              <label class="st-thief-checkbox-item" style="font-weight:600; color:#4ec9b0;">
+                <input type="checkbox" id="setting-enable-whitelist" ${wlChecked} />
+                <span>启用正文白名单提取</span>
+              </label>
+              <span id="btn-clear-whitelist" class="st-thief-btn-link">清空白名单</span>
+            </div>
+            <textarea id="setting-whitelist" class="st-thief-textarea" placeholder="输入标签名，以英文逗号分隔">${whitelistVal}</textarea>
+            <div class="st-thief-chips-row">
+              <span class="st-thief-chips-label">快选:</span>
+              <span class="tb-wl-chip" data-tag="content">+content</span>
+              <span class="tb-wl-chip" data-tag="output">+output</span>
+              <span class="tb-wl-chip" data-tag="response">+response</span>
+              <span class="tb-wl-chip" data-tag="dialogue">+dialogue</span>
+              <span class="tb-wl-chip" data-tag="story">+story</span>
+              <span class="tb-wl-chip" data-tag="reply">+reply</span>
+              <span class="tb-wl-chip" data-tag="text">+text</span>
+              <span class="tb-wl-chip" data-tag="正文">+正文</span>
+            </div>
+            <div class="st-thief-hint">优先提取白名单标签内的正文内容；未匹配任何白名单时安全降级读取全文。</div>
+          </div>
+
+          <!-- 2. 黑名单剥离 -->
+          <div class="st-thief-section">
+            <div class="st-thief-section-header">
+              <span class="st-thief-section-title" style="color:#f48771;">思考与元数据黑名单 (彻底清除标签及其内部内容)</span>
+              <span id="btn-clear-blacklist" class="st-thief-btn-link">清空黑名单</span>
+            </div>
+            <textarea id="setting-blacklist" class="st-thief-textarea" placeholder="输入黑名单标签，以英文逗号分隔">${blacklistVal}</textarea>
+            <div class="st-thief-chips-row">
+              <span class="st-thief-chips-label">快选:</span>
+              <span class="tb-bl-chip" data-tag="think">+think</span>
+              <span class="tb-bl-chip" data-tag="thought">+thought</span>
+              <span class="tb-bl-chip" data-tag="cot">+cot</span>
+              <span class="tb-bl-chip" data-tag="status">+status</span>
+              <span class="tb-bl-chip" data-tag="bbi_image">+bbi_image</span>
+              <span class="tb-bl-chip" data-tag="fox_hugou">+fox_hugou</span>
+              <span class="tb-bl-chip" data-tag="fox_selc">+fox_selc</span>
+              <span class="tb-bl-chip" data-tag="fox_tip">+fox_tip</span>
+              <span class="tb-bl-chip" data-tag="so_seq">+so_seq</span>
+              <span class="tb-bl-chip" data-tag="details">+details</span>
+            </div>
+            <div class="st-thief-hint">彻底剥离上述标签块及内容；其他普通排版标签仅剥除尖括号保留纯文字。</div>
+          </div>
+
+          <!-- 3. 阅读与界面参数 -->
+          <div class="st-thief-section">
+            <div class="st-thief-form-grid">
+              <div class="st-thief-form-item">
+                <label for="setting-filtermode">阅读模式</label>
+                <select id="setting-filtermode">
+                  <option value="pure" ${filterModePure}>纯净小说模式 (过滤多余标签，短小精炼)</option>
+                  <option value="regex" ${filterModeRegex}>酒馆正则清洗模式 (执行正则后清洗)</option>
+                </select>
+              </div>
+              <div class="st-thief-form-item">
+                <label for="setting-charmode">角色名显示</label>
+                <select id="setting-charmode">
+                  <option value="compact" ${charModeCompact}>精简胶囊 (限制宽度并省略)</option>
+                  <option value="hidden" ${charModeHidden}>完全隐藏 (最大正文空间)</option>
+                  <option value="full" ${charModeFull}>完整显示</option>
+                </select>
+              </div>
+              <div class="st-thief-form-item">
+                <label for="setting-wrapmode">换行展示</label>
+                <select id="setting-wrapmode">
+                  <option value="wrap" ${wrapModeWrap}>自动折行全显 (完整展示长句)</option>
+                  <option value="single" ${wrapModeSingle}>单行截断</option>
+                </select>
+              </div>
+              <div class="st-thief-form-item">
+                <label for="setting-barwidth">摸鱼条长度</label>
+                <div style="display:flex; align-items:center; gap:6px; flex:1;">
+                  <input type="number" id="setting-barwidth" value="${barWidthVal}" min="360" max="2560" step="20" />
+                  <span style="font-size:11px; color:#888;">px</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 功能开关 -->
+            <div class="st-thief-checkbox-grid">
+              <label class="st-thief-checkbox-item">
+                <input type="checkbox" id="setting-minimal-mode" ${minChecked} />
+                <span>极简模式 (纯文字无边框)</span>
+              </label>
+              <label class="st-thief-checkbox-item">
+                <input type="checkbox" id="setting-privacy-mode" ${privacyChecked} />
+                <span>隐私模式 (悬停显示/移开隐藏)</span>
+              </label>
+              <label class="st-thief-checkbox-item">
+                <input type="checkbox" id="setting-filter-actions" ${actChecked} />
+                <span>过滤动作描写 (*xxx*)</span>
+              </label>
+              <label class="st-thief-checkbox-item">
+                <input type="checkbox" id="setting-show-user-messages" ${userMsgChecked} />
+                <span>显示用户消息 (默认仅阅读AI)</span>
+              </label>
+              <label class="st-thief-checkbox-item">
+                <input type="checkbox" id="setting-hover-blur" ${blurChecked} />
+                <span>防窥毛玻璃 (鼠标移开模糊)</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 4. 桌面端同步 -->
+          <div class="st-thief-section">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <label class="st-thief-checkbox-item" style="font-weight:500;">
+                <input type="checkbox" id="setting-enable-desktopsync" ${deskSyncChecked} />
+                <span>启用本地桌面端同步 (thief_desktop_bar.py)</span>
+              </label>
+              <button type="button" id="btn-reconnect-desktop" class="st-thief-status-btn" style="${deskBtnStyle}">
+                ${deskStatusText}
+              </button>
+            </div>
+            <div class="st-thief-hint">默认保持纯网页模式。仅在启动本地 start_desktop.bat 时开启同步。</div>
+          </div>
+        </div>
+
+        <!-- 5. 底部操作栏 -->
+        <div class="st-thief-settings-footer">
+          <button id="btn-reset-settings" class="tb-btn-danger">恢复默认预设</button>
+          <div style="display:flex; gap:8px;">
+            <button id="btn-cancel-settings" class="tb-btn-secondary">取消</button>
+            <button id="btn-save-settings" class="tb-btn-primary">保存生效</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    bindStandaloneSettingsEvents(modal, topDoc);
+  }
+
+  function bindStandaloneSettingsEvents(modal, topDoc) {
+    if (!modal) return;
+
+    modal.addEventListener('click', e => {
+      if (e.target === modal) {
+        closeSettingsModal();
+      }
+    });
+
+    const card = modal.querySelector('.st-thief-settings-card');
+    card?.addEventListener('click', e => {
+      e.stopPropagation();
+    });
+
+    modal.querySelector('#btn-standalone-close-settings')?.addEventListener('click', closeSettingsModal);
+    modal.querySelector('#btn-cancel-settings')?.addEventListener('click', closeSettingsModal);
+
+    modal.querySelector('#btn-clear-whitelist')?.addEventListener('click', () => {
+      const area = modal.querySelector('#setting-whitelist');
+      if (area) {
+        area.value = '';
+        area.focus();
+      }
+    });
+
+    modal.querySelector('#btn-clear-blacklist')?.addEventListener('click', () => {
+      const area = modal.querySelector('#setting-blacklist');
+      if (area) {
+        area.value = '';
+        area.focus();
+      }
+    });
+
+    modal.querySelectorAll('.tb-wl-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const tag = chip.getAttribute('data-tag');
+        const area = modal.querySelector('#setting-whitelist');
+        if (!tag || !area) return;
+        const curTags = area.value
+          .split(/[,，\n]/)
+          .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+          .filter(Boolean);
+        if (!curTags.includes(tag)) {
+          curTags.push(tag);
+          area.value = curTags.join(', ');
+        }
+      });
+    });
+
+    modal.querySelectorAll('.tb-bl-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const tag = chip.getAttribute('data-tag');
+        const area = modal.querySelector('#setting-blacklist');
+        if (!tag || !area) return;
+        const curTags = area.value
+          .split(/[,，\n]/)
+          .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+          .filter(Boolean);
+        if (!curTags.includes(tag)) {
+          curTags.push(tag);
+          area.value = curTags.join(', ');
+        }
+      });
+    });
+
+    modal.querySelector('#btn-reset-settings')?.addEventListener('click', () => {
+      const wlArea = modal.querySelector('#setting-whitelist');
+      if (wlArea) wlArea.value = DEFAULT_TAG_WHITELIST.join(', ');
+      const blArea = modal.querySelector('#setting-blacklist');
+      if (blArea) blArea.value = DEFAULT_TAG_BLACKLIST.join(', ');
+      const wlEnable = modal.querySelector('#setting-enable-whitelist');
+      if (wlEnable) wlEnable.checked = true;
+      const charMode = modal.querySelector('#setting-charmode');
+      if (charMode) charMode.value = 'compact';
+      const wrapMode = modal.querySelector('#setting-wrapmode');
+      if (wrapMode) wrapMode.value = 'wrap';
+      const minMode = modal.querySelector('#setting-minimal-mode');
+      if (minMode) minMode.checked = false;
+      const userMsg = modal.querySelector('#setting-show-user-messages');
+      if (userMsg) userMsg.checked = false;
+      const actions = modal.querySelector('#setting-filter-actions');
+      if (actions) actions.checked = false;
+      const blur = modal.querySelector('#setting-hover-blur');
+      if (blur) blur.checked = false;
+      const privacy = modal.querySelector('#setting-privacy-mode');
+      if (privacy) privacy.checked = false;
+      const mode = modal.querySelector('#setting-filtermode');
+      if (mode) mode.value = 'pure';
+      const barW = modal.querySelector('#setting-barwidth');
+      if (barW) barW.value = '840';
+      const deskSync = modal.querySelector('#setting-enable-desktopsync');
+      if (deskSync) deskSync.checked = false;
+    });
+
+    modal.querySelector('#btn-reconnect-desktop')?.addEventListener('click', () => {
+      const deskSync = modal.querySelector('#setting-enable-desktopsync');
+      if (deskSync) deskSync.checked = true;
+      CONFIG.enableDesktopSync = true;
+      saveCurrentConfig();
+      flashStatusHint('正在连接本地桌面端 127.0.0.1:18899...');
+      initDesktopBridge(true);
+    });
+
+    modal.querySelector('#btn-save-settings')?.addEventListener('click', () => {
+      const wlArea = modal.querySelector('#setting-whitelist');
+      const blArea = modal.querySelector('#setting-blacklist');
+      const wlEnable = modal.querySelector('#setting-enable-whitelist');
+      const charMode = modal.querySelector('#setting-charmode');
+      const wrapMode = modal.querySelector('#setting-wrapmode');
+      const minMode = modal.querySelector('#setting-minimal-mode');
+      const userMsg = modal.querySelector('#setting-show-user-messages');
+      const actions = modal.querySelector('#setting-filter-actions');
+      const blur = modal.querySelector('#setting-hover-blur');
+      const privacy = modal.querySelector('#setting-privacy-mode');
+      const mode = modal.querySelector('#setting-filtermode');
+      const barW = modal.querySelector('#setting-barwidth');
+      const deskSync = modal.querySelector('#setting-enable-desktopsync');
+
+      if (wlEnable) CONFIG.enableWhitelist = wlEnable.checked;
+      if (charMode) CONFIG.charNameMode = charMode.value;
+      if (wrapMode) CONFIG.wrapMode = wrapMode.value;
+      if (minMode) CONFIG.minimalMode = minMode.checked;
+      if (privacy) CONFIG.privacyMode = privacy.checked;
+      if (userMsg) CONFIG.showUserMessages = userMsg.checked;
+      if (barW) {
+        const w = parseInt(barW.value, 10);
+        if (!isNaN(w) && w >= 360 && w <= 2560) {
+          CONFIG.barWidth = w;
+          if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
+            try {
+              STATE.thiefWindow.resizeTo(CONFIG.barWidth, STATE.thiefWindow.outerHeight || 74);
+            } catch (e) {}
+          }
+        }
+      }
+
+      if (wlArea) {
+        const list = wlArea.value
+          .split(/[,，\n]/)
+          .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+          .filter(Boolean);
+        CONFIG.tagWhitelist = list.length > 0 ? list : [...DEFAULT_TAG_WHITELIST];
+      }
+
+      if (blArea) {
+        const list = blArea.value
+          .split(/[,，\n]/)
+          .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+          .filter(Boolean);
+        CONFIG.tagBlacklist = list.length > 0 ? list : [...DEFAULT_TAG_BLACKLIST];
+      }
+
+      if (actions) CONFIG.filterActions = actions.checked;
+      if (blur) CONFIG.hoverBlur = blur.checked;
+      if (mode) CONFIG.filterMode = mode.value;
+
+      if (deskSync) {
+        const oldState = CONFIG.enableDesktopSync;
+        CONFIG.enableDesktopSync = deskSync.checked;
+        if (!oldState && CONFIG.enableDesktopSync) {
+          initDesktopBridge(true);
+        } else if (oldState && !CONFIG.enableDesktopSync) {
+          stopDesktopBridge();
+        }
+      }
+
+      saveCurrentConfig();
+      closeSettingsModal();
+      flashStatusHint('设置已保存并生效');
+      if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
+        renderThiefBar();
+      }
+      refreshLatestMessage(false);
+      syncToDesktop();
+    });
   }
 
   function closeSettingsModal() {
     STATE.isSettingsOpen = false;
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-      const baseH = CONFIG.minimalMode
-        ? (CONFIG.layoutMode === 'double' ? 56 : 30)
-        : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
-      const targetHeight = baseH + 35;
-      try {
-        STATE.thiefWindow.resizeTo(CONFIG.barWidth, targetHeight);
-      } catch (e) {}
+    const topDoc = getSafeTopDoc();
+    const modal = topDoc?.getElementById('st-thief-standalone-settings-modal');
+    if (modal) {
+      modal.remove();
     }
-    renderThiefBar();
   }
 
   // ------------------------------------------------------------------------------------
@@ -895,17 +1610,17 @@
       -webkit-font-smoothing: antialiased;
     }
 
-    body.theme-vscode-dark {
+    body.theme-vscode-dark, #st-thief-inpage-container.theme-vscode-dark {
       background-color: #181818;
       color: #cccccc;
       border-top: 1px solid #2d2d2d;
     }
-    body.theme-vscode-blue {
+    body.theme-vscode-blue, #st-thief-inpage-container.theme-vscode-blue {
       background-color: #007acc;
       color: #ffffff;
       border-top: 1px solid #0062a3;
     }
-    body.theme-terminal {
+    body.theme-terminal, #st-thief-inpage-container.theme-terminal {
       background-color: #0c0c0c;
       color: #00ff66;
       border-top: 1px solid #1a1a1a;
@@ -932,6 +1647,29 @@
     }
     body.single-mode .tb-row-reading {
       border-bottom: none;
+    }
+
+    /* 拖拽手柄 */
+    .tb-drag-handle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: grab;
+      padding: 0 4px;
+      font-size: 13px;
+      color: #777777;
+      user-select: none;
+      touch-action: none;
+      transition: color 0.15s ease, transform 0.1s ease;
+      line-height: 1;
+    }
+    .tb-drag-handle:hover {
+      color: #4ec9b0;
+      transform: scale(1.15);
+    }
+    .tb-drag-handle:active {
+      cursor: grabbing;
+      color: #73e6cf;
     }
 
     /* 左侧 Git 分支与楼层导航器 */
@@ -1102,6 +1840,104 @@
     body.tb-blur-mode .tb-sentence-text { filter: blur(4px); }
     body.tb-blur-mode:hover .tb-sentence-text { filter: blur(0); }
 
+    /* 👻 隐私模式 (移开隐藏，鼠标悬浮在窗口上方时才显示工具条) */
+    body.tb-privacy-mode {
+      background-color: transparent !important;
+      transition: opacity 0.22s ease-in, background-color 0.22s ease-in;
+    }
+    body.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active) {
+      opacity: 0 !important;
+      background-color: transparent !important;
+      border-color: transparent !important;
+      box-shadow: none !important;
+      pointer-events: auto;
+      transition: opacity 0.22s ease-in, background-color 0.22s ease-in;
+    }
+    body.tb-privacy-mode:hover,
+    body.tb-privacy-mode.tb-mouse-over,
+    body.tb-privacy-mode.tb-privacy-active {
+      opacity: var(--tb-user-opacity, 0.95) !important;
+      pointer-events: auto;
+      transition: opacity 0.15s ease-out, background-color 0.15s ease-out;
+    }
+    body.tb-privacy-mode.theme-vscode-dark:hover,
+    body.tb-privacy-mode.theme-vscode-dark.tb-mouse-over,
+    body.tb-privacy-mode.theme-vscode-dark.tb-privacy-active {
+      background-color: #181818 !important;
+      border-top: 1px solid #2d2d2d !important;
+    }
+    body.tb-privacy-mode.theme-vscode-blue:hover,
+    body.tb-privacy-mode.theme-vscode-blue.tb-mouse-over,
+    body.tb-privacy-mode.theme-vscode-blue.tb-privacy-active {
+      background-color: #007acc !important;
+      border-top: 1px solid #0062a3 !important;
+    }
+    body.tb-privacy-mode.theme-terminal:hover,
+    body.tb-privacy-mode.theme-terminal.tb-mouse-over,
+    body.tb-privacy-mode.theme-terminal.tb-privacy-active {
+      background-color: #0c0c0c !important;
+      border-top: 1px solid #1a1a1a !important;
+    }
+
+    #st-thief-inpage-container.tb-privacy-mode {
+      background-color: transparent !important;
+      transition: bottom 0.2s cubic-bezier(0.2, 0, 0, 1), opacity 0.22s ease-in, background-color 0.22s ease-in;
+    }
+    #st-thief-inpage-container.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active) {
+      opacity: 0 !important;
+      background-color: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      pointer-events: auto;
+      transition: opacity 0.22s ease-in;
+    }
+    #st-thief-inpage-container.tb-privacy-mode:hover,
+    #st-thief-inpage-container.tb-privacy-mode.tb-mouse-over,
+    #st-thief-inpage-container.tb-privacy-mode.tb-privacy-active {
+      opacity: var(--tb-user-opacity, 0.95) !important;
+      pointer-events: auto;
+      box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.7);
+      transition: opacity 0.15s ease-out;
+    }
+    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-dark:hover,
+    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-dark.tb-mouse-over,
+    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-dark.tb-privacy-active {
+      background-color: #181818 !important;
+      border-top: 1px solid #2d2d2d !important;
+    }
+    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-blue:hover,
+    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-blue.tb-mouse-over,
+    #st-thief-inpage-container.tb-privacy-mode.theme-vscode-blue.tb-privacy-active {
+      background-color: #007acc !important;
+      border-top: 1px solid #0062a3 !important;
+    }
+    #st-thief-inpage-container.tb-privacy-mode.theme-terminal:hover,
+    #st-thief-inpage-container.tb-privacy-mode.theme-terminal.tb-mouse-over,
+    #st-thief-inpage-container.tb-privacy-mode.theme-terminal.tb-privacy-active {
+      background-color: #0c0c0c !important;
+      border-top: 1px solid #1a1a1a !important;
+    }
+
+    /* 移动端/触屏环境豁免：触屏无 hover 特性，防止隐私模式导致移动端完全不可见 */
+    @media (hover: none), (max-width: 768px) {
+      body.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active),
+      #st-thief-inpage-container.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active) {
+        opacity: var(--tb-user-opacity, 0.95) !important;
+      }
+      #st-thief-inpage-container.tb-privacy-mode.theme-vscode-dark {
+        background-color: #181818 !important;
+        border-top: 1px solid #2d2d2d !important;
+      }
+      #st-thief-inpage-container.tb-privacy-mode.theme-vscode-blue {
+        background-color: #007acc !important;
+        border-top: 1px solid #0062a3 !important;
+      }
+      #st-thief-inpage-container.tb-privacy-mode.theme-terminal {
+        background-color: #0c0c0c !important;
+        border-top: 1px solid #1a1a1a !important;
+      }
+    }
+
     /* 右侧精简状态与功能触发器 */
     .tb-section-right {
       display: flex;
@@ -1179,6 +2015,15 @@
       text-align: center;
       font-size: 12px;
       opacity: 0.85;
+    }
+    .tb-menu-mark {
+      width: 14px;
+      text-align: center;
+      font-size: 11px;
+      color: #4ec9b0;
+      font-weight: bold;
+      display: inline-block;
+      flex-shrink: 0;
     }
     .tb-menu-shortcut {
       font-size: 10px;
@@ -1339,33 +2184,81 @@
       background: #1177bb;
     }
 
-    /* 设置模态弹窗 */
+    /* 设置模态弹窗 (视口自适应居中) */
     #tb-settings-overlay {
-      position: absolute;
+      position: fixed;
       top: 0; left: 0; right: 0; bottom: 0;
+      width: 100vw;
+      height: 100vh;
       background: rgba(0, 0, 0, 0.88);
       backdrop-filter: blur(8px);
       display: flex;
       align-items: center;
       justify-content: center;
-      z-index: 99999;
-      padding: 6px;
+      z-index: 9999999;
+      padding: 10px;
       animation: tbFadeIn 0.15s ease-out;
+      box-sizing: border-box;
     }
     .tb-settings-card {
       background: #1e1e1e;
       color: #cccccc;
       border: 1px solid #3c3c3c;
-      border-radius: 5px;
+      border-radius: 6px;
       width: 100%;
-      height: 100%;
+      max-width: 720px;
+      max-height: 88vh;
+      height: auto;
       padding: 10px 14px;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
       overflow-y: auto;
       font-size: 11px;
-      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.8);
+      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.85);
+      box-sizing: border-box;
+    }
+
+    /* 宿主页内悬浮条专属容器 (手机端与无弹窗环境) */
+    #st-thief-inpage-container {
+      position: fixed;
+      bottom: max(0px, env(safe-area-inset-bottom, 0px));
+      left: 0;
+      width: 100%;
+      max-width: 100vw;
+      z-index: 999998;
+      box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.7);
+      user-select: none;
+      box-sizing: border-box;
+      touch-action: none;
+      transition: bottom 0.2s cubic-bezier(0.2, 0, 0, 1), opacity 0.15s ease;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, Consolas, monospace;
+    }
+    #st-thief-inpage-container #tb-container {
+      width: 100%;
+      height: 100%;
+    }
+
+    @media (max-width: 768px) {
+      .tb-git-branch {
+        display: none !important;
+      }
+      .tb-section-left {
+        gap: 2px !important;
+      }
+      .tb-char-compact {
+        max-width: 50px !important;
+      }
+      .tb-sentence-text {
+        font-size: 13px !important;
+      }
+      #tb-context-menu {
+        max-width: 90vw !important;
+      }
+      .tb-settings-card {
+        max-height: 86vh !important;
+        padding: 8px 10px !important;
+      }
     }
     .tb-settings-card::-webkit-scrollbar {
       width: 5px;
@@ -1500,15 +2393,39 @@
       doc.head.appendChild(style);
     }
 
-    doc.body.className = `theme-${CONFIG.theme} ${CONFIG.hoverBlur ? 'tb-blur-mode' : ''} ${CONFIG.layoutMode === 'single' ? 'single-mode' : 'double-mode'} ${CONFIG.minimalMode ? 'minimal-mode' : ''}`;
-    doc.body.style.opacity = CONFIG.opacity;
+    const isInteracting = STATE.isContextMenuOpen || STATE.isSettingsOpen || STATE.isFloorPickerOpen || (doc.activeElement && doc.activeElement.tagName === 'INPUT');
+    const activePrivacyClass = isInteracting ? 'tb-privacy-active' : '';
+
+    if (!STATE.isHostInpage) {
+      doc.body.className = `theme-${CONFIG.theme} ${CONFIG.hoverBlur ? 'tb-blur-mode' : ''} ${CONFIG.privacyMode ? 'tb-privacy-mode' : ''} ${CONFIG.layoutMode === 'single' ? 'single-mode' : 'double-mode'} ${CONFIG.minimalMode ? 'minimal-mode' : ''} ${activePrivacyClass}`.trim();
+      doc.body.style.setProperty('--tb-user-opacity', CONFIG.opacity);
+      if (CONFIG.privacyMode) {
+        doc.body.style.opacity = '';
+      } else {
+        doc.body.style.opacity = CONFIG.opacity;
+      }
+    }
 
     let container = doc.getElementById('tb-container');
     if (!container) {
       container = doc.createElement('div');
       container.id = 'tb-container';
-      doc.body.appendChild(container);
+      if (STATE.isHostInpage && STATE.inpageContainer) {
+        STATE.inpageContainer.appendChild(container);
+      } else {
+        doc.body.appendChild(container);
+      }
       bindWindowEvents(STATE.thiefWindow);
+    }
+
+    if (STATE.isHostInpage && STATE.inpageContainer) {
+      STATE.inpageContainer.className = `theme-${CONFIG.theme} ${CONFIG.hoverBlur ? 'tb-blur-mode' : ''} ${CONFIG.privacyMode ? 'tb-privacy-mode' : ''} ${CONFIG.layoutMode === 'single' ? 'single-mode' : 'double-mode'} ${CONFIG.minimalMode ? 'minimal-mode' : ''} ${activePrivacyClass}`.trim();
+      STATE.inpageContainer.style.setProperty('--tb-user-opacity', CONFIG.opacity);
+      if (CONFIG.privacyMode) {
+        STATE.inpageContainer.style.opacity = '';
+      } else {
+        STATE.inpageContainer.style.opacity = CONFIG.opacity;
+      }
     }
 
     // 1. 老板键伪装模式
@@ -1551,8 +2468,9 @@
     const displayFloor = STATE.currentMsgId >= 0 ? STATE.currentMsgId : 0;
 
     const leftIconHtml = STATE.isGenerating
-      ? `<span class="tb-spin-icon" title="AI 生成中...">⟳</span> <span style="color:#dcdcaa;font-size:11px;">Building...</span>`
+      ? `<span class="tb-drag-handle" id="tb-drag-handle" title="按住拖拽调节摸鱼条上下高度 (双击贴底复位)">⠿</span> <span class="tb-spin-icon" title="AI 生成中...">⟳</span> <span style="color:#dcdcaa;font-size:11px;">Building...</span>`
       : `
+        <span class="tb-drag-handle" id="tb-drag-handle" title="按住拖拽调节摸鱼条上下高度 (双击贴底复位)">⠿</span>
         <span class="tb-git-branch" title="Git 分支">⎇ main*</span>
         <div class="tb-floor-nav-wrap" title="楼层导航 (点击跳转)">
           <span class="tb-floor-btn-step" id="btn-floor-prev" title="上一楼 (快捷键: PageUp)">▲</span>
@@ -1585,6 +2503,7 @@
       <div class="tb-section-right">
         <span class="tb-progress-badge" id="tb-progress" title="当前阅读进度">${curIdx}/${totalSentences}</span>
         <span class="tb-menu-trigger" id="btn-context-menu" title="功能菜单 (鼠标右键任意处也可唤出)">⋮</span>
+        ${STATE.isHostInpage ? `<span class="tb-menu-trigger tb-close-btn" id="btn-inpage-close" title="收起摸鱼条" style="color:#e06c75; font-size:12px; margin-left:2px; font-weight:bold;">✕</span>` : ''}
       </div>
     `;
 
@@ -1630,220 +2549,103 @@
       `;
     }
 
-    // 设置弹窗 HTML
-    let settingsOverlayHtml = '';
-    if (STATE.isSettingsOpen) {
-      settingsOverlayHtml = `
-        <div id="tb-settings-overlay">
-          <div class="tb-settings-card">
-            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #333; padding-bottom:5px;">
-              <span style="font-weight:600; color:#4ec9b0; font-size:12px;">⚙️ ST-Thief-Book 摸鱼过滤与白名单/黑名单设置</span>
-              <span id="btn-close-settings" title="关闭设置" style="cursor:pointer; font-weight:bold; font-size:14px; padding:0 6px; color:#aaa;">✕</span>
-            </div>
-
-            <!-- 白名单提取容器设置 -->
-            <div style="margin-top:6px; background:#1c1e22; padding:6px 8px; border-radius:4px; border:1px solid #2d3139;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <label style="font-size:11px; color:#4ec9b0; font-weight:600; display:flex; align-items:center; gap:5px; cursor:pointer;">
-                  <input type="checkbox" id="setting-enable-whitelist" ${CONFIG.enableWhitelist ? 'checked' : ''} />
-                  <span>🎯 启用正文白名单容器提取 (推荐)</span>
-                </label>
-                <span id="btn-clear-whitelist" style="cursor:pointer; font-size:10px; color:#ce9178; text-decoration:underline;">清空白名单</span>
-              </div>
-              <textarea id="setting-whitelist" style="
-                width:100%; height:38px; background:#141414; color:#d4d4d4;
-                border:1px solid #3c3c3c; border-radius:3px; padding:4px 6px;
-                font-family:Consolas, monospace; font-size:11px; resize:none; outline:none; line-height:1.4;
-              ">${escapeHtml(CONFIG.tagWhitelist.join(', '))}</textarea>
-              <div style="margin-top:3px; display:flex; flex-wrap:wrap; gap:4px; align-items:center;">
-                <span style="font-size:10px; opacity:0.65;">白名单快选:</span>
-                <span class="tb-wl-chip" data-tag="content">+content</span>
-                <span class="tb-wl-chip" data-tag="output">+output</span>
-                <span class="tb-wl-chip" data-tag="response">+response</span>
-                <span class="tb-wl-chip" data-tag="dialogue">+dialogue</span>
-                <span class="tb-wl-chip" data-tag="story">+story</span>
-                <span class="tb-wl-chip" data-tag="reply">+reply</span>
-                <span class="tb-wl-chip" data-tag="text">+text</span>
-                <span class="tb-wl-chip" data-tag="正文">+正文</span>
-              </div>
-              <div style="font-size:10px; opacity:0.6; margin-top:2px;">
-                💡 规则：若消息含有白名单标签，只提取其中正文；若未包含任何白名单标签，则安全降级读取全文。
-              </div>
-            </div>
-
-            <!-- 黑名单彻底剥离设置 -->
-            <div style="margin-top:6px; background:#1c1c1c; padding:6px 8px; border-radius:4px; border:1px solid #2d2d2d;">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <label style="font-size:11px; color:#f48771; font-weight:600;">
-                  🚫 思考与元数据黑名单 (这些标签及内部内容将被彻底清除):
-                </label>
-                <span id="btn-clear-blacklist" style="cursor:pointer; font-size:10px; color:#ce9178; text-decoration:underline;">清空黑名单</span>
-              </div>
-              <textarea id="setting-blacklist" style="
-                width:100%; height:40px; background:#141414; color:#d4d4d4;
-                border:1px solid #3c3c3c; border-radius:3px; padding:4px 6px;
-                font-family:Consolas, monospace; font-size:11px; resize:none; outline:none; line-height:1.4;
-              ">${escapeHtml(CONFIG.tagBlacklist.join(', '))}</textarea>
-              <div style="margin-top:3px; display:flex; flex-wrap:wrap; gap:4px; align-items:center;">
-                <span style="font-size:10px; opacity:0.65;">黑名单快选:</span>
-                <span class="tb-bl-chip" data-tag="think">+think</span>
-                <span class="tb-bl-chip" data-tag="thought">+thought</span>
-                <span class="tb-bl-chip" data-tag="cot">+cot</span>
-                <span class="tb-bl-chip" data-tag="status">+status</span>
-                <span class="tb-bl-chip" data-tag="bbi_image">+bbi_image</span>
-                <span class="tb-bl-chip" data-tag="fox_hugou">+fox_hugou</span>
-                <span class="tb-bl-chip" data-tag="fox_selc">+fox_selc</span>
-                <span class="tb-bl-chip" data-tag="fox_tip">+fox_tip</span>
-                <span class="tb-bl-chip" data-tag="so_seq">+so_seq</span>
-                <span class="tb-bl-chip" data-tag="details">+details</span>
-              </div>
-              <div style="font-size:10px; opacity:0.6; margin-top:2px;">
-                💡 规则：在正文中，彻底清除所有黑名单标签块；其他普通排版标签仅剥除尖括号保留纯文字。
-              </div>
-            </div>
-
-            <!-- 阅读与展示参数 -->
-            <div style="margin-top:6px; padding:4px 8px; border-top:1px solid #2d2d2d; display:flex; flex-direction:column; gap:5px;">
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span style="font-size:11px; color:#9cdcfe; font-weight:600;">阅读模式:</span>
-                <select id="setting-filtermode" style="background:#252526; color:#ccc; border:1px solid #3c3c3c; border-radius:3px; padding:2px 6px; font-size:11px; outline:none;">
-                  <option value="pure" ${CONFIG.filterMode === 'pure' ? 'selected' : ''}>🧹 纯净小说模式 (强烈推荐：剔除CSS美化与多余标签，短小精炼)</option>
-                  <option value="regex" ${CONFIG.filterMode === 'regex' ? 'selected' : ''}>🎨 酒馆正则清洗模式 (执行酒馆正则后再剥离黑名单)</option>
-                </select>
-              </div>
-
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span style="font-size:11px; color:#9cdcfe; font-weight:600;">角色名显示:</span>
-                <select id="setting-charmode" style="background:#252526; color:#ccc; border:1px solid #3c3c3c; border-radius:3px; padding:2px 6px; font-size:11px; outline:none;">
-                  <option value="compact" ${CONFIG.charNameMode === 'compact' ? 'selected' : ''}>🏷️ 精简胶囊 (推荐：最宽68px，自动省略不占位)</option>
-                  <option value="hidden" ${CONFIG.charNameMode === 'hidden' ? 'selected' : ''}>🙈 完全隐藏 (最大正文空间，最隐蔽)</option>
-                  <option value="full" ${CONFIG.charNameMode === 'full' ? 'selected' : ''}>📜 完整展示 (显示全部名字)</option>
-                </select>
-              </div>
-
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span style="font-size:11px; color:#9cdcfe; font-weight:600;">换行展示:</span>
-                <select id="setting-wrapmode" style="background:#252526; color:#ccc; border:1px solid #3c3c3c; border-radius:3px; padding:2px 6px; font-size:11px; outline:none;">
-                  <option value="wrap" ${CONFIG.wrapMode === 'wrap' ? 'selected' : ''}>↩️ 自动折行全显 (长句自动折行显示全部文字，绝不截断丢字)</option>
-                  <option value="single" ${CONFIG.wrapMode === 'single' ? 'selected' : ''}>↔️ 强制单行模式 (超长截断)</option>
-                </select>
-              </div>
-
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span style="font-size:11px; color:#9cdcfe; font-weight:600;">窗口宽度:</span>
-                <input type="number" id="setting-barwidth" value="${CONFIG.barWidth}" min="360" max="2560" step="20" style="width:70px; background:#252526; color:#ccc; border:1px solid #3c3c3c; border-radius:3px; padding:2px 6px; font-size:11px; outline:none;" />
-                <span style="font-size:10px; opacity:0.6;">px (支持直接拖拽弹窗边缘缩放长度)</span>
-              </div>
-
-              <div style="display:flex; flex-wrap:wrap; gap:12px; font-size:11px;">
-                <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
-                  <input type="checkbox" id="setting-minimal-mode" ${CONFIG.minimalMode ? 'checked' : ''} />
-                  <span>✨ 极简模式 (纯文字+背景，完全符合参考图)</span>
-                </label>
-                <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
-                  <input type="checkbox" id="setting-show-user-messages" ${CONFIG.showUserMessages ? 'checked' : ''} />
-                  <span>💬 显示用户消息 (默认关闭，仅阅读AI/小说回复)</span>
-                </label>
-                <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
-                  <input type="checkbox" id="setting-filter-actions" ${CONFIG.filterActions ? 'checked' : ''} />
-                  <span>过滤动作描写 (*xxx*)</span>
-                </label>
-                <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
-                  <input type="checkbox" id="setting-hover-blur" ${CONFIG.hoverBlur ? 'checked' : ''} />
-                  <span>防窥毛玻璃 (鼠标移开模糊)</span>
-                </label>
-              </div>
-            </div>
-
-            <!-- 底部保存按钮 -->
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px; padding-top:6px; border-top:1px solid #2d2d2d;">
-              <button id="btn-reset-settings" style="padding:4px 10px; background:#333; color:#ccc; border:none; border-radius:3px; cursor:pointer; font-size:11px;">恢复默认预设</button>
-              <div style="display:flex; gap:8px;">
-                <button id="btn-cancel-settings" style="padding:4px 12px; background:#2a2a2a; color:#aaa; border:1px solid #444; border-radius:3px; cursor:pointer; font-size:11px;">取消</button>
-                <button id="btn-save-settings" style="padding:4px 16px; background:#0e639c; color:#fff; border:none; border-radius:3px; cursor:pointer; font-size:11px; font-weight:600;">💾 保存并立即生效</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      `;
-    }
-
     // 右键上下文菜单 HTML
     let contextMenuHtml = '';
     if (STATE.isContextMenuOpen) {
-      const docW = doc.documentElement.clientWidth || 800;
-      const docH = doc.documentElement.clientHeight || 200;
-      const posX = Math.min(docW - 240, Math.max(10, STATE.contextMenuPos.x || (docW - 240)));
-      const posY = Math.min(docH - 280, Math.max(5, STATE.contextMenuPos.y || 25));
+      const topWin = window.top || window;
+      const vp = topWin.visualViewport;
+      const docW = (vp ? vp.width : topWin.innerWidth) || doc.documentElement.clientWidth || 800;
+      const docH = (vp ? vp.height : topWin.innerHeight) || doc.documentElement.clientHeight || 400;
+      let posStyle = '';
+
+      if (STATE.isHostInpage || isMobileDevice()) {
+        // 页内浮窗贴底时，菜单向上展开，避免被软键盘或屏幕边缘截断
+        posStyle = `right: 10px; bottom: calc(65px + env(safe-area-inset-bottom, 0px));`;
+      } else {
+        const posX = Math.min(docW - 240, Math.max(10, STATE.contextMenuPos.x || (docW - 240)));
+        const posY = Math.min(docH - 280, Math.max(5, STATE.contextMenuPos.y || 25));
+        posStyle = `left: ${posX}px; top: ${posY}px;`;
+      }
       contextMenuHtml = `
-        <div id="tb-context-menu" style="left:${posX}px; top:${posY}px;">
+        <div id="tb-context-menu" style="${posStyle}">
           <div class="tb-menu-item" id="menu-toggle-minimal">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">✨</span><span>极简模式: ${CONFIG.minimalMode ? '✓ 已开启' : '未开启'}</span></div>
-            <span class="tb-menu-tag">点击切换</span>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.minimalMode ? '✓' : ''}</span><span>极简模式</span></div>
+            <span class="tb-menu-shortcut">${CONFIG.minimalMode ? '已开启' : ''}</span>
+          </div>
+          <div class="tb-menu-item" id="menu-toggle-privacy">
+            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.privacyMode ? '✓' : ''}</span><span>隐私模式 (悬停显示)</span></div>
+            <span class="tb-menu-shortcut">${CONFIG.privacyMode ? '已开启' : ''}</span>
           </div>
           <div class="tb-menu-item" id="menu-toggle-layout">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">↕</span><span>布局: ${CONFIG.layoutMode === 'double' ? '双行回复' : '单行极窄'}</span></div>
-            <span class="tb-menu-tag">点击切换</span>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.layoutMode === 'double' ? '✓' : ''}</span><span>双行布局 (含回复框)</span></div>
+            <span class="tb-menu-shortcut">${CONFIG.layoutMode === 'double' ? '双行' : '单行'}</span>
           </div>
           <div class="tb-menu-separator"></div>
           <div class="tb-menu-item" id="menu-prev">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">‹</span><span>上一句</span></div>
-            <span class="tb-menu-shortcut">← / J</span>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>上一句</span></div>
+            <span class="tb-menu-shortcut">←</span>
           </div>
           <div class="tb-menu-item" id="menu-next">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">›</span><span>下一句</span></div>
-            <span class="tb-menu-shortcut">→ / K</span>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>下一句</span></div>
+            <span class="tb-menu-shortcut">→</span>
           </div>
-          <div class="tb-menu-item" id="menu-floor-prev">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">▲</span><span>上一楼</span></div>
-            <span class="tb-menu-shortcut">PageUp</span>
-          </div>
-          <div class="tb-menu-item" id="menu-floor-next">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">▼</span><span>下一楼</span></div>
-            <span class="tb-menu-shortcut">PageDown</span>
-          </div>
-          <div class="tb-menu-item" id="menu-floor-jump">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">📖</span><span>快速楼层跳转...</span></div>
-          </div>
-          <div class="tb-menu-separator"></div>
           <div class="tb-menu-item" id="menu-swipe">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">⟲</span><span>重新生成回复 (Swipe)</span></div>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>重新生成</span></div>
             <span class="tb-menu-shortcut">Alt+S</span>
           </div>
           ${STATE.isGenerating ? `
           <div class="tb-menu-item" id="menu-stop" style="color:#f44747;">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">■</span><span>中止生成</span></div>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>中止生成</span></div>
             <span class="tb-menu-shortcut">Alt+X</span>
           </div>
           ` : ''}
           <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" id="menu-toggle-user-messages">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">💬</span><span>用户消息: ${CONFIG.showUserMessages ? '✓ 允许显示' : '已过滤隐藏'}</span></div>
-            <span class="tb-menu-tag">点击切换</span>
+          <div class="tb-menu-item" id="menu-floor-prev">
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>上一楼</span></div>
+            <span class="tb-menu-shortcut">PageUp</span>
           </div>
-          <div class="tb-menu-item" id="menu-toggle-char">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">👤</span><span>角色名: ${CONFIG.charNameMode === 'compact' ? '精简胶囊' : (CONFIG.charNameMode === 'hidden' ? '完全隐藏' : '完整展示')}</span></div>
-            <span class="tb-menu-tag">点击切换</span>
+          <div class="tb-menu-item" id="menu-floor-next">
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>下一楼</span></div>
+            <span class="tb-menu-shortcut">PageDown</span>
           </div>
+          <div class="tb-menu-item" id="menu-floor-jump">
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>跳转楼层...</span></div>
+            <span class="tb-menu-shortcut">#${displayFloor}</span>
+          </div>
+          <div class="tb-menu-separator"></div>
           <div class="tb-menu-item" id="menu-toggle-wrap">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">↩️</span><span>换行: ${CONFIG.wrapMode === 'wrap' ? '自动折行全显' : '强制单行'}</span></div>
-            <span class="tb-menu-tag">点击切换</span>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.wrapMode === 'wrap' ? '✓' : ''}</span><span>自动折行全显</span></div>
+          </div>
+          <div class="tb-menu-item" id="menu-toggle-user-messages">
+            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.showUserMessages ? '✓' : ''}</span><span>显示用户消息</span></div>
           </div>
           <div class="tb-menu-item" id="menu-toggle-width">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">📏</span><span>长度: ${CONFIG.barWidth}px</span></div>
-            <span class="tb-menu-tag">点击切换</span>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>窗口长度</span></div>
+            <span class="tb-menu-shortcut">${CONFIG.barWidth}px</span>
+          </div>
+          <div class="tb-menu-item" id="menu-toggle-char">
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>角色名模式</span></div>
+            <span class="tb-menu-shortcut">${CONFIG.charNameMode === 'compact' ? '精简' : (CONFIG.charNameMode === 'hidden' ? '隐藏' : '完整')}</span>
           </div>
           <div class="tb-menu-item" id="menu-toggle-filter">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">🧹</span><span>模式: ${CONFIG.filterMode === 'pure' ? '纯净小说' : '酒馆正则'}</span></div>
-            <span class="tb-menu-tag">点击切换</span>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>过滤模式</span></div>
+            <span class="tb-menu-shortcut">${CONFIG.filterMode === 'pure' ? '纯净' : '正则'}</span>
+          </div>
+          <div class="tb-menu-item" id="menu-toggle-desktopsync">
+            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.enableDesktopSync ? '✓' : ''}</span><span>桌面端同步</span></div>
+            <span class="tb-menu-shortcut">${CONFIG.enableDesktopSync ? (STATE.wsClient ? '已连接' : '未连接') : '未开启'}</span>
           </div>
           <div class="tb-menu-separator"></div>
           <div class="tb-menu-item" id="menu-boss">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">🕶️</span><span>一键老板键</span></div>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>老板键 (伪装)</span></div>
             <span class="tb-menu-shortcut">Esc</span>
           </div>
           <div class="tb-menu-item" id="menu-settings">
-            <div class="tb-menu-item-left"><span class="tb-menu-item-icon">⚙️</span><span>摸鱼过滤与黑白名单设置...</span></div>
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>设置...</span></div>
+          </div>
+          <div class="tb-menu-separator"></div>
+          <div class="tb-menu-item" id="menu-inpage-close" style="color:#e06c75;">
+            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>退出摸鱼条</span></div>
           </div>
         </div>
       `;
@@ -1857,7 +2659,6 @@
       </div>
       ${replyRowHtml}
       ${floorPopoverHtml}
-      ${settingsOverlayHtml}
       ${contextMenuHtml}
     `;
 
@@ -1887,10 +2688,23 @@
         openContextMenu(rect.left - 200, rect.bottom + 4);
       }
     });
+    doc.getElementById('btn-inpage-close')?.addEventListener('click', e => {
+      e.stopPropagation();
+      closeThiefBar();
+    });
+    doc.getElementById('tb-drag-handle')?.addEventListener('dblclick', e => {
+      e.stopPropagation();
+      if (STATE.isHostInpage && STATE.inpageContainer) {
+        STATE.inpageContainer.style.bottom = 'max(0px, env(safe-area-inset-bottom, 0px))';
+        try { localStorage.removeItem('ST_THIEF_INPAGE_BOTTOM'); } catch (err) {}
+        flashStatusHint('摸鱼条已贴底复位');
+      }
+    });
 
     // 右键上下文菜单项事件绑定
     if (STATE.isContextMenuOpen) {
       doc.getElementById('menu-toggle-minimal')?.addEventListener('click', () => { closeContextMenu(); toggleMinimalMode(); });
+      doc.getElementById('menu-toggle-privacy')?.addEventListener('click', () => { closeContextMenu(); togglePrivacyMode(); });
       doc.getElementById('menu-toggle-user-messages')?.addEventListener('click', () => { closeContextMenu(); toggleShowUserMessages(); });
       doc.getElementById('menu-prev')?.addEventListener('click', () => { closeContextMenu(); prevSentence(); });
       doc.getElementById('menu-next')?.addEventListener('click', () => { closeContextMenu(); nextSentence(); });
@@ -1903,15 +2717,25 @@
       doc.getElementById('menu-toggle-wrap')?.addEventListener('click', () => { closeContextMenu(); toggleWrapMode(); });
       doc.getElementById('menu-toggle-width')?.addEventListener('click', () => { closeContextMenu(); cycleBarWidth(); });
       doc.getElementById('menu-toggle-filter')?.addEventListener('click', () => { closeContextMenu(); toggleFilterMode(); });
+      doc.getElementById('menu-toggle-desktopsync')?.addEventListener('click', () => { closeContextMenu(); toggleDesktopSync(); });
       doc.getElementById('menu-toggle-layout')?.addEventListener('click', () => { closeContextMenu(); toggleLayoutMode(); });
       doc.getElementById('menu-boss')?.addEventListener('click', () => { closeContextMenu(); toggleBossKey(true); });
       doc.getElementById('menu-settings')?.addEventListener('click', () => { closeContextMenu(); openSettingsModal(); });
+      doc.getElementById('menu-inpage-close')?.addEventListener('click', () => { closeContextMenu(); closeThiefBar(); });
     }
 
     const input = doc.getElementById('tb-input');
     const sendBtn = doc.getElementById('btn-send');
 
     if (input) {
+      input.addEventListener('focus', () => {
+        const targetEl = STATE.isHostInpage ? STATE.inpageContainer : doc.body;
+        if (targetEl) targetEl.classList.add('tb-privacy-active');
+      });
+      input.addEventListener('blur', () => {
+        const targetEl = STATE.isHostInpage ? STATE.inpageContainer : doc.body;
+        if (targetEl) targetEl.classList.remove('tb-privacy-active');
+      });
       input.addEventListener('keydown', e => {
         if (e.key === 'Enter') {
           e.preventDefault();
@@ -1961,154 +2785,6 @@
       }
     }
 
-    // 设置弹窗内事件绑定
-    if (STATE.isSettingsOpen) {
-      doc.getElementById('btn-close-settings')?.addEventListener('click', closeSettingsModal);
-      doc.getElementById('btn-cancel-settings')?.addEventListener('click', closeSettingsModal);
-
-      // 清空白名单输入框
-      doc.getElementById('btn-clear-whitelist')?.addEventListener('click', () => {
-        const area = doc.getElementById('setting-whitelist');
-        if (area) {
-          area.value = '';
-          area.focus();
-        }
-      });
-
-      // 清空黑名单输入框
-      doc.getElementById('btn-clear-blacklist')?.addEventListener('click', () => {
-        const area = doc.getElementById('setting-blacklist');
-        if (area) {
-          area.value = '';
-          area.focus();
-        }
-      });
-
-      // 白名单 chip 点击
-      doc.querySelectorAll('.tb-wl-chip').forEach(chip => {
-        chip.addEventListener('click', () => {
-          const tag = chip.getAttribute('data-tag');
-          const area = doc.getElementById('setting-whitelist');
-          if (!tag || !area) return;
-
-          const curTags = area.value
-            .split(/[,，\n]/)
-            .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-            .filter(Boolean);
-
-          if (!curTags.includes(tag)) {
-            curTags.push(tag);
-            area.value = curTags.join(', ');
-          }
-        });
-      });
-
-      // 黑名单 chip 点击
-      doc.querySelectorAll('.tb-bl-chip').forEach(chip => {
-        chip.addEventListener('click', () => {
-          const tag = chip.getAttribute('data-tag');
-          const area = doc.getElementById('setting-blacklist');
-          if (!tag || !area) return;
-
-          const curTags = area.value
-            .split(/[,，\n]/)
-            .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-            .filter(Boolean);
-
-          if (!curTags.includes(tag)) {
-            curTags.push(tag);
-            area.value = curTags.join(', ');
-          }
-        });
-      });
-
-      doc.getElementById('btn-reset-settings')?.addEventListener('click', () => {
-        const wlArea = doc.getElementById('setting-whitelist');
-        if (wlArea) wlArea.value = DEFAULT_TAG_WHITELIST.join(', ');
-        const blArea = doc.getElementById('setting-blacklist');
-        if (blArea) blArea.value = DEFAULT_TAG_BLACKLIST.join(', ');
-        const wlEnable = doc.getElementById('setting-enable-whitelist');
-        if (wlEnable) wlEnable.checked = true;
-        const charMode = doc.getElementById('setting-charmode');
-        if (charMode) charMode.value = 'compact';
-        const wrapMode = doc.getElementById('setting-wrapmode');
-        if (wrapMode) wrapMode.value = 'wrap';
-        const minMode = doc.getElementById('setting-minimal-mode');
-        if (minMode) minMode.checked = false;
-        const userMsg = doc.getElementById('setting-show-user-messages');
-        if (userMsg) userMsg.checked = false;
-        const actions = doc.getElementById('setting-filter-actions');
-        if (actions) actions.checked = false;
-        const blur = doc.getElementById('setting-hover-blur');
-        if (blur) blur.checked = false;
-        const mode = doc.getElementById('setting-filtermode');
-        if (mode) mode.value = 'pure';
-        const barW = doc.getElementById('setting-barwidth');
-        if (barW) barW.value = '840';
-      });
-
-      doc.getElementById('btn-save-settings')?.addEventListener('click', () => {
-        const wlArea = doc.getElementById('setting-whitelist');
-        const blArea = doc.getElementById('setting-blacklist');
-        const wlEnable = doc.getElementById('setting-enable-whitelist');
-        const charMode = doc.getElementById('setting-charmode');
-        const wrapMode = doc.getElementById('setting-wrapmode');
-        const minMode = doc.getElementById('setting-minimal-mode');
-        const userMsg = doc.getElementById('setting-show-user-messages');
-        const actions = doc.getElementById('setting-filter-actions');
-        const blur = doc.getElementById('setting-hover-blur');
-        const mode = doc.getElementById('setting-filtermode');
-        const barW = doc.getElementById('setting-barwidth');
-
-        if (wlEnable) CONFIG.enableWhitelist = wlEnable.checked;
-        if (charMode) CONFIG.charNameMode = charMode.value;
-        if (wrapMode) CONFIG.wrapMode = wrapMode.value;
-        if (minMode) CONFIG.minimalMode = minMode.checked;
-        if (userMsg) CONFIG.showUserMessages = userMsg.checked;
-        if (barW) {
-          const w = parseInt(barW.value, 10);
-          if (!isNaN(w) && w >= 360 && w <= 2560) {
-            CONFIG.barWidth = w;
-            if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-              try {
-                STATE.thiefWindow.resizeTo(CONFIG.barWidth, STATE.thiefWindow.outerHeight || 74);
-              } catch (e) {}
-            }
-          }
-        }
-
-        if (wlArea) {
-          const list = wlArea.value
-            .split(/[,，\n]/)
-            .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-            .filter(Boolean);
-          CONFIG.tagWhitelist = list.length > 0 ? list : [...DEFAULT_TAG_WHITELIST];
-        }
-
-        if (blArea) {
-          const list = blArea.value
-            .split(/[,，\n]/)
-            .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-            .filter(Boolean);
-          CONFIG.tagBlacklist = list.length > 0 ? list : [...DEFAULT_TAG_BLACKLIST];
-        }
-
-        if (actions) CONFIG.filterActions = actions.checked;
-        if (blur) CONFIG.hoverBlur = blur.checked;
-        if (mode) CONFIG.filterMode = mode.value;
-
-        saveCurrentConfig();
-        closeSettingsModal();
-        flashStatusHint('设置已保存！已应用最新配置');
-        refreshLatestMessage(false);
-        syncToDesktop();
-      });
-    }
-  }
-
-  function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
   // ------------------------------------------------------------------------------------
@@ -2116,7 +2792,10 @@
   // ------------------------------------------------------------------------------------
   function bindWindowEvents(win) {
     if (!win || !win.document) return;
+    if (win.document._tbEventsBound) return;
+    win.document._tbEventsBound = true;
 
+    // 1. 键盘快捷键监听
     win.document.addEventListener('keydown', e => {
       if (STATE.isContextMenuOpen) {
         if (e.key === 'Escape') {
@@ -2142,7 +2821,7 @@
       }
 
       const activeEl = win.document.activeElement;
-      const isInputActive = activeEl && activeEl.tagName === 'INPUT';
+      const isInputActive = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable);
 
       if (isInputActive) {
         if (e.key === 'Escape') {
@@ -2151,10 +2830,32 @@
         return;
       }
 
+      // 页内模式作用域保护：若摸鱼条未显示，或者鼠标/焦点并未位于摸鱼条内部，绝不拦截单键导航快捷键 (j, k, 方向键, Enter 等)
+      if (STATE.isHostInpage) {
+        const inpage = STATE.inpageContainer || win.document.getElementById('st-thief-inpage-container');
+        if (!inpage || inpage.style.display === 'none') return;
+
+        const isHovered = inpage.matches(':hover') || inpage.classList.contains('tb-mouse-over');
+        const isFocusedInside = inpage.contains(activeEl);
+
+        // 未与摸鱼条交互时，放行所有单键快捷键，避免破坏酒馆正常操作
+        if (!isHovered && !isFocusedInside) {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            closeThiefBar();
+          }
+          return;
+        }
+      }
+
       switch (e.key) {
         case 'Escape':
           e.preventDefault();
-          toggleBossKey();
+          if (STATE.isHostInpage) {
+            closeThiefBar();
+          } else {
+            toggleBossKey();
+          }
           break;
         case 'ArrowRight':
         case 'k':
@@ -2192,24 +2893,33 @@
       }
     });
 
-    win.document.addEventListener(
-      'wheel',
-      e => {
-        if (STATE.isSettingsOpen) return;
-        const activeEl = win.document.activeElement;
-        if (activeEl && activeEl.tagName === 'INPUT') return;
+    // 2. 鼠标滚轮翻句：严格限制作用域，杜绝劫持酒馆页面/聊天历史/弹窗列表等任何滚动组件
+    const onWheelHandler = e => {
+      if (STATE.isSettingsOpen) return;
+      const activeEl = win.document.activeElement;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable)) return;
 
-        e.preventDefault();
-        if (e.deltaY > 0) {
-          nextSentence();
-        } else if (e.deltaY < 0) {
-          prevSentence();
-        }
-      },
-      { passive: false }
-    );
+      // 仅在明确滚轮发生在摸鱼条上方时翻句
+      e.preventDefault();
+      if (e.deltaY > 0) {
+        nextSentence();
+      } else if (e.deltaY < 0) {
+        prevSentence();
+      }
+    };
 
-    // 点击菜单外部关闭右键上下文菜单
+    // 如果是页内模式，滚轮事件监听器严格只绑定到摸鱼条容器元素上；绝不挂载到 window.document，确保酒馆主界面任何组件滚动零干扰
+    if (STATE.isHostInpage) {
+      const inpage = STATE.inpageContainer || win.document.getElementById('st-thief-inpage-container');
+      if (inpage && !inpage._tbWheelBound) {
+        inpage._tbWheelBound = true;
+        inpage.addEventListener('wheel', onWheelHandler, { passive: false });
+      }
+    } else {
+      win.document.addEventListener('wheel', onWheelHandler, { passive: false });
+    }
+
+    // 3. 点击菜单外部关闭右键上下文菜单
     win.document.addEventListener('click', e => {
       if (STATE.isContextMenuOpen) {
         const menu = win.document.getElementById('tb-context-menu');
@@ -2220,115 +2930,410 @@
       }
     });
 
-    // 右键呼出摸鱼条专属上下文菜单
-    win.document.addEventListener('contextmenu', e => {
+    // 4. 右键呼出摸鱼条专属上下文菜单：仅在摸鱼条范围内生效，坚决不劫持酒馆全局右键菜单
+    const onContextMenuHandler = e => {
       if (STATE.isSettingsOpen || STATE.isFloorPickerOpen) return;
       const target = e.target;
       // 输入框内右键保留系统原生编辑菜单 (复制/粘贴/剪切)
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
 
       e.preventDefault();
       e.stopPropagation();
       openContextMenu(e.clientX, e.clientY);
-    });
+    };
+
+    // 页内模式下右键事件严格只绑定至摸鱼条容器，绝不拦截酒馆聊天内容或其他区域的原生右键操作
+    if (STATE.isHostInpage) {
+      const inpage = STATE.inpageContainer || win.document.getElementById('st-thief-inpage-container');
+      if (inpage && !inpage._tbContextMenuBound) {
+        inpage._tbContextMenuBound = true;
+        inpage.addEventListener('contextmenu', onContextMenuHandler);
+      }
+    } else {
+      win.document.addEventListener('contextmenu', onContextMenuHandler);
+    }
+
+    // 5. 隐私模式鼠标悬停与移开显隐联动
+    let mouseLeaveTimer = null;
+    const updateHoverState = isHovering => {
+      if (mouseLeaveTimer) {
+        clearTimeout(mouseLeaveTimer);
+        mouseLeaveTimer = null;
+      }
+      const targetEl = STATE.isHostInpage ? STATE.inpageContainer : win.document.body;
+      if (!targetEl) return;
+      if (isHovering) {
+        targetEl.classList.add('tb-mouse-over');
+      } else {
+        mouseLeaveTimer = setTimeout(() => {
+          const isInteracting = STATE.isContextMenuOpen || STATE.isSettingsOpen || STATE.isFloorPickerOpen || (win.document.activeElement && win.document.activeElement.tagName === 'INPUT');
+          if (!isInteracting) {
+            targetEl.classList.remove('tb-mouse-over');
+          }
+        }, 120);
+      }
+    };
+
+    if (STATE.isHostInpage && STATE.inpageContainer) {
+      STATE.inpageContainer.addEventListener('mouseenter', () => updateHoverState(true));
+      STATE.inpageContainer.addEventListener('mouseleave', () => updateHoverState(false));
+      STATE.inpageContainer.addEventListener('mousemove', () => updateHoverState(true));
+    } else {
+      win.document.addEventListener('mouseenter', () => updateHoverState(true));
+      win.document.addEventListener('mouseleave', () => updateHoverState(false));
+      win.document.addEventListener('mousemove', () => updateHoverState(true));
+      if (win.document.body) {
+        win.document.body.addEventListener('mouseenter', () => updateHoverState(true));
+        win.document.body.addEventListener('mouseleave', () => updateHoverState(false));
+        win.document.body.addEventListener('mousemove', () => updateHoverState(true));
+      }
+    }
+
+    if (typeof win.addEventListener === 'function') {
+      win.addEventListener('blur', () => {
+        if (CONFIG.privacyMode) {
+          const isInteracting = STATE.isContextMenuOpen || STATE.isSettingsOpen || STATE.isFloorPickerOpen || (win.document.activeElement && win.document.activeElement.tagName === 'INPUT');
+          if (!isInteracting) {
+            updateHoverState(false);
+          }
+        }
+      });
+    }
   }
 
   // ------------------------------------------------------------------------------------
-  // 酒馆网页常驻悬浮入口注入
+  // 酒馆网页常驻悬浮入口注入 (完美跟随页面变化与移动端触控)
   // ------------------------------------------------------------------------------------
+  function getSafeTopDoc() {
+    try {
+      if (window.top && window.top.document && window.top.document.body) {
+        return window.top.document;
+      }
+    } catch (e) {}
+    return document;
+  }
+
+  function getSafeTopWin() {
+    try {
+      if (window.top && window.top.location && window.top.location.href) {
+        return window.top;
+      }
+    } catch (e) {}
+    return window;
+  }
+
+  function clampFloatingButton(btn) {
+    if (!btn) return;
+    try {
+      const topDoc = getSafeTopDoc();
+      const topWin = getSafeTopWin();
+      const vp = topWin.visualViewport;
+      const winW = (vp ? vp.width : topWin.innerWidth) || topDoc.documentElement.clientWidth || 360;
+      const winH = (vp ? vp.height : topWin.innerHeight) || topDoc.documentElement.clientHeight || 640;
+      const rect = btn.getBoundingClientRect();
+      const btnW = rect.width || btn.offsetWidth || 38;
+      const btnH = rect.height || btn.offsetHeight || 38;
+      const margin = 6;
+
+      // 如果按钮被拖拽过（设置了具体的 left/top），确保其绝不会超出当前视口
+      if (btn.style.left && btn.style.left !== 'auto') {
+        let curLeft = parseFloat(btn.style.left) || 0;
+        let curTop = parseFloat(btn.style.top) || 0;
+        let safeLeft = Math.max(margin, Math.min(curLeft, winW - btnW - margin));
+        let safeTop = Math.max(margin, Math.min(curTop, winH - btnH - margin));
+        btn.style.left = `${safeLeft}px`;
+        btn.style.top = `${safeTop}px`;
+        btn.style.right = 'auto';
+        btn.style.bottom = 'auto';
+      } else {
+        // 默认贴在右下角安全区
+        btn.style.right = 'max(15px, env(safe-area-inset-right, 15px))';
+        btn.style.bottom = 'max(80px, calc(80px + env(safe-area-inset-bottom, 0px)))';
+      }
+    } catch (e) {}
+  }
+
   function injectSillyTavernEntrance() {
     try {
-      const topDoc = window.top ? window.top.document : document;
+      const topDoc = getSafeTopDoc();
       if (!topDoc || topDoc.getElementById('st-thief-floating-btn')) return;
 
       const btn = topDoc.createElement('div');
       btn.id = 'st-thief-floating-btn';
-      btn.innerHTML = `🐟 Thief摸鱼条 <span id="st-thief-pill-gear" title="点击打开标签黑名单与设置" style="opacity:0.75; font-size:11px; margin-left:5px; padding:1px 3px; border-radius:3px;">⚙️</span>`;
-      btn.title = '左键点击: 开启/收起摸鱼条 (快捷键: Alt + M)\n右键点击或点击齿轮: 打开标签黑名单设置\n支持鼠标按住随意拖拽位置';
+      btn.innerHTML = `🐟`;
+      btn.title = '🐟 Thief摸鱼条\n[左键点击]：展开 / 收起摸鱼条 (Alt+M)\n[右键点击]：直接打开设置面板\n[按住拖拽]：高效移动位置 (双击复位)';
       btn.style.cssText = `
         position: fixed;
-        bottom: 80px;
-        right: 25px;
+        bottom: max(80px, calc(80px + env(safe-area-inset-bottom, 0px)));
+        right: max(15px, env(safe-area-inset-right, 15px));
         z-index: 999999;
-        padding: 6px 14px;
-        background: #181818;
+        width: 38px;
+        height: 38px;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, #252830 0%, #17181c 100%);
         color: #4ec9b0;
-        border: 1px solid #3c3c3c;
-        border-radius: 18px;
-        font-size: 12px;
-        font-weight: 600;
-        cursor: pointer;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+        border: 1.5px solid rgba(78, 201, 176, 0.45);
+        border-radius: 50%;
+        font-size: 19px;
+        line-height: 1;
+        cursor: grab;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.65), 0 0 10px rgba(78, 201, 176, 0.2);
         user-select: none;
-        opacity: 0.9;
-        transition: opacity 0.2s, transform 0.15s;
+        -webkit-user-select: none;
+        opacity: 0.92;
+        transition: transform 0.15s ease, opacity 0.2s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+        touch-action: none;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Consolas, sans-serif;
       `;
 
+      // 还原拖拽记忆位置
+      try {
+        const savedPos = JSON.parse(localStorage.getItem('ST_THIEF_PILL_POS') || 'null');
+        if (savedPos && typeof savedPos.left === 'number' && typeof savedPos.top === 'number') {
+          btn.style.left = `${savedPos.left}px`;
+          btn.style.top = `${savedPos.top}px`;
+          btn.style.right = 'auto';
+          btn.style.bottom = 'auto';
+        }
+      } catch (err) {}
+
       btn.addEventListener('mouseenter', () => {
-        btn.style.opacity = '1';
-        btn.style.transform = 'scale(1.05)';
+        if (!isDragging) {
+          btn.style.opacity = '1';
+          btn.style.borderColor = '#4ec9b0';
+          btn.style.boxShadow = '0 6px 18px rgba(0, 0, 0, 0.8), 0 0 14px rgba(78, 201, 176, 0.4)';
+          btn.style.transform = 'scale(1.12)';
+        }
       });
       btn.addEventListener('mouseleave', () => {
-        btn.style.opacity = '0.9';
-        btn.style.transform = 'scale(1)';
+        if (!isDragging) {
+          btn.style.opacity = '0.92';
+          btn.style.borderColor = 'rgba(78, 201, 176, 0.45)';
+          btn.style.boxShadow = '0 4px 14px rgba(0, 0, 0, 0.65), 0 0 10px rgba(78, 201, 176, 0.2)';
+          btn.style.transform = 'scale(1)';
+        }
       });
 
+      function resetBtnPosition() {
+        btn.style.left = 'auto';
+        btn.style.top = 'auto';
+        btn.style.right = 'max(15px, env(safe-area-inset-right, 15px))';
+        btn.style.bottom = 'max(80px, calc(80px + env(safe-area-inset-bottom, 0px)))';
+        try {
+          localStorage.removeItem('ST_THIEF_PILL_POS');
+        } catch (err) {}
+        flashStatusHint('悬浮入口已复位至右下角安全区');
+      }
+
+      // 现代高性能 Pointer Events 交互模型 (GPU 加速、requestAnimationFrame 节流防掉帧)
+      let activePointerId = null;
+      let startX = 0, startY = 0;
+      let origLeft = 0, origTop = 0;
+      let isDragging = false;
+      let hasTriggeredLongPress = false;
+      let longPressTimer = null;
+      let lastTapTime = 0;
+      let rafPending = false;
+      let nextTargetX = 0, nextTargetY = 0;
+      let cachedWinW = 360, cachedWinH = 640;
+      let cachedBtnW = 38, cachedBtnH = 38;
+
+      function applyPosition() {
+        btn.style.left = `${nextTargetX}px`;
+        btn.style.top = `${nextTargetY}px`;
+        rafPending = false;
+      }
+
+      btn.addEventListener('pointerdown', e => {
+        // 仅处理鼠标左键 (0) 或触屏/手写笔
+        if (e.button !== 0) return;
+
+        activePointerId = e.pointerId;
+        startX = e.clientX;
+        startY = e.clientY;
+        isDragging = false;
+        hasTriggeredLongPress = false;
+
+        const rect = btn.getBoundingClientRect();
+        origLeft = rect.left;
+        origTop = rect.top;
+
+        // 一次性预缓存窗口与按钮几何尺寸，彻底杜绝 pointermove 过程中的 DOM layout thrashing 回流
+        const topWin = getSafeTopWin();
+        const topDoc = getSafeTopDoc();
+        const vp = topWin.visualViewport;
+        cachedWinW = (vp ? vp.width : topWin.innerWidth) || topDoc.documentElement.clientWidth || 360;
+        cachedWinH = (vp ? vp.height : topWin.innerHeight) || topDoc.documentElement.clientHeight || 640;
+        cachedBtnW = rect.width || 38;
+        cachedBtnH = rect.height || 38;
+
+        try {
+          btn.setPointerCapture(e.pointerId);
+        } catch (err) {}
+
+        btn.style.willChange = 'left, top, transform';
+
+        // 移动端长按检测 (480ms)：触屏长按可直接唤起设置面板
+        if (longPressTimer) clearTimeout(longPressTimer);
+        longPressTimer = setTimeout(() => {
+          if (!isDragging && activePointerId === e.pointerId) {
+            hasTriggeredLongPress = true;
+            if (activePointerId !== null) {
+              try { btn.releasePointerCapture(activePointerId); } catch (err) {}
+              activePointerId = null;
+            }
+            openSettingsModal();
+          }
+        }, 480);
+
+        // 阻止原生文字选中与 HTML 拖拽，防止事件被浏览器抢占中断
+        e.preventDefault();
+      });
+
+      btn.addEventListener('pointermove', e => {
+        if (activePointerId !== e.pointerId) return;
+
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        const dist = Math.hypot(dx, dy);
+
+        // 4px 响应阈值：既能过滤人类手指极微小颤动，又能实现一触即发的高性能即时拖拽反馈
+        if (!isDragging && dist > 4) {
+          isDragging = true;
+          if (longPressTimer) {
+            clearTimeout(longPressTimer);
+            longPressTimer = null;
+          }
+          btn.style.transition = 'none';
+          btn.style.cursor = 'grabbing';
+          btn.style.transform = 'scale(1.1)';
+          btn.style.right = 'auto';
+          btn.style.bottom = 'auto';
+        }
+
+        if (isDragging) {
+          const margin = 4;
+          let targetX = origLeft + dx;
+          let targetY = origTop + dy;
+
+          targetX = Math.max(margin, Math.min(targetX, cachedWinW - cachedBtnW - margin));
+          targetY = Math.max(margin, Math.min(targetY, cachedWinH - cachedBtnH - margin));
+
+          nextTargetX = targetX;
+          nextTargetY = targetY;
+
+          if (!rafPending) {
+            rafPending = true;
+            requestAnimationFrame(applyPosition);
+          }
+        }
+      });
+
+      function onPointerEnd(e, isCancel) {
+        if (activePointerId !== e.pointerId) return;
+
+        if (longPressTimer) {
+          clearTimeout(longPressTimer);
+          longPressTimer = null;
+        }
+
+        try {
+          btn.releasePointerCapture(e.pointerId);
+        } catch (err) {}
+        activePointerId = null;
+
+        btn.style.willChange = 'auto';
+        btn.style.cursor = 'grab';
+        btn.style.transition = 'transform 0.15s ease, opacity 0.2s ease, border-color 0.15s ease, box-shadow 0.15s ease';
+        btn.style.transform = 'scale(1)';
+
+        if (hasTriggeredLongPress) {
+          hasTriggeredLongPress = false;
+          isDragging = false;
+          return;
+        }
+
+        if (isDragging && !isCancel) {
+          if (rafPending) {
+            applyPosition();
+          }
+          clampFloatingButton(btn);
+          try {
+            const curLeft = parseFloat(btn.style.left) || 0;
+            const curTop = parseFloat(btn.style.top) || 0;
+            localStorage.setItem('ST_THIEF_PILL_POS', JSON.stringify({ left: curLeft, top: curTop }));
+          } catch (err) {}
+          isDragging = false;
+          return;
+        }
+
+        const wasDragging = isDragging;
+        isDragging = false;
+
+        if (isCancel || wasDragging) return;
+
+        // 双击/双触快速复位 (350ms 内连续两次点击)
+        const now = Date.now();
+        if (now - lastTapTime < 350) {
+          lastTapTime = 0;
+          resetBtnPosition();
+          return;
+        }
+        lastTapTime = now;
+
+        // 左键干净点击 / 触屏轻触：开启或收起摸鱼条
+        toggleThiefBar();
+      }
+
+      btn.addEventListener('pointerup', e => onPointerEnd(e, false));
+      btn.addEventListener('pointercancel', e => onPointerEnd(e, true));
+
+      // 右键悬浮窗直接打开设置
       btn.addEventListener('contextmenu', e => {
         e.preventDefault();
         e.stopPropagation();
+        if (longPressTimer) {
+          clearTimeout(longPressTimer);
+          longPressTimer = null;
+        }
         openSettingsModal();
       });
 
-      let isDragging = false;
-      let startX = 0,
-        startY = 0,
-        origX = 0,
-        origY = 0;
-
-      btn.addEventListener('mousedown', e => {
-        isDragging = false;
-        startX = e.clientX;
-        startY = e.clientY;
-        const rect = btn.getBoundingClientRect();
-        origX = rect.left;
-        origY = rect.top;
-
-        function onMouseMove(ev) {
-          if (Math.hypot(ev.clientX - startX, ev.clientY - startY) > 4) {
-            isDragging = true;
-          }
-          if (isDragging) {
-            btn.style.right = 'auto';
-            btn.style.bottom = 'auto';
-            btn.style.left = `${origX + (ev.clientX - startX)}px`;
-            btn.style.top = `${origY + (ev.clientY - startY)}px`;
-          }
-        }
-
-        function onMouseUp() {
-          topDoc.removeEventListener('mousemove', onMouseMove);
-          topDoc.removeEventListener('mouseup', onMouseUp);
-        }
-
-        topDoc.addEventListener('mousemove', onMouseMove);
-        topDoc.addEventListener('mouseup', onMouseUp);
+      // 阻止原生合成点击事件二次触发干扰
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        e.preventDefault();
       });
 
-      btn.addEventListener('click', e => {
-        if (!isDragging) {
-          e.stopPropagation();
-          const target = e.target;
-          if (target && target.id === 'st-thief-pill-gear') {
-            openSettingsModal();
-          } else {
-            toggleThiefBar();
-          }
-        }
+      // 双击鼠标一键复位
+      btn.addEventListener('dblclick', e => {
+        e.stopPropagation();
+        resetBtnPosition();
       });
 
       topDoc.body.appendChild(btn);
-      console.log('[ST-Thief-Book] 成功在酒馆主界面注入“🐟 Thief摸鱼条”悬浮入口');
+      clampFloatingButton(btn);
+
+      // 监听屏幕尺寸、旋转与视口缩放变化，确保悬浮窗始终紧紧跟随页面变化
+      const topWin = getSafeTopWin();
+      const onViewportChange = () => {
+        clampFloatingButton(btn);
+        if (STATE.isHostInpage) {
+          updateInpageFloatingPosition();
+          refreshLatestMessage(false);
+        }
+      };
+      topWin.addEventListener('resize', onViewportChange);
+      topWin.addEventListener('orientationchange', onViewportChange);
+      if (topWin.visualViewport) {
+        topWin.visualViewport.addEventListener('resize', onViewportChange);
+        topWin.visualViewport.addEventListener('scroll', onViewportChange);
+      }
+
+      console.log('[ST-Thief-Book] 成功在酒馆主界面注入“🐟”精简图标入口 (右键直接设置 / 移动超高效)');
     } catch (e) {
       console.warn('[ST-Thief-Book] 注入悬浮入口异常:', e);
     }
@@ -2336,14 +3341,48 @@
 
   function setupHostGlobalShortcuts() {
     try {
-      const topDoc = window.top ? window.top.document : document;
+      const topDoc = getSafeTopDoc();
+      if (topDoc._tbHostShortcutsBound) return;
+      topDoc._tbHostShortcutsBound = true;
+
       topDoc.addEventListener('keydown', e => {
         if (e.altKey && (e.key === 'm' || e.key === 'M')) {
           e.preventDefault();
           toggleThiefBar();
+          return;
         }
-        if (e.key === 'Escape' && STATE.thiefWindow && !STATE.thiefWindow.closed) {
-          toggleBossKey();
+        if (e.key === 'Escape') {
+          const activeEl = topDoc.activeElement;
+          const isInputActive = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable);
+          if (isInputActive) return;
+
+          if (STATE.isSettingsOpen) {
+            e.preventDefault();
+            closeSettingsModal();
+            return;
+          }
+          if (STATE.isContextMenuOpen) {
+            e.preventDefault();
+            closeContextMenu();
+            return;
+          }
+          if (STATE.isFloorPickerOpen) {
+            e.preventDefault();
+            toggleFloorPicker(false);
+            return;
+          }
+          if (STATE.isHostInpage && STATE.inpageContainer && STATE.inpageContainer.style.display !== 'none') {
+            closeThiefBar();
+          } else if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isHostInpage) {
+            toggleBossKey();
+          }
+        }
+      });
+
+      // 当用户从桌面切回酒馆窗口且开启了桌面同步时，顺手轻量探测连接一次
+      window.addEventListener('focus', () => {
+        if (CONFIG.enableDesktopSync && !STATE.wsClient && !STATE.wsConnecting) {
+          initDesktopBridge(false);
         }
       });
     } catch (e) {
@@ -2352,21 +3391,186 @@
   }
 
   // ------------------------------------------------------------------------------------
-  // 画中画（Document Picture-in-Picture）与弹窗开启逻辑
+  // 画中画（Document Picture-in-Picture）、独立弹窗与页内原生悬浮条支持
   // ------------------------------------------------------------------------------------
+  function setupInpageDraggable(inpage) {
+    if (!inpage || inpage.dataset.dragInit === 'true') return;
+    inpage.dataset.dragInit = 'true';
+
+    // 还原历史记录的垂直高度位置
+    try {
+      const savedBottom = localStorage.getItem('ST_THIEF_INPAGE_BOTTOM');
+      if (savedBottom !== null && !isNaN(parseFloat(savedBottom))) {
+        inpage.style.bottom = `${Math.max(0, parseFloat(savedBottom))}px`;
+      }
+    } catch (e) {}
+
+    let isDragging = false;
+    let startY = 0;
+    let origBottom = 0;
+    let dragPointerId = null;
+    let lastHandleTap = 0;
+
+    function onPointerDown(e) {
+      const target = e.target;
+      const isHandle = target && (target.id === 'tb-drag-handle' || target.classList?.contains('tb-drag-handle'));
+      const isReadingRow = target && target.classList?.contains('tb-row-reading');
+      const isSectionLeft = target && target.classList?.contains('tb-section-left');
+      if (!isHandle && !isReadingRow && !isSectionLeft) return;
+
+      if (e.button !== 0) return;
+      dragPointerId = e.pointerId;
+      try {
+        target.setPointerCapture(e.pointerId);
+      } catch (err) {}
+
+      isDragging = false;
+      startY = e.clientY;
+      origBottom = parseFloat(inpage.style.bottom) || 0;
+      e.preventDefault();
+    }
+
+    function onPointerMove(e) {
+      if (dragPointerId !== e.pointerId) return;
+      const dy = startY - e.clientY; // 向上拖动 clientY 变小，dy 为正，bottom 应增大
+      if (!isDragging && Math.abs(dy) > 5) {
+        isDragging = true;
+        inpage.style.transition = 'none';
+      }
+
+      if (isDragging) {
+        const topWin = getSafeTopWin();
+        const maxBottom = Math.max(0, (topWin.innerHeight || 600) - 50);
+        const newBottom = Math.max(0, Math.min(origBottom + dy, maxBottom));
+        inpage.style.bottom = `${newBottom}px`;
+      }
+    }
+
+    function onPointerUp(e) {
+      if (dragPointerId !== e.pointerId) return;
+      const target = e.target;
+      try {
+        target.releasePointerCapture(e.pointerId);
+      } catch (err) {}
+      dragPointerId = null;
+      inpage.style.transition = 'bottom 0.2s cubic-bezier(0.2, 0, 0, 1), opacity 0.15s ease';
+
+      if (isDragging) {
+        isDragging = false;
+        try {
+          const curBottom = parseFloat(inpage.style.bottom) || 0;
+          localStorage.setItem('ST_THIEF_INPAGE_BOTTOM', curBottom.toString());
+        } catch (err) {}
+        return;
+      }
+
+      isDragging = false;
+      // 双击/双触拖拽手柄 ⠿ 一键贴底复位
+      const isHandle = target && (target.id === 'tb-drag-handle' || target.classList?.contains('tb-drag-handle'));
+      if (isHandle) {
+        const now = Date.now();
+        if (now - lastHandleTap < 350) {
+          lastHandleTap = 0;
+          inpage.style.bottom = 'max(0px, env(safe-area-inset-bottom, 0px))';
+          try {
+            localStorage.removeItem('ST_THIEF_INPAGE_BOTTOM');
+          } catch (err) {}
+          flashStatusHint('摸鱼条已贴底复位');
+          return;
+        }
+        lastHandleTap = now;
+      }
+    }
+
+    inpage.addEventListener('pointerdown', onPointerDown);
+    inpage.addEventListener('pointermove', onPointerMove);
+    inpage.addEventListener('pointerup', onPointerUp);
+    inpage.addEventListener('pointercancel', onPointerUp);
+  }
+
+  function updateInpageFloatingPosition() {
+    if (!STATE.isHostInpage || !STATE.inpageContainer) return;
+    try {
+      const topWin = getSafeTopWin();
+      const vp = topWin.visualViewport;
+      if (vp) {
+        // 手机端软键盘弹起时，自适应升至软键盘上方，不遮挡不丢失
+        const keyboardHeight = Math.max(0, topWin.innerHeight - (vp.offsetTop + vp.height));
+        const savedBottom = parseFloat(localStorage.getItem('ST_THIEF_INPAGE_BOTTOM') || '0') || 0;
+        const totalBottom = savedBottom + keyboardHeight;
+        STATE.inpageContainer.style.bottom = `${totalBottom}px`;
+      }
+    } catch (e) {}
+  }
+
+  function openInpageThiefBar() {
+    const topDoc = getSafeTopDoc();
+    let inpage = topDoc.getElementById('st-thief-inpage-container');
+    if (!inpage) {
+      inpage = topDoc.createElement('div');
+      inpage.id = 'st-thief-inpage-container';
+      topDoc.body.appendChild(inpage);
+    }
+
+    inpage.style.display = 'block';
+    STATE.isHostInpage = true;
+    STATE.inpageContainer = inpage;
+
+    // 虚拟 window 适配器，衔接 renderThiefBar
+    STATE.thiefWindow = {
+      document: topDoc,
+      closed: false,
+      isHostInpage: true,
+      focus: () => {
+        if (STATE.inpageContainer) STATE.inpageContainer.style.display = 'block';
+      },
+      close: () => {
+        closeThiefBar();
+      },
+      resizeTo: () => {}
+    };
+
+    setupInpageDraggable(inpage);
+    updateInpageFloatingPosition();
+    renderThiefBar();
+
+    // 唤起时保持临时可见高亮，防止隐私模式下立即变为完全透明看不到
+    if (inpage) {
+      inpage.classList.add('tb-privacy-active');
+      setTimeout(() => {
+        const isInteracting = STATE.isContextMenuOpen || STATE.isSettingsOpen || STATE.isFloorPickerOpen || (topDoc.activeElement && topDoc.activeElement.tagName === 'INPUT');
+        if (!isInteracting && STATE.inpageContainer) {
+          STATE.inpageContainer.classList.remove('tb-privacy-active');
+        }
+      }, 3500);
+    }
+
+    flashStatusHint('摸鱼状态栏已展开 (轻触文字阅读，可拖拽调节高度)');
+  }
+
   async function openThiefBar() {
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-      STATE.thiefWindow.focus();
+    if (STATE.isHostInpage && STATE.inpageContainer && STATE.inpageContainer.style.display !== 'none') {
+      return;
+    }
+    if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isHostInpage) {
+      try { STATE.thiefWindow.focus(); } catch (e) {}
       return;
     }
 
     refreshLatestMessage(false);
 
+    // 1. 移动端/小屏环境检测：优先使用页内原生悬浮条，彻底解决手机端看不见与弹窗被拦问题
+    if (isMobileDevice()) {
+      openInpageThiefBar();
+      return;
+    }
+
     const baseH = CONFIG.minimalMode
       ? (CONFIG.layoutMode === 'double' ? 56 : 30)
       : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
-    const winHeight = STATE.isSettingsOpen ? 500 : baseH;
+    const winHeight = baseH;
 
+    // 2. 桌面端优先支持画中画 (Picture-in-Picture)
     if ('documentPictureInPicture' in window) {
       try {
         const pipWin = await window.documentPictureInPicture.requestWindow({
@@ -2374,8 +3578,12 @@
           height: winHeight
         });
 
+        STATE.isHostInpage = false;
         STATE.thiefWindow = pipWin;
         pipWin.addEventListener('unload', () => {
+          STATE.thiefWindow = null;
+        });
+        pipWin.addEventListener('pagehide', () => {
           STATE.thiefWindow = null;
         });
         pipWin.addEventListener('resize', () => {
@@ -2389,42 +3597,18 @@
         renderThiefBar();
         return;
       } catch (err) {
-        console.warn('[ST-Thief-Book] Document Picture-in-Picture 启动失败，降级使用独立弹窗:', err);
+        console.warn('[ST-Thief-Book] Document Picture-in-Picture 启动失败，降级使用页内原生悬浮条:', err);
       }
     }
 
-    const left = Math.max(0, Math.floor((window.screen.width - CONFIG.barWidth) / 2));
-    const top = Math.max(0, window.screen.height - winHeight - 65);
-
-    const popupWin = window.open(
-      '',
-      'ST_Thief_Bar',
-      `width=${CONFIG.barWidth},height=${winHeight},left=${left},top=${top},menubar=no,toolbar=no,location=no,status=no,resizable=yes`
-    );
-
-    if (!popupWin) {
-      alert('无法弹出摸鱼条，请在浏览器地址栏允许弹出式窗口权限！');
-      return;
-    }
-
-    STATE.thiefWindow = popupWin;
-    popupWin.document.title = 'VSCode Status Bar';
-    popupWin.addEventListener('unload', () => {
-      STATE.thiefWindow = null;
-    });
-    popupWin.addEventListener('resize', () => {
-      if (popupWin.innerWidth && popupWin.innerWidth >= 360) {
-        CONFIG.barWidth = popupWin.innerWidth;
-        saveCurrentConfig();
-        syncToDesktop();
-      }
-    });
-
-    renderThiefBar();
+    // 3. 终极自适应保底：若不支持画中画或启动失败，直接开启页内原生悬浮窗 (稳定可靠，绝不被弹窗拦截器阻拦)
+    openInpageThiefBar();
   }
 
   function toggleThiefBar() {
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
+    if (STATE.isHostInpage && STATE.inpageContainer && STATE.inpageContainer.style.display !== 'none') {
+      closeThiefBar();
+    } else if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isHostInpage) {
       closeThiefBar();
     } else {
       openThiefBar();
@@ -2432,8 +3616,14 @@
   }
 
   function closeThiefBar() {
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-      STATE.thiefWindow.close();
+    if (STATE.isHostInpage && STATE.inpageContainer) {
+      STATE.inpageContainer.style.display = 'none';
+      STATE.isHostInpage = false;
+      STATE.thiefWindow = null;
+    } else if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
+      try {
+        STATE.thiefWindow.close();
+      } catch (e) {}
       STATE.thiefWindow = null;
     }
   }
@@ -2441,14 +3631,69 @@
   // ------------------------------------------------------------------------------------
   // 本地桌面端 WebSocket 同步机制
   // ------------------------------------------------------------------------------------
-  function initDesktopBridge() {
+  function stopDesktopBridge() {
+    if (STATE.wsReconnectTimer) {
+      clearTimeout(STATE.wsReconnectTimer);
+      STATE.wsReconnectTimer = null;
+    }
+    if (STATE.wsClient) {
+      try {
+        STATE.wsClient.onopen = null;
+        STATE.wsClient.onmessage = null;
+        STATE.wsClient.onclose = null;
+        STATE.wsClient.onerror = null;
+        STATE.wsClient.close();
+      } catch (e) {}
+      STATE.wsClient = null;
+    }
+    STATE.wsConnecting = false;
+  }
+
+  function toggleDesktopSync(forcedState) {
+    STATE.isContextMenuOpen = false;
+    const target = typeof forcedState === 'boolean' ? forcedState : !CONFIG.enableDesktopSync;
+    CONFIG.enableDesktopSync = target;
+    saveCurrentConfig();
+
+    if (CONFIG.enableDesktopSync) {
+      flashStatusHint('🖥️ 已手动开启桌面同步，正在连接 127.0.0.1:18899...');
+      initDesktopBridge(true);
+    } else {
+      stopDesktopBridge();
+      flashStatusHint('⚪ 已关闭桌面同步 (纯网页模式)');
+    }
+    renderThiefBar();
+  }
+
+  function initDesktopBridge(isManual = false) {
+    // 关键守卫：如果未手动开启桌面端同步，绝不发起任何 WebSocket 连接与重连！
+    if (!CONFIG.enableDesktopSync) {
+      stopDesktopBridge();
+      return;
+    }
+
+    if (STATE.wsClient && (STATE.wsClient.readyState === WebSocket.OPEN || STATE.wsClient.readyState === WebSocket.CONNECTING)) {
+      if (isManual) flashStatusHint('🟢 桌面端已在连接中');
+      return;
+    }
+
+    if (STATE.wsReconnectTimer) {
+      clearTimeout(STATE.wsReconnectTimer);
+      STATE.wsReconnectTimer = null;
+    }
+
+    STATE.wsConnecting = true;
+
     try {
       const wsUrl = `ws://127.0.0.1:${CONFIG.wsPort}`;
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        console.log('[ST-Thief-Book] 成功连接到 Python 桌面摸鱼客户端');
+        STATE.wsConnecting = false;
         STATE.wsClient = ws;
+        console.log('[ST-Thief-Book] 成功连接到 Python 桌面摸鱼客户端');
+        flashStatusHint('🟢 成功连接到 Python 桌面摸鱼客户端');
+        renderThiefBar();
         syncToDesktop();
       };
 
@@ -2488,6 +3733,7 @@
             if (data.config.charNameMode) CONFIG.charNameMode = data.config.charNameMode;
             if (data.config.wrapMode) CONFIG.wrapMode = data.config.wrapMode;
             if (typeof data.config.minimalMode === 'boolean') CONFIG.minimalMode = data.config.minimalMode;
+            if (typeof data.config.privacyMode === 'boolean') CONFIG.privacyMode = data.config.privacyMode;
             if (data.config.layoutMode) CONFIG.layoutMode = data.config.layoutMode;
             if (typeof data.config.opacity === 'number') CONFIG.opacity = data.config.opacity;
             if (typeof data.config.barWidth === 'number') CONFIG.barWidth = data.config.barWidth;
@@ -2501,17 +3747,35 @@
 
       ws.onclose = () => {
         STATE.wsClient = null;
-        setTimeout(initDesktopBridge, 5000);
+        STATE.wsConnecting = false;
+        renderThiefBar();
+
+        // 只有当用户依然开启了桌面同步时，才温和安排重连，若未开启则完全静默
+        if (CONFIG.enableDesktopSync) {
+          if (STATE.wsReconnectTimer) clearTimeout(STATE.wsReconnectTimer);
+          STATE.wsReconnectTimer = setTimeout(() => {
+            if (CONFIG.enableDesktopSync) {
+              initDesktopBridge(false);
+            }
+          }, 10000);
+        }
       };
 
       ws.onerror = () => {
         STATE.wsClient = null;
+        STATE.wsConnecting = false;
+        if (isManual) {
+          flashStatusHint('⚠️ 桌面端未开启，请先运行 start_desktop.bat');
+        }
       };
-    } catch (e) {}
+    } catch (e) {
+      STATE.wsClient = null;
+      STATE.wsConnecting = false;
+    }
   }
 
   function syncToDesktop() {
-    if (!STATE.wsClient || STATE.wsClient.readyState !== WebSocket.OPEN) return;
+    if (!CONFIG.enableDesktopSync || !STATE.wsClient || STATE.wsClient.readyState !== WebSocket.OPEN) return;
 
     try {
       const payload = {
@@ -2535,6 +3799,7 @@
           charNameMode: CONFIG.charNameMode,
           wrapMode: CONFIG.wrapMode,
           minimalMode: CONFIG.minimalMode,
+          privacyMode: CONFIG.privacyMode,
           layoutMode: CONFIG.layoutMode,
           opacity: CONFIG.opacity,
           barWidth: CONFIG.barWidth
@@ -2667,9 +3932,13 @@
     toggleCharMode: toggleCharNameMode,
     toggleWrap: toggleWrapMode,
     toggleMinimal: toggleMinimalMode,
+    togglePrivacy: togglePrivacyMode,
     openMenu: openContextMenu,
     closeMenu: closeContextMenu,
     openSettings: openSettingsModal,
+    toggleDesktopSync: toggleDesktopSync,
+    connectDesktop: () => toggleDesktopSync(true),
+    disconnectDesktop: () => toggleDesktopSync(false),
     addWhitelistTag: tag => {
       if (tag && !CONFIG.tagWhitelist.includes(tag)) {
         CONFIG.tagWhitelist.push(tag);

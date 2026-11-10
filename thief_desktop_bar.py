@@ -618,38 +618,60 @@ class ThiefDesktopBar:
 
         is_min = self.config.get('minimalMode', False)
         is_single = self.config.get('layoutMode', 'double') == 'single'
-
-        # 1. 核心模式切换
-        min_label = "✨ 极简模式 [✓ 已开启]" if is_min else "✨ 极简模式 [未开启]"
-        self.context_menu.add_command(label=min_label, command=self._cmd(self.toggle_minimal_mode))
-
-        layout_label = "↕ 布局: 切换为双行 (含回复)" if is_single else "↕ 布局: 切换为单行极窄"
-        self.context_menu.add_command(label=layout_label, command=self._cmd(self.toggle_layout_mode))
-
-        self.context_menu.add_separator()
-
-        # 2. 楼层控制 (右键直接换楼与展示当前楼层)
-        floor_info = f"📖 当前楼层: #{self.floor} (句 {self.cur_idx}/{self.total_sentences})"
-        self.context_menu.add_command(label=floor_info, command=self._cmd(self.open_floor_jump_dialog))
-        self.context_menu.add_command(label="▲ 上一楼 (PageUp)", command=self._cmd(self.action_floor_prev))
-        self.context_menu.add_command(label="▼ 下一楼 (PageDown)", command=self._cmd(self.action_floor_next))
-        self.context_menu.add_command(label="⏮ 首楼 (#0)", command=self._cmd(lambda: self.action_floor_jump(0)))
-        self.context_menu.add_command(label="🔢 快速输入楼层跳转...", command=self._cmd(self.open_floor_jump_dialog))
-
-        self.context_menu.add_separator()
-
-        # 3. 阅读翻句与生成
-        self.context_menu.add_command(label="‹ 上一句 (← / J / 滚轮上)", command=self._cmd(self.action_prev))
-        self.context_menu.add_command(label="› 下一句 (→ / K / 滚轮下 / 点击)", command=self._cmd(self.action_next))
-        self.context_menu.add_command(label="⟲ 重卷回复 (Alt+S)", command=self._cmd(self.action_swipe))
-        self.context_menu.add_command(label="⏹ 中止生成 (Alt+X)", command=self._cmd(self.action_stop))
-
-        self.context_menu.add_separator()
-
-        # 4. 显示与透明度设置
+        is_privacy = self.config.get('privacyMode', False)
         is_wrap = self.config.get('wrapMode', 'wrap') == 'wrap'
-        wrap_label = "↩ 换行模式: 自动折行全显" if is_wrap else "↩ 换行模式: 强制单行"
-        self.context_menu.add_command(label=wrap_label, command=self._cmd(self.toggle_wrap_mode))
+        show_user = self.config.get('showUserMessages', False)
+
+        # 1. 核心模式切换 (简洁勾选标记，杜绝花俏图标)
+        mark_min = "✓ " if is_min else "   "
+        self.context_menu.add_command(
+            label=f"{mark_min}极简模式",
+            accelerator="已开启" if is_min else "",
+            command=self._cmd(self.toggle_minimal_mode)
+        )
+
+        mark_privacy = "✓ " if is_privacy else "   "
+        self.context_menu.add_command(
+            label=f"{mark_privacy}隐私模式 (悬停显示)",
+            accelerator="已开启" if is_privacy else "",
+            command=self._cmd(self.toggle_privacy_mode)
+        )
+
+        mark_layout = "   " if is_single else "✓ "
+        self.context_menu.add_command(
+            label=f"{mark_layout}双行布局 (含回复框)",
+            accelerator="单行" if is_single else "双行",
+            command=self._cmd(self.toggle_layout_mode)
+        )
+
+        self.context_menu.add_separator()
+
+        # 2. 阅读与生成控制 (文字清爽简明，快捷键右对齐)
+        self.context_menu.add_command(label="上一句", accelerator="←", command=self._cmd(self.action_prev))
+        self.context_menu.add_command(label="下一句", accelerator="→", command=self._cmd(self.action_next))
+        self.context_menu.add_command(label="重新生成", accelerator="Alt+S", command=self._cmd(self.action_swipe))
+        if self.is_generating:
+            self.context_menu.add_command(label="中止生成", accelerator="Alt+X", command=self._cmd(self.action_stop))
+
+        self.context_menu.add_separator()
+
+        # 3. 楼层导航
+        self.context_menu.add_command(label="上一楼", accelerator="PageUp", command=self._cmd(self.action_floor_prev))
+        self.context_menu.add_command(label="下一楼", accelerator="PageDown", command=self._cmd(self.action_floor_next))
+        self.context_menu.add_command(
+            label="跳转楼层...",
+            accelerator=f"#{self.floor}",
+            command=self._cmd(self.open_floor_jump_dialog)
+        )
+
+        self.context_menu.add_separator()
+
+        # 4. 显示与外观设置
+        mark_wrap = "✓ " if is_wrap else "   "
+        self.context_menu.add_command(
+            label=f"{mark_wrap}自动折行全显",
+            command=self._cmd(self.toggle_wrap_mode)
+        )
 
         # 窗口长度调整子菜单
         width_menu = tk.Menu(
@@ -663,28 +685,25 @@ class ThiefDesktopBar:
             bd=1,
             relief=tk.SOLID
         )
-        width_menu.add_command(label="✨ 自动适应文字长短 (Ctrl+↑)", command=self._cmd(self.auto_fit_text_length))
-        width_menu.add_command(label="➕ 加长 +100px (Ctrl+→)", command=self._cmd(lambda: self.change_window_width(100)))
-        width_menu.add_command(label="➖ 缩短 -100px (Ctrl+←)", command=self._cmd(lambda: self.change_window_width(-100)))
+        width_menu.add_command(label="自适应文本长度", accelerator="Ctrl+↑", command=self._cmd(self.auto_fit_text_length))
+        width_menu.add_command(label="增加宽度 (+100px)", accelerator="Ctrl+→", command=self._cmd(lambda: self.change_window_width(100)))
+        width_menu.add_command(label="减小宽度 (-100px)", accelerator="Ctrl+←", command=self._cmd(lambda: self.change_window_width(-100)))
         width_menu.add_separator()
         width_presets = [
-            ("480px (极窄紧凑)", 480),
-            ("680px (紧凑摸鱼)", 680),
-            ("860px (标准默认)", 860),
-            ("1080px (宽屏舒适)", 1080),
-            ("1360px (超宽长句)", 1360)
+            ("480px (紧凑)", 480),
+            ("680px (标准)", 680),
+            ("860px (舒适)", 860),
+            ("1080px (宽屏)", 1080),
+            ("1360px (超宽)", 1360)
         ]
         for name, val in width_presets:
-            mark = " ✓" if abs(self.width - val) <= 15 else ""
-            width_menu.add_command(label=f"{name}{mark}", command=self._cmd(lambda v=val: self.set_window_width(v)))
+            mark = "✓ " if abs(self.width - val) <= 15 else "   "
+            width_menu.add_command(label=f"{mark}{name}", command=self._cmd(lambda v=val: self.set_window_width(v)))
         width_menu.add_separator()
-        width_menu.add_command(label="✏️ 滑块精确微调长度...", command=self._cmd(self.open_custom_width_dialog))
-        self.context_menu.add_cascade(label=f"📏 窗口长度 ({self.width}px)", menu=width_menu)
+        width_menu.add_command(label="自定义长度...", command=self._cmd(self.open_custom_width_dialog))
+        self.context_menu.add_cascade(label=f"窗口长度 ({self.width}px)", menu=width_menu)
 
-        if not is_min:
-            self.context_menu.add_command(label="👤 切换角色名显示模式", command=self._cmd(self.cycle_char_name_mode))
-
-        # 窗口透明度子菜单 (丰富预设 + 滑块微调)
+        # 窗口透明度子菜单
         opacity_menu = tk.Menu(
             self.context_menu,
             tearoff=0,
@@ -698,35 +717,64 @@ class ThiefDesktopBar:
         )
         cur_pct = int(round(self.alpha * 100))
         presets = [
-            ("100% 完全不透明 (Alt+9)", 1.0),
-            ("90% 经典深色", 0.9),
-            ("80% 轻度透明 (Alt+8)", 0.8),
-            ("70% 舒适摸鱼 (Alt+7)", 0.7),
-            ("50% 半透明隐蔽 (Alt+5)", 0.5),
-            ("30% 极淡幽灵 (Alt+3)", 0.3),
-            ("15% 极限隐身 (Alt+1)", 0.15)
+            ("100% (不透明)", 1.0, "Alt+9"),
+            ("90%", 0.9, ""),
+            ("80%", 0.8, "Alt+8"),
+            ("70%", 0.7, "Alt+7"),
+            ("50% (半透明)", 0.5, "Alt+5"),
+            ("30%", 0.3, "Alt+3"),
+            ("15% (极淡)", 0.15, "Alt+1")
         ]
-        for name, val in presets:
-            mark = " ✓" if abs(cur_pct - int(round(val * 100))) <= 3 else ""
-            opacity_menu.add_command(label=f"{name}{mark}", command=self._cmd(lambda v=val: self.set_opacity(v)))
+        for name, val, sc in presets:
+            mark = "✓ " if abs(cur_pct - int(round(val * 100))) <= 3 else "   "
+            opacity_menu.add_command(
+                label=f"{mark}{name}",
+                accelerator=sc,
+                command=self._cmd(lambda v=val: self.set_opacity(v))
+            )
         opacity_menu.add_separator()
-        opacity_menu.add_command(label="✏️ 滑块精确微调透明度...", command=self._cmd(self.open_custom_opacity_dialog))
-        self.context_menu.add_cascade(label=f"🌓 窗口透明度 ({cur_pct}%)", menu=opacity_menu)
+        opacity_menu.add_command(label="自定义透明度...", command=self._cmd(self.open_custom_opacity_dialog))
+        self.context_menu.add_cascade(label=f"窗口透明度 ({cur_pct}%)", menu=opacity_menu)
 
-        show_user = self.config.get('showUserMessages', False)
-        user_lbl = "💬 用户消息: ✓ 显示中" if show_user else "💬 用户消息: 隐藏 (仅看AI)"
-        self.context_menu.add_command(label=user_lbl, command=self._cmd(self.toggle_show_user_messages))
+        mark_user = "✓ " if show_user else "   "
+        self.context_menu.add_command(
+            label=f"{mark_user}显示用户消息",
+            command=self._cmd(self.toggle_show_user_messages)
+        )
 
-        self.context_menu.add_command(label="🎨 切换主题 (Alt+T)", command=self._cmd(self.toggle_theme))
+        self.context_menu.add_command(
+            label="切换主题",
+            accelerator="Alt+T",
+            command=self._cmd(self.toggle_theme)
+        )
+
+        if not is_min:
+            char_mode = self.config.get('charNameMode', 'compact')
+            char_desc = "精简" if char_mode == 'compact' else ("隐藏" if char_mode == 'hidden' else "完整")
+            self.context_menu.add_command(
+                label="角色名模式",
+                accelerator=char_desc,
+                command=self._cmd(self.cycle_char_name_mode)
+            )
 
         self.context_menu.add_separator()
 
         # 5. 系统控制与设置
-        boss_label = "🕶️ 退出老板键伪装 (Esc)" if self.is_boss_key else "🕶️ 一键老板键 (Esc)"
-        self.context_menu.add_command(label=boss_label, command=self._cmd(self.toggle_boss))
-        self.context_menu.add_command(label="⚙️ 白名单/黑名单设置...", command=self._cmd(self.open_settings_dialog))
+        boss_label = "退出伪装" if self.is_boss_key else "老板键 (伪装)"
+        self.context_menu.add_command(
+            label=boss_label,
+            accelerator="Esc",
+            command=self._cmd(self.toggle_boss)
+        )
+        self.context_menu.add_command(
+            label="设置...",
+            command=self._cmd(self.open_settings_dialog)
+        )
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="✕ 退出摸鱼状态栏", command=self._cmd(self.root.quit))
+        self.context_menu.add_command(
+            label="退出",
+            command=self._cmd(self.root.quit)
+        )
 
     def _show_context_menu(self, x, y):
         if getattr(self, 'context_menu', None):
@@ -808,6 +856,34 @@ class ThiefDesktopBar:
         for n in range(1, 10):
             self.root.bind(f"<Alt-Key-{n}>", lambda e, val=n: self.set_opacity(val / 10.0))
 
+        self.root.bind("<Enter>", self._on_window_enter)
+        self.root.bind("<Leave>", self._on_window_leave)
+
+    def _on_window_enter(self, event=None):
+        if self.config.get('privacyMode', False) and not self.is_boss_key:
+            self.root.wm_attributes("-alpha", self.alpha)
+
+    def _on_window_leave(self, event=None):
+        if self.config.get('privacyMode', False) and not self.is_boss_key:
+            self.root.after(80, self._check_privacy_mouse_leave)
+
+    def _check_privacy_mouse_leave(self):
+        if not self.config.get('privacyMode', False) or self.is_boss_key:
+            return
+        try:
+            x = self.root.winfo_pointerx()
+            y = self.root.winfo_pointery()
+            wx = self.root.winfo_rootx()
+            wy = self.root.winfo_rooty()
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            if not (wx <= x <= wx + w and wy <= y <= wy + h):
+                self.root.wm_attributes("-alpha", 0.01)
+            else:
+                self.root.wm_attributes("-alpha", self.alpha)
+        except Exception:
+            self.root.wm_attributes("-alpha", 0.01)
+
     def _bind_mouse_drag_and_motion(self, widget):
         excluded_from_drag = {
             getattr(self, 'entry_reply', None),
@@ -835,6 +911,9 @@ class ThiefDesktopBar:
             self._bind_mouse_drag_and_motion(child)
 
     def _on_mouse_motion(self, event):
+        if self.config.get('privacyMode', False) and not self.is_boss_key:
+            self.root.wm_attributes("-alpha", self.alpha)
+
         rel_x = event.x_root - self.root.winfo_x()
         if rel_x <= 12 or rel_x >= self.width - 12:
             self.root.configure(cursor="size_we")
@@ -862,6 +941,8 @@ class ThiefDesktopBar:
     def _on_mouse_leave(self, event):
         if not getattr(self, '_is_resizing', False):
             self.root.configure(cursor="")
+        if self.config.get('privacyMode', False) and not self.is_boss_key:
+            self.root.after(60, self._check_privacy_mouse_leave)
 
     def _start_drag(self, event):
         if event.widget == getattr(self, 'entry_reply', None):
@@ -914,6 +995,16 @@ class ThiefDesktopBar:
             self._has_dragged = True
             new_x = event.x_root - self._drag_offset_x
             new_y = event.y_root - self._drag_offset_y
+            # 边界钳制：窗口无边框且不进任务栏/Alt+Tab，被拖出屏幕就再也找不回来
+            try:
+                import ctypes as _ct
+                _g = _ct.windll.user32.GetSystemMetrics
+                _vx, _vy, _vw, _vh = _g(76), _g(77), _g(78), _g(79)
+                _keep = 80
+                new_x = min(max(new_x, _vx - self.width + _keep), _vx + _vw - _keep)
+                new_y = min(max(new_y, _vy - self.height + 12), _vy + _vh - 12)
+            except Exception:
+                pass
             self.root.geometry(f"+{new_x}+{new_y}")
 
     def _on_drag_release(self, event):
@@ -1027,6 +1118,22 @@ class ThiefDesktopBar:
             'action': 'toggle_minimal_mode',
             'minimalMode': self.config['minimalMode']
         })
+
+    def toggle_privacy_mode(self):
+        if self.is_boss_key:
+            return
+        self.config['privacyMode'] = not self.config.get('privacyMode', False)
+        self._save_config()
+        if not self.config['privacyMode']:
+            self.root.wm_attributes("-alpha", self.alpha)
+        else:
+            self.root.after(50, self._check_privacy_mouse_leave)
+        self.server.broadcast({
+            'action': 'update_config',
+            'config': {'privacyMode': self.config['privacyMode']}
+        })
+        hint = "👻 隐私模式: 已开启 (移开隐藏)" if self.config['privacyMode'] else "👁️ 隐私模式: 已关闭 (常驻显示)"
+        self.flash_hint(hint)
 
     def toggle_layout_mode(self):
         if self.is_boss_key:
@@ -1319,7 +1426,7 @@ class ThiefDesktopBar:
         self._settings_win = win
 
         # 头部标题
-        hdr = tk.Label(win, text="⚙️ ST-Thief-Book 摸鱼过滤与白名单/黑名单设置", font=self.font_bold, bg="#1e1e1e", fg="#4ec9b0")
+        hdr = tk.Label(win, text="ST-Thief-Book 设置与规则过滤", font=self.font_bold, bg="#1e1e1e", fg="#cccccc")
         hdr.pack(anchor="w", padx=14, pady=(12, 6))
 
         # ------------------ 0. 极简模式与布局风格 ------------------
@@ -1327,13 +1434,13 @@ class ThiefDesktopBar:
         mode_group.pack(fill=tk.X, padx=14, pady=(2, 6))
 
         tk.Label(
-            mode_group, text="✨ 界面风格与单双行布局 (参考纯净文字风格):",
-            font=self.font_bold, bg="#1c1e22", fg="#4ec9b0"
+            mode_group, text="界面风格与布局:",
+            font=self.font_bold, bg="#1c1e22", fg="#9cdcfe"
         ).pack(anchor="w", padx=8, pady=(6, 2))
 
         var_min_mode = tk.BooleanVar(value=bool(self.config.get('minimalMode', False)))
         chk_min = tk.Checkbutton(
-            mode_group, text="启用极简模式 (纯文字+背景无边框，极度隐蔽无多余按钮)",
+            mode_group, text="极简模式 (纯文字无边框，隐藏多余按钮)",
             variable=var_min_mode, font=self.font_main,
             bg="#1c1e22", fg="#cccccc", selectcolor="#141414",
             activebackground="#1c1e22", activeforeground="#ffffff"
@@ -1363,8 +1470,8 @@ class ThiefDesktopBar:
         char_group.pack(fill=tk.X, padx=14, pady=(2, 6))
 
         tk.Label(
-            char_group, text="👤 角色卡名称显示模式 (标准模式下生效):",
-            font=self.font_bold, bg="#1c1e22", fg="#4ec9b0"
+            char_group, text="角色名称显示模式:",
+            font=self.font_bold, bg="#1c1e22", fg="#9cdcfe"
         ).pack(anchor="w", padx=8, pady=(6, 2))
 
         var_char_mode = tk.StringVar(value=self.config.get('charNameMode', 'compact'))
@@ -1372,7 +1479,7 @@ class ThiefDesktopBar:
         radio_frame.pack(anchor="w", padx=8, pady=(2, 6))
 
         tk.Radiobutton(
-            radio_frame, text="精简胶囊 (默认，超长截断至6字)",
+            radio_frame, text="精简胶囊 (限制宽度并省略)",
             variable=var_char_mode, value="compact",
             font=self.font_main, bg="#1c1e22", fg="#cccccc", selectcolor="#141414",
             activebackground="#1c1e22", activeforeground="#ffffff"
@@ -1397,8 +1504,8 @@ class ThiefDesktopBar:
         wrap_group.pack(fill=tk.X, padx=14, pady=(2, 6))
 
         tk.Label(
-            wrap_group, text="↩️ 换行展示模式 (解决长句截断看不全与跳段问题):",
-            font=self.font_bold, bg="#1c1e22", fg="#4ec9b0"
+            wrap_group, text="换行展示模式:",
+            font=self.font_bold, bg="#1c1e22", fg="#9cdcfe"
         ).pack(anchor="w", padx=8, pady=(6, 2))
 
         var_wrap_mode = tk.StringVar(value=self.config.get('wrapMode', 'wrap'))
@@ -1406,7 +1513,7 @@ class ThiefDesktopBar:
         wrap_radio_frame.pack(anchor="w", padx=8, pady=(2, 6))
 
         tk.Radiobutton(
-            wrap_radio_frame, text="自动折行全显 (默认推荐：长句自动折行显示全部文字，绝不截断丢字)",
+            wrap_radio_frame, text="自动折行全显 (完整展示长句)",
             variable=var_wrap_mode, value="wrap",
             font=self.font_main, bg="#1c1e22", fg="#cccccc", selectcolor="#141414",
             activebackground="#1c1e22", activeforeground="#ffffff"
@@ -1425,7 +1532,7 @@ class ThiefDesktopBar:
 
         var_enable_wl = tk.BooleanVar(value=bool(self.config.get('enableWhitelist', True)))
         chk_wl = tk.Checkbutton(
-            wl_group, text="🎯 启用正文白名单容器提取 (推荐：若含白名单标签则优先提取正文)",
+            wl_group, text="启用正文白名单提取 (优先提取正文)",
             variable=var_enable_wl, font=self.font_bold,
             bg="#1c1e22", fg="#4ec9b0", selectcolor="#141414",
             activebackground="#1c1e22", activeforeground="#73e6cf"
@@ -1461,7 +1568,7 @@ class ThiefDesktopBar:
         bl_group.pack(fill=tk.X, padx=14, pady=4)
 
         tk.Label(
-            bl_group, text="🚫 思考与元数据黑名单 (这些标签及其内部内容将被彻底清除):",
+            bl_group, text="思考与元数据黑名单 (彻底清除标签及其内部内容):",
             font=self.font_bold, bg="#1c1c1c", fg="#f48771"
         ).pack(anchor="w", padx=8, pady=(6, 2))
 
@@ -1501,6 +1608,10 @@ class ThiefDesktopBar:
         chk_user = tk.Checkbutton(opt_frame, text="显示用户消息 (默认关闭，仅阅读AI/小说回复)", variable=var_user, bg="#1e1e1e", fg="#cccccc", selectcolor="#252526", activebackground="#1e1e1e", activeforeground="#ffffff")
         chk_user.pack(side=tk.LEFT, padx=12)
 
+        var_privacy = tk.BooleanVar(value=bool(self.config.get('privacyMode', False)))
+        chk_privacy = tk.Checkbutton(opt_frame, text="隐私模式 (悬停显示/移开隐藏)", variable=var_privacy, bg="#1e1e1e", fg="#cccccc", selectcolor="#252526", activebackground="#1e1e1e", activeforeground="#ffffff")
+        chk_privacy.pack(side=tk.LEFT, padx=8)
+
         # 底部操作按钮
         btn_frame = tk.Frame(win, bg="#1e1e1e")
         btn_frame.pack(fill=tk.X, padx=14, pady=(10, 14))
@@ -1523,6 +1634,7 @@ class ThiefDesktopBar:
             ]))
             var_act.set(False)
             var_user.set(False)
+            var_privacy.set(False)
 
         btn_reset = tk.Button(btn_frame, text="恢复默认预设", command=reset_defaults, bg="#333333", fg="#cccccc", bd=0, padx=8, pady=4, cursor="hand2")
         btn_reset.pack(side=tk.LEFT)
@@ -1542,6 +1654,11 @@ class ThiefDesktopBar:
             self.config['tagBlacklist'] = bl_tags
             self.config['filterActions'] = var_act.get()
             self.config['showUserMessages'] = var_user.get()
+            self.config['privacyMode'] = var_privacy.get()
+            if not self.config['privacyMode']:
+                self.root.wm_attributes("-alpha", self.alpha)
+            else:
+                self.root.after(50, self._check_privacy_mouse_leave)
 
             self._apply_layout_and_mode()
             self._update_display()
@@ -1569,6 +1686,17 @@ class ThiefDesktopBar:
                 self._save_config()
                 self.root.after(0, self._apply_layout_and_mode)
                 self.root.after(0, self._update_display)
+                return
+            elif action == 'toggle_privacy_mode':
+                if 'privacyMode' in data:
+                    self.config['privacyMode'] = bool(data['privacyMode'])
+                else:
+                    self.config['privacyMode'] = not self.config.get('privacyMode', False)
+                self._save_config()
+                if not self.config['privacyMode']:
+                    self.root.wm_attributes("-alpha", self.alpha)
+                else:
+                    self.root.after(50, self._check_privacy_mouse_leave)
                 return
             elif action == 'toggle_layout_mode':
                 if 'layoutMode' in data:

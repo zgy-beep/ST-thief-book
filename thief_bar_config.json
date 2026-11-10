@@ -1,15 +1,16 @@
 {
-  "barWidth": 458,
-  "alpha": 0.3,
+  "barWidth": 383,
+  "alpha": 0.5,
   "theme": "vscode-dark",
-  "minimalMode": false,
+  "minimalMode": true,
   "layoutMode": "double",
-  "charNameMode": "hidden",
+  "charNameMode": "compact",
   "wrapMode": "wrap",
-  "showUserMessages": true,
+  "showUserMessages": false,
   "enableWhitelist": true,
   "tagWhitelist": [
     "content",
+    "output",
     "response",
     "dialogue",
     "story",
@@ -17,13 +18,11 @@
     "text",
     "narration",
     "message",
-    "正文"
+    "正文",
+    "game"
   ],
   "tagBlacklist": [
     "think",
-    "think_fox~",
-    "fox_input",
-    "bbi_image",
     "thought",
     "cot",
     "scratchpad",
@@ -39,6 +38,8 @@
     "fox_hugou",
     "fox_selc",
     "fox_tip",
+    "fox_input",
+    "think_fox~",
     "so_seq",
     "details",
     "system"
