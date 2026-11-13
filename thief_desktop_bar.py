@@ -39,6 +39,8 @@ import secrets
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
+from tkinter import simpledialog
+import re
 from urllib.parse import urlparse
 
 WS_HOST = '127.0.0.1'
@@ -69,23 +71,42 @@ def _enable_dpi_awareness():
 # 零依赖轻量 RFC 6455 WebSocket 服务端实现
 # ------------------------------------------------------------------------------------
 class SimpleWebSocketServer:
-    def __init__(self, host, port, on_message_callback, token=''):
+    def __init__(self, host, port, on_message_callback, token='', allowed_origins=None):
         self.host = host
         self.port = port
         self.on_message = on_message_callback
         self.token = token
+        self.allowed_origins = self._normalize_origins(allowed_origins or [])
         self.clients = {}  # sock -> {'authed': bool, 'queue': queue.Queue}；发送统一走队列，避免慢客户端拖住广播
         self.server_sock = None
         self.running = False
         self.lock = threading.Lock()
 
     @staticmethod
-    def _origin_allowed(origin):
-        # 浏览器 WS 不受 CORS 约束，必须自行挡掉公网页面；本地/私网/null(沙箱 iframe) 放行后再由 token 认证把关
+    def _normalize_origins(entries):
+        out = set()
+        for e in entries or []:
+            if isinstance(e, str):
+                e = e.strip().lower().rstrip('/')
+                if e:
+                    out.add(e)
+        return out
+
+    def set_allowed_origins(self, entries):
+        """运行时替换白名单，保存后立即生效，不用重启服务端。"""
+        self.allowed_origins = self._normalize_origins(entries)
+        return self.allowed_origins
+
+    def _origin_allowed(self, origin):
+        # 浏览器 WS 不受 CORS 约束，必须自行挡掉公网页面：
+        # 本地/私网/null(沙箱 iframe) 直接放行；其余必须命中白名单，最后由 hello token 把关。
         if not origin or origin == 'null':
             return True
+        origin_norm = origin.strip().lower().rstrip('/')
+        if '*' in self.allowed_origins:
+            return True
         try:
-            host = urlparse(origin).hostname
+            host = urlparse(origin_norm).hostname
         except Exception:
             return False
         if not host:
@@ -93,9 +114,18 @@ class SimpleWebSocketServer:
         if host == 'localhost':
             return True
         try:
-            return ipaddress.ip_address(host).is_private
+            if ipaddress.ip_address(host).is_private:
+                return True
         except ValueError:
-            return False
+            pass
+        if origin_norm in self.allowed_origins:
+            return True
+        for entry in self.allowed_origins:
+            if entry.startswith('*.'):
+                suffix = entry[2:]
+                if host == suffix or host.endswith('.' + suffix):
+                    return True
+        return False
 
     @staticmethod
     def _encode_text_frame(text):
@@ -430,8 +460,13 @@ class ThiefDesktopBar:
         self._setup_ui()
         self._bind_events()
 
-        self.server = SimpleWebSocketServer(WS_HOST, WS_PORT, self._on_ws_message, token=self.bridge_token)
+        self.server = SimpleWebSocketServer(
+            WS_HOST, WS_PORT, self._on_ws_message, token=self.bridge_token,
+            allowed_origins=self.config.get('allowedOrigins', [])
+        )
         self.server.start()
+        if self.server.allowed_origins:
+            print(f"[WebSocket Server] 额外放行来源: {', '.join(sorted(self.server.allowed_origins))}", flush=True)
 
     def _load_config(self):
         try:
@@ -449,7 +484,7 @@ class ThiefDesktopBar:
                             self.theme = self.THEMES[self.theme_name]
                         for k in ['minimalMode', 'layoutMode', 'charNameMode', 'wrapMode',
                                   'showUserMessages', 'enableWhitelist', 'tagWhitelist', 'tagBlacklist',
-                                  'filterActions', 'filterMode']:
+                                  'filterActions', 'filterMode', 'allowedOrigins']:
                             if k in saved:
                                 self.config[k] = saved[k]
         except Exception as e:
@@ -474,7 +509,8 @@ class ThiefDesktopBar:
     @staticmethod
     def _atomic_write_text(path, text):
         tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
+        # newline='\n'：Windows 上也不要把 LF 变成 CRLF，否则每次保存都整文件 diff
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
@@ -498,7 +534,8 @@ class ThiefDesktopBar:
             'tagWhitelist': self.config.get('tagWhitelist', []),
             'tagBlacklist': self.config.get('tagBlacklist', []),
             'filterActions': self.config.get('filterActions', False),
-            'filterMode': self.config.get('filterMode', 'pure')
+            'filterMode': self.config.get('filterMode', 'pure'),
+            'allowedOrigins': self.config.get('allowedOrigins', [])
         }
         try:
             self._atomic_write_json(self.config_file, data)
@@ -750,6 +787,9 @@ class ThiefDesktopBar:
         self.lbl_text.configure(wraplength=0)
 
         # 保持当前绝对坐标（支持多显示器、副屏负坐标与超宽坐标，绝不发生跨屏漂移）
+        # 窗口尚未映射时 winfo_x/y 恒为 0，此时改写几何会把 __init__ 的初始定位冲掉
+        if override_x is None and override_y is None and not self.root.winfo_ismapped():
+            return
         cur_x = override_x if override_x is not None else self.root.winfo_x()
         cur_y = override_y if override_y is not None else self.root.winfo_y()
 
@@ -941,6 +981,11 @@ class ThiefDesktopBar:
         self.context_menu.add_command(
             label="复制桥接密钥 (填入网页端设置)",
             command=self._cmd(self.copy_bridge_token)
+        )
+        origins = self.config.get('allowedOrigins', [])
+        self.context_menu.add_command(
+            label=(f"远程酒馆来源白名单… ({len(origins)} 条)" if origins else "远程酒馆来源白名单… (仅本地)"),
+            command=self._cmd(self.edit_allowed_origins)
         )
         self.context_menu.add_separator()
         self.context_menu.add_command(
@@ -1573,6 +1618,79 @@ class ThiefDesktopBar:
         y = max(0, self.root.winfo_y() - top.winfo_reqheight() - 8)
         top.geometry(f"+{x}+{y}")
         top.after(2500, top.destroy)
+
+    def flash_hint(self, text, ms=2400):
+        """条上方弹一个无边框小提示，几秒后自动消失。"""
+        try:
+            top = tk.Toplevel(self.root)
+            top.overrideredirect(True)
+            top.wm_attributes("-topmost", True)
+            top.configure(bg="#252526")
+            tk.Label(top, text=text, fg="#cccccc", bg="#252526",
+                     font=self.font_main, padx=12, pady=6).pack()
+            top.update_idletasks()
+            x = self.root.winfo_x() + max(0, (self.width - top.winfo_reqwidth()) // 2)
+            y = max(0, self.root.winfo_y() - top.winfo_reqheight() - 8)
+            top.geometry(f"+{x}+{y}")
+            top.after(ms, top.destroy)
+            return top
+        except Exception:
+            return None
+
+    def edit_allowed_origins(self):
+        """远程（公网）酒馆页面的来源白名单，保存后立即对运行中的 WS 服务端生效。"""
+        cur = list(self.config.get('allowedOrigins', []))
+        win = tk.Toplevel(self.root)
+        win.title("远程酒馆来源白名单")
+        win.configure(bg="#1e1e1e")
+        win.wm_attributes("-topmost", True)
+        win.transient(self.root)
+        win.geometry("520x260")
+
+        tk.Label(
+            win,
+            text="每行一个来源（也可用逗号分隔），例如：\n"
+                 "    https://st.sobysong.cn:8443\n"
+                 "支持通配：*.sobysong.cn    留空 = 只允许本地 / 局域网",
+            fg="#cccccc", bg="#1e1e1e", font=self.font_main, justify="left", anchor="w"
+        ).pack(fill="x", padx=12, pady=(10, 6))
+
+        txt = tk.Text(win, height=6, bg="#252526", fg="#cccccc", insertbackground="#cccccc",
+                      font=self.font_mono, relief="flat", highlightthickness=1,
+                      highlightbackground="#3c3c3c")
+        txt.pack(fill="both", expand=True, padx=12)
+        txt.insert("1.0", "\n".join(cur))
+
+        row = tk.Frame(win, bg="#1e1e1e")
+        row.pack(fill="x", padx=12, pady=8)
+
+        def _apply():
+            raw = txt.get("1.0", "end").strip()
+            entries = [e.rstrip('/') for e in re.split(r'[,;，；\s]+', raw) if e]
+            self.config['allowedOrigins'] = entries
+            self._save_config()
+            applied = set()
+            if getattr(self, 'server', None):
+                applied = self.server.set_allowed_origins(entries)
+            print(f"[WebSocket Server] 来源白名单: {', '.join(sorted(applied)) or '（仅本地/私网）'}", flush=True)
+            win.destroy()
+            self.flash_hint(f"🌐 白名单已生效: {len(entries)} 条" if entries else "🌐 白名单已清空（仅本地/私网）")
+
+        tk.Button(row, text="保存并生效", command=_apply, bg="#007acc", fg="#ffffff",
+                  relief="flat", padx=12, pady=3).pack(side="right")
+        tk.Button(row, text="取消", command=win.destroy, bg="#333333", fg="#cccccc",
+                  relief="flat", padx=12, pady=3).pack(side="right", padx=(0, 8))
+
+        win.update_idletasks()
+        x = self.root.winfo_x() + max(0, (self.width - win.winfo_reqwidth()) // 2)
+        y = max(80, self.root.winfo_y() - win.winfo_reqheight() - 12)
+        win.geometry(f"+{x}+{y}")
+        win.attributes("-topmost", True)
+        win.lift()
+        try:
+            win.focus_force()
+        except Exception:
+            pass
 
     def set_opacity(self, alpha):
         self.alpha = max(0.15, min(1.0, alpha))

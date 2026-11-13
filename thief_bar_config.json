@@ -1,9 +1,9 @@
 {
-  "barWidth": 383,
+  "barWidth": 360,
   "alpha": 0.5,
   "theme": "vscode-dark",
   "minimalMode": true,
-  "layoutMode": "double",
+  "layoutMode": "single",
   "charNameMode": "compact",
   "wrapMode": "wrap",
   "showUserMessages": false,
@@ -45,5 +45,8 @@
     "system"
   ],
   "filterActions": false,
-  "filterMode": "pure"
+  "filterMode": "pure",
+  "allowedOrigins": [
+    "https://st.sobysong.cn:8443"
+  ]
 }
