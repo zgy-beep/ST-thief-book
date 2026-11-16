@@ -49,5 +49,5 @@
   "allowedOrigins": [
     "https://st.sobysong.cn:8443"
   ],
-  "marquee": true
+  "pagedReading": true
 }

@@ -41,15 +41,10 @@ import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import simpledialog
 import re
-import bisect
 from urllib.parse import urlparse
 
 WS_HOST = '127.0.0.1'
 WS_PORT = 18899
-# 流式跑马灯：每 60ms 向左移动 2px，到尾部停 1.2s 再从头开始
-MARQUEE_STEP_PX = 3
-MARQUEE_INTERVAL_MS = 50
-MARQUEE_END_HOLD_MS = 900
 MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 WS_MAX_PAYLOAD = 1024 * 1024
 WS_HANDSHAKE_LIMIT = 8192
@@ -410,17 +405,11 @@ class ThiefDesktopBar:
         self.floor = 0
         self.is_boss_key = False
         self.is_generating = False
-        self._sub_chunks = []
-        self._sub_chunk_idx = 0
         self.stream_text = ''
         self._pending_sentence_offset = None
-        self._anim_job = None
         self._pages = []
         self._page_idx = 0
         self._pages_ready = False
-        self._hovering = False
-        self._avail_px = 0
-        self._text_total_px = 0
         self.config = {
             'charNameMode': 'compact',
             'wrapMode': 'wrap',
@@ -438,7 +427,7 @@ class ThiefDesktopBar:
             'showUserMessages': False,
             'filterActions': False,
             'filterMode': 'pure',
-            'marquee': True
+            'pagedReading': True
         }
 
         self.width = 860
@@ -499,7 +488,7 @@ class ThiefDesktopBar:
                             self.theme = self.THEMES[self.theme_name]
                         for k in ['minimalMode', 'layoutMode', 'charNameMode', 'wrapMode',
                                   'showUserMessages', 'enableWhitelist', 'tagWhitelist', 'tagBlacklist',
-                                  'filterActions', 'filterMode', 'allowedOrigins', 'marquee']:
+                                  'filterActions', 'filterMode', 'allowedOrigins', 'pagedReading']:
                             if k in saved:
                                 self.config[k] = saved[k]
         except Exception as e:
@@ -551,7 +540,7 @@ class ThiefDesktopBar:
             'filterActions': self.config.get('filterActions', False),
             'filterMode': self.config.get('filterMode', 'pure'),
             'allowedOrigins': self.config.get('allowedOrigins', []),
-            'marquee': self.config.get('marquee', True)
+            'pagedReading': self.config.get('pagedReading', True)
         }
         try:
             self._atomic_write_json(self.config_file, data)
@@ -829,13 +818,13 @@ class ThiefDesktopBar:
     def _has_prev_pages(self):
         return bool(getattr(self, '_pages', None)) and self._page_idx > 0
 
-    def toggle_marquee(self):
-        self.config['marquee'] = not self.config.get('marquee', True)
+    def toggle_paged_reading(self):
+        self.config['pagedReading'] = not self.config.get('pagedReading', True)
         self._save_config()
         self._page_idx = 0
         self._pfx_key = None
         self._update_display()
-        self.flash_hint("➡ 整句分屏: 已开启" if self.config['marquee'] else "⏸ 整句分屏: 已关闭（整段截断，一次看完）")
+        self.flash_hint("➡ 整段分屏: 已开启" if self.config['pagedReading'] else "⏸ 整段分屏: 已关闭（单行截断，一次看完）")
 
     def _truncate_to_width(self, text, max_px):
         """单行模式：按像素宽度截断并补'…'，尽量切在标点后。"""
@@ -1081,10 +1070,10 @@ class ThiefDesktopBar:
             accelerator="Esc",
             command=self._cmd(self.toggle_boss)
         )
-        mark_marquee = "✓ " if self.config.get('marquee', True) else "   "
+        mark_paged = "✓ " if self.config.get('pagedReading', True) else "   "
         self.context_menu.add_command(
-            label=f"{mark_marquee}流式滚动 (跑马灯)",
-            command=self._cmd(self.toggle_marquee)
+            label=f"{mark_paged}整段分屏阅读",
+            command=self._cmd(self.toggle_paged_reading)
         )
         self.context_menu.add_command(
             label="设置...",
@@ -1189,12 +1178,10 @@ class ThiefDesktopBar:
         self.root.bind("<Leave>", self._on_window_leave)
 
     def _on_window_enter(self, event=None):
-        self._hovering = True
         if self.config.get('privacyMode', False) and not self.is_boss_key:
             self.root.wm_attributes("-alpha", self.alpha)
 
     def _on_window_leave(self, event=None):
-        self._hovering = False
         if self.config.get('privacyMode', False) and not self.is_boss_key:
             self.root.after(80, self._check_privacy_mouse_leave)
 
@@ -1528,7 +1515,7 @@ class ThiefDesktopBar:
         if self.is_boss_key:
             return
         # 本条消息还没翻完：翻到下一屏
-        if self.config.get('marquee', True) and self._has_more_pages():
+        if self.config.get('pagedReading', True) and self._has_more_pages():
             self._page_idx += 1
             self._render_page()
             return
@@ -1543,7 +1530,7 @@ class ThiefDesktopBar:
         if self.is_boss_key:
             return
         # 还在消息中间：翻回上一屏
-        if self.config.get('marquee', True) and self._has_prev_pages():
+        if self.config.get('pagedReading', True) and self._has_prev_pages():
             self._page_idx -= 1
             self._render_page()
             return
@@ -2103,7 +2090,7 @@ class ThiefDesktopBar:
         btn_save = tk.Button(btn_frame, text="💾 保存并同步生效", command=save_settings, bg="#0e639c", fg="#ffffff", bd=0, padx=14, pady=4, cursor="hand2")
         btn_save.pack(side=tk.RIGHT)
 
-    _BOOL_CONFIG_KEYS = {'minimalMode', 'showUserMessages', 'enableWhitelist', 'filterActions', 'privacyMode'}
+    _BOOL_CONFIG_KEYS = {'minimalMode', 'showUserMessages', 'enableWhitelist', 'filterActions', 'privacyMode', 'pagedReading'}
     _ENUM_CONFIG_KEYS = {
         'layoutMode': {'single', 'double'},
         'charNameMode': {'compact', 'hidden', 'full'},
@@ -2173,8 +2160,6 @@ class ThiefDesktopBar:
                     self._page_idx = 0
                     self.stream_text = ''
                     self._pending_sentence_offset = 0
-                if new_sentence != self.current_sentence or new_floor != self.floor or new_cur != self.cur_idx:
-                    self._sub_chunk_idx = 0
                 full_text = data.get('fullText')
                 if isinstance(full_text, str) and full_text.strip():
                     # 新版插件：整条消息一起来，直接用它做整段
@@ -2200,7 +2185,7 @@ class ThiefDesktopBar:
                         base = len(joined) - len(new_sentence)
                         self._pending_sentence_offset = max(0, base)
                 sent_off = data.get('sentenceOffset')
-                if isinstance(sent_off, (int, float)) and sent_off >= 0 and self.config.get('marquee', True):
+                if isinstance(sent_off, (int, float)) and sent_off >= 0 and self.config.get('pagedReading', True):
                     self._pending_sentence_offset = int(sent_off)
                 self.char_name = data.get('charName', 'AI')
                 self.user_name = data.get('userName', 'User')
@@ -2294,10 +2279,8 @@ class ThiefDesktopBar:
         # 1. 正文一行可用宽度（像素）：跟着工具条当前宽度走
         self._apply_narrow_chrome()
         avail_w = self._text_width_px()
-        text = self.current_sentence or ""
 
         # 2. 一行显示：按条宽分屏；整句优先成屏，超宽才硬切
-        self._avail_px = avail_w
         stream = self._stream()
         pages_dirty = (stream, avail_w) != getattr(self, '_pfx_key', None)
         if pages_dirty:
@@ -2320,10 +2303,7 @@ class ThiefDesktopBar:
         if self.is_generating and self._pages:
             self._page_idx = len(self._pages) - 1
 
-        self._sub_chunks = [text]
-        self._sub_chunk_idx = 0
-
-        if self.config.get('marquee', True):
+        if self.config.get('pagedReading', True):
             self._render_page()
         else:
             self.lbl_text.configure(text=self._truncate_to_width(stream, avail_w), wraplength=0, justify=tk.LEFT)

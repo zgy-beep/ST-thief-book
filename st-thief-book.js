@@ -3973,7 +3973,7 @@
         curIdx: STATE.currentSentenceIndex + 1,
         totalSentences: STATE.sentences.length,
         currentSentence: STATE.sentences[STATE.currentSentenceIndex] || '',
-        // 整条消息连成一段：桌面端据此做流式跑马灯（不再按标点一句一翻）
+        // 整条消息连成一段：桌面端据此整段分屏（不再按标点一句一翻）
         fullText: STATE.sentences.join(''),
         // 当前句在整段里的字符偏移，供桌面端"跳句"定位
         sentenceOffset: STATE.sentences.slice(0, STATE.currentSentenceIndex).join('').length,
