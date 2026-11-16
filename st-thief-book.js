@@ -6,9 +6,9 @@
  * 架构：Web 端为无界面桥接后端，桌面端 thief_desktop_bar.py 是唯一阅读 UI。
  * 1. Web 端职责：消息监听、白名单正文提取 + 思考黑名单剥离、整段分句状态机、
  *    回复发送 / Swipe / 中止生成，经 WebSocket (127.0.0.1:18899, 密钥认证) 同步桌面端
- * 2. ⚙️ 设置面板：魔法棒（扩展）菜单「Thief 设置」一键呼出，自定义黑白名单标签、阅读配置与桥接密钥配对
+ * 2. ⚙️ 设置面板：魔法棒（扩展）菜单「摸鱼条」一键呼出，自定义黑白名单标签、阅读配置与桥接密钥配对
  * 3. 桌面端职责：置顶隐蔽状态栏渲染、整段分屏翻阅、老板键、自动阅读、贴边隐藏等
- * 4. 一键老板键：魔法棒菜单「Thief 老板键」或桌面端 Esc 秒切纯代码编译状态
+ * 4. 一键老板键：桌面端 Esc 秒切纯代码编译状态
  * ======================================================================================
  */
 
@@ -1588,7 +1588,7 @@
   }
 
   // ------------------------------------------------------------------------------------
-  // 魔法棒（扩展）菜单入口：Thief 设置与老板键
+  // 魔法棒（扩展）菜单入口：摸鱼条设置
   // ------------------------------------------------------------------------------------
   let wandObserver = null;
   let wandRetryTimer = null;
@@ -1602,15 +1602,11 @@
     container.id = 'st_thief_wand_container';
     container.className = 'extension_container';
     container.innerHTML = `
-      <div id="st_thief_wand_settings" class="list-group-item flex-container flexGap5" title="打开 Thief 设置与桥接密钥配对">
-        <div class="fa-solid fa-gear extensionsMenuExtensionButton"></div>Thief 设置
-      </div>
-      <div id="st_thief_wand_boss" class="list-group-item flex-container flexGap5" title="切换老板键伪装（同步桌面端）">
-        <div class="fa-solid fa-user-secret extensionsMenuExtensionButton"></div>Thief 老板键
+      <div id="st_thief_wand_settings" class="list-group-item flex-container flexGap5" title="打开摸鱼条设置与桥接密钥配对">
+        <div class="fa-solid fa-fish extensionsMenuExtensionButton"></div>摸鱼条
       </div>`;
     menu.appendChild(container);
     container.querySelector('#st_thief_wand_settings').addEventListener('click', () => openSettingsModal());
-    container.querySelector('#st_thief_wand_boss').addEventListener('click', () => toggleBossKey());
   }
 
   function ensureWandMenu() {
