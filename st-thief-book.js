@@ -3,17 +3,12 @@
  * ST-Thief-Book: 酒馆助手（Tavern Helper）隐蔽摸鱼阅读与回复工具 (v3.5 整段分屏版)
  * 仿 VS Code 知名摸鱼插件 Thief-Book 设计
  *
- * 核心升级：
- * 1. 新增【⚙️ 设置面板 & 自定义标签黑名单】：
- *    - 随时点击状态栏右侧“⚙️设置”呼出配置窗口
- *    - 可自定义填入任意思考/状态标签（如 think, cot, status, analysis, plan 等）
- *    - 自动剥离黑名单内所有闭合标签、未闭合流式标签与中括号标签
- *    - 支持一键开启“自动剥除所有未知自定义 XML 标签”
- *    - 支持设置数据本地自动持久化（localStorage + 脚本变量）
- * 2. 默认启用【🧹 纯净小说模式】：直取原始对白描写，不跑 HTML 美化正则，对白短小精炼
- * 3. 独立常驻浮动入口：酒馆主页右下角“🐟 摸鱼条”悬浮胶囊随时开启（支持拖拽）
- * 4. 边看边回双行布局：上行正文看小说（点击文字直接翻句），下行单行回复回车发送
- * 5. 一键老板键：按 Esc 秒切纯代码编译状态
+ * 架构：Web 端为无界面桥接后端，桌面端 thief_desktop_bar.py 是唯一阅读 UI。
+ * 1. Web 端职责：消息监听、白名单正文提取 + 思考黑名单剥离、整段分句状态机、
+ *    回复发送 / Swipe / 中止生成，经 WebSocket (127.0.0.1:18899, 密钥认证) 同步桌面端
+ * 2. ⚙️ 设置面板：脚本按钮栏一键呼出，自定义黑白名单标签、阅读配置与桥接密钥配对
+ * 3. 桌面端职责：置顶隐蔽状态栏渲染、整段分屏翻阅、老板键、自动阅读、贴边隐藏等
+ * 4. 一键老板键：脚本按钮或桌面端 Esc 秒切纯代码编译状态
  * ======================================================================================
  */
 
@@ -36,8 +31,8 @@
   // 配置与状态管理
   // ------------------------------------------------------------------------------------
   const CONFIG = {
-    // 是否启用本地 Python 桌面端 (WebSocket) 同步 (默认 false：纯网页模式，不默认主动开启，杜绝连接报错)
-    enableDesktopSync: false,
+    // 是否启用本地 Python 桌面端 (WebSocket) 同步 (默认 true：桌面端是唯一阅读 UI，未启动时静默重试)
+    enableDesktopSync: true,
     // 布局模式: 'double' (双行边看边回) | 'single' (32px极窄单行)
     layoutMode: 'double',
     // 文本过滤模式: 'pure' (纯净模式：绝不引入美化HTML，剥离思考块与标签) | 'regex' (正则清洗模式)
@@ -50,8 +45,6 @@
     tagWhitelist: [...DEFAULT_TAG_WHITELIST],
     // 自定义标签黑名单 (这些标签及其内部思考内容将被彻底删除)
     tagBlacklist: [...DEFAULT_TAG_BLACKLIST],
-    // 默认样式主题: 'vscode-dark' | 'vscode-blue' | 'terminal'
-    theme: 'vscode-dark',
     // 角色名展示模式: 'compact' (精简68px胶囊，不占位) | 'hidden' (隐藏角色名留出最大空间) | 'full' (完整展示)
     charNameMode: 'compact',
     // 换行模式: 'wrap' (默认：长句自动折行显示全部文字，绝不截断) | 'single' (强制单行)
@@ -61,13 +54,9 @@
     // 隐私模式: true (鼠标悬浮在窗口上方时才显示，移开时窗口隐藏) | false (常驻显示)
     privacyMode: false,
     // 尺寸配置
-    doubleHeight: 74,
-    singleHeight: 40,
     barWidth: 840,
     // 透明度 (0.2 ~ 1.0)
     opacity: 0.95,
-    // 防窥毛玻璃模式
-    hoverBlur: false,
     // 是否过滤动作描写括号 *xxx*
     filterActions: false,
     // 单句最小与最大长度
@@ -88,46 +77,17 @@
     currentMsgId: -1,
     currentSentenceIndex: 0,
     sentences: [],
-    cachedMessage: null,
     characterName: 'AI',
     userName: 'User',
     isGenerating: false,
     isBossKey: false,
     isSettingsOpen: false,
-    isFloorPickerOpen: false,
-    isContextMenuOpen: false,
-    contextMenuPos: { x: 0, y: 0 },
-    thiefWindow: null,
     wsClient: null,
     wsReconnectTimer: null,
     wsConnecting: false,
     wsAuthenticated: false,
-    streamRenderTimer: null,
-    isHostInpage: false,
-    inpageContainer: null
+    streamRenderTimer: null
   };
-
-  // 检查是否处于手机/移动端窄屏环境
-  function isMobileDevice() {
-    try {
-      if (typeof navigator !== 'undefined') {
-        const ua = navigator.userAgent || '';
-        if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(ua)) {
-          return true;
-        }
-      }
-      if (typeof window !== 'undefined') {
-        const topWin = window.top || window;
-        if (topWin.matchMedia && topWin.matchMedia('(max-width: 768px)').matches) {
-          return true;
-        }
-        if (topWin.innerWidth <= 768) {
-          return true;
-        }
-      }
-    } catch (e) {}
-    return false;
-  }
 
   // 获取当前屏幕实际可用宽度 (移动端自适应，绝不截断溢出)
   function getEffectiveBarWidth() {
@@ -148,8 +108,7 @@
     filterMode: ['pure', 'regex'],
     charNameMode: ['compact', 'hidden', 'full'],
     wrapMode: ['wrap', 'single'],
-    layoutMode: ['single', 'double'],
-    theme: ['vscode-dark', 'vscode-blue', 'terminal']
+    layoutMode: ['single', 'double']
   };
 
   function sanitizeTagList(arr) {
@@ -190,14 +149,8 @@
         if (typeof saved.filterActions === 'boolean') {
           CONFIG.filterActions = saved.filterActions;
         }
-        if (typeof saved.hoverBlur === 'boolean') {
-          CONFIG.hoverBlur = saved.hoverBlur;
-        }
         if (CONFIG_ENUMS.filterMode.includes(saved.filterMode)) {
           CONFIG.filterMode = saved.filterMode;
-        }
-        if (CONFIG_ENUMS.theme.includes(saved.theme)) {
-          CONFIG.theme = saved.theme;
         }
         if (typeof saved.opacity === 'number') {
           CONFIG.opacity = Math.max(0.15, Math.min(1, saved.opacity));
@@ -237,9 +190,7 @@
         tagWhitelist: CONFIG.tagWhitelist,
         tagBlacklist: CONFIG.tagBlacklist,
         filterActions: CONFIG.filterActions,
-        hoverBlur: CONFIG.hoverBlur,
         filterMode: CONFIG.filterMode,
-        theme: CONFIG.theme,
         charNameMode: CONFIG.charNameMode,
         wrapMode: CONFIG.wrapMode,
         minimalMode: CONFIG.minimalMode,
@@ -556,7 +507,6 @@
 
       const latest = messages[0];
       const isNewFloor = STATE.currentMsgId !== targetId;
-      STATE.cachedMessage = latest;
       STATE.currentMsgId = targetId;
 
       STATE.characterName = latest.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
@@ -579,7 +529,6 @@
         STATE.currentSentenceIndex = 0;
       }
 
-      renderThiefBar();
       syncToDesktop();
     } catch (err) {
       console.warn('[ST-Thief-Book] 读取最新消息异常:', err);
@@ -613,7 +562,6 @@
       if (!msgs || msgs.length === 0) return;
 
       const msg = msgs[0];
-      STATE.cachedMessage = msg;
       STATE.currentMsgId = targetId;
       STATE.characterName = msg.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
 
@@ -626,7 +574,6 @@
       STATE.sentences = splitIntoSentences(cleanText);
       STATE.currentSentenceIndex = delta < 0 ? Math.max(0, STATE.sentences.length - 1) : 0;
 
-      renderThiefBar();
       syncToDesktop();
     } catch (e) {
       console.error('[ST-Thief-Book] 切换楼层失败:', e);
@@ -648,7 +595,6 @@
       }
 
       const msg = msgs[0];
-      STATE.cachedMessage = msg;
       STATE.currentMsgId = targetId;
       STATE.characterName = msg.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
 
@@ -662,9 +608,7 @@
       // 可选句序（1 起）：桌面端重启恢复阅读位置时传入；缺省回第一句
       const idx = parseInt(sentenceIdx, 10);
       STATE.currentSentenceIndex = isNaN(idx) ? 0 : Math.max(0, Math.min(STATE.sentences.length - 1, idx - 1));
-      STATE.isFloorPickerOpen = false;
 
-      renderThiefBar();
       syncToDesktop();
       flashStatusHint(`已跳转至第 #${targetId} 楼`);
     } catch (e) {
@@ -672,22 +616,7 @@
     }
   }
 
-  function toggleFloorPicker(forcedState) {
-    STATE.isFloorPickerOpen = typeof forcedState === 'boolean' ? forcedState : !STATE.isFloorPickerOpen;
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-      const baseH = CONFIG.minimalMode
-        ? (CONFIG.layoutMode === 'double' ? 56 : 30)
-        : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
-      const targetHeight = (STATE.isFloorPickerOpen ? 100 : baseH) + 35;
-      try {
-        STATE.thiefWindow.resizeTo(CONFIG.barWidth, targetHeight);
-      } catch (e) {}
-    }
-    renderThiefBar();
-  }
-
   function toggleCharNameMode() {
-    STATE.isContextMenuOpen = false;
     if (CONFIG.charNameMode === 'compact') {
       CONFIG.charNameMode = 'hidden';
       flashStatusHint('角色名已完全隐藏 (享受最大正文空间)');
@@ -699,90 +628,36 @@
       flashStatusHint('角色名已切为精简胶囊 (68px)');
     }
     saveCurrentConfig();
-    renderThiefBar();
     syncToDesktop();
   }
 
   function toggleWrapMode() {
-    STATE.isContextMenuOpen = false;
     CONFIG.wrapMode = CONFIG.wrapMode === 'wrap' ? 'single' : 'wrap';
     saveCurrentConfig();
     flashStatusHint(`换行模式: ${CONFIG.wrapMode === 'wrap' ? '↩️ 自动折行全显' : '↔️ 单行切片'}`);
-    renderThiefBar();
-    syncToDesktop();
-  }
-
-  function cycleBarWidth() {
-    STATE.isContextMenuOpen = false;
-    const presets = [680, 840, 1080, 1360];
-    let nextW = 840;
-    let found = false;
-    for (let i = 0; i < presets.length; i++) {
-      if (Math.abs(CONFIG.barWidth - presets[i]) <= 20) {
-        nextW = presets[(i + 1) % presets.length];
-        found = true;
-        break;
-      }
-    }
-    if (!found) nextW = 840;
-    CONFIG.barWidth = nextW;
-    saveCurrentConfig();
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-      try {
-        STATE.thiefWindow.resizeTo(CONFIG.barWidth, STATE.thiefWindow.outerHeight || 74);
-      } catch (e) {}
-    }
-    flashStatusHint(`窗口长度已调整为: ${CONFIG.barWidth}px`);
-    renderThiefBar();
     syncToDesktop();
   }
 
   function toggleMinimalMode(forcedState) {
-    STATE.isContextMenuOpen = false;
     CONFIG.minimalMode = typeof forcedState === 'boolean' ? forcedState : !CONFIG.minimalMode;
     saveCurrentConfig();
     flashStatusHint(`极简模式: ${CONFIG.minimalMode ? '✨ 已开启 (纯文字+背景)' : '📋 已关闭 (标准状态栏)'}`);
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-      const baseH = CONFIG.minimalMode
-        ? (CONFIG.layoutMode === 'double' ? 56 : 30)
-        : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
-      try {
-        STATE.thiefWindow.resizeTo(CONFIG.barWidth, baseH + 35);
-      } catch (e) {}
-    }
-    renderThiefBar();
     syncToDesktop();
   }
 
   function togglePrivacyMode(forcedState) {
-    STATE.isContextMenuOpen = false;
     CONFIG.privacyMode = typeof forcedState === 'boolean' ? forcedState : !CONFIG.privacyMode;
     saveCurrentConfig();
     flashStatusHint(`隐私模式: ${CONFIG.privacyMode ? '👻 已开启 (移开隐藏 / 悬浮显示)' : '👁️ 已关闭 (常驻显示)'}`);
-    renderThiefBar();
     syncToDesktop();
   }
 
   function toggleShowUserMessages() {
-    STATE.isContextMenuOpen = false;
     CONFIG.showUserMessages = !CONFIG.showUserMessages;
     saveCurrentConfig();
     flashStatusHint(CONFIG.showUserMessages ? '已开启显示用户消息' : '已隐藏用户消息 (仅阅读AI与小说)');
     refreshLatestMessage(false);
     syncToDesktop();
-  }
-
-  function openContextMenu(x, y) {
-    STATE.isContextMenuOpen = true;
-    STATE.contextMenuPos = { x, y };
-    renderThiefBar();
-  }
-
-  function closeContextMenu() {
-    if (STATE.isContextMenuOpen) {
-      STATE.isContextMenuOpen = false;
-      renderThiefBar();
-    }
   }
 
   // ------------------------------------------------------------------------------------
@@ -795,7 +670,6 @@
 
     if (STATE.currentSentenceIndex < STATE.sentences.length - 1) {
       STATE.currentSentenceIndex++;
-      renderThiefBar();
       syncToDesktop();
     } else {
       const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : -1;
@@ -814,25 +688,22 @@
 
     if (STATE.currentSentenceIndex > 0) {
       STATE.currentSentenceIndex--;
-      renderThiefBar();
       syncToDesktop();
     } else if (STATE.currentMsgId > 0) {
       changeMessageFloor(-1);
     }
   }
 
+  // 无界面桥接后端的状态提示：优先酒馆 toastr，降级控制台
   function flashStatusHint(text) {
-    if (!STATE.thiefWindow || !STATE.thiefWindow.document) return;
-    const textEl = STATE.thiefWindow.document.getElementById('tb-text');
-    if (!textEl) return;
-
-    const original = textEl.textContent;
-    textEl.style.color = '#e5c07b';
-    textEl.textContent = `💡 ${text}`;
-    setTimeout(() => {
-      textEl.style.color = '';
-      textEl.textContent = original;
-    }, 2000);
+    try {
+      const topWin = getSafeTopWin();
+      if (topWin && topWin.toastr && typeof topWin.toastr.info === 'function') {
+        topWin.toastr.info(text, 'ST-Thief-Book', { timeOut: 2500 });
+        return;
+      }
+    } catch (e) {}
+    console.log('[ST-Thief-Book] 💡 ' + text);
   }
 
   // ------------------------------------------------------------------------------------
@@ -843,7 +714,7 @@
     if (!text) return;
 
     STATE.isGenerating = true;
-    renderThiefBar();
+    syncToDesktop();
 
     try {
       if (typeof createChatMessages === 'function') {
@@ -870,7 +741,7 @@
     try {
       flashStatusHint('正在重新生成 (Swipe)...');
       STATE.isGenerating = true;
-      renderThiefBar();
+      syncToDesktop();
       if (typeof triggerSlash === 'function') {
         await triggerSlash('/swipe');
       }
@@ -894,7 +765,7 @@
       }
       STATE.isGenerating = false;
       flashStatusHint('已中止生成');
-      renderThiefBar();
+      syncToDesktop();
     } catch (e) {
       console.warn('[ST-Thief-Book] 中止生成失败:', e);
     }
@@ -905,28 +776,16 @@
   // ------------------------------------------------------------------------------------
   function toggleBossKey(forcedState) {
     STATE.isBossKey = typeof forcedState === 'boolean' ? forcedState : !STATE.isBossKey;
-    renderThiefBar();
     syncToDesktop();
   }
 
   function toggleLayoutMode() {
-    STATE.isContextMenuOpen = false;
     CONFIG.layoutMode = CONFIG.layoutMode === 'double' ? 'single' : 'double';
     saveCurrentConfig();
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-      const baseH = CONFIG.minimalMode
-        ? (CONFIG.layoutMode === 'double' ? 56 : 30)
-        : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
-      try {
-        STATE.thiefWindow.resizeTo(CONFIG.barWidth, baseH + 35);
-      } catch (e) {}
-    }
-    renderThiefBar();
     syncToDesktop();
   }
 
   function toggleFilterMode() {
-    STATE.isContextMenuOpen = false;
     CONFIG.filterMode = CONFIG.filterMode === 'pure' ? 'regex' : 'pure';
     saveCurrentConfig();
     flashStatusHint(`模式: ${CONFIG.filterMode === 'pure' ? '🧹 纯净小说(去HTML美化)' : '🎨 酒馆正则清洗'}`);
@@ -1290,7 +1149,6 @@
     const privacyChecked = CONFIG.privacyMode ? 'checked' : '';
     const userMsgChecked = CONFIG.showUserMessages ? 'checked' : '';
     const actChecked = CONFIG.filterActions ? 'checked' : '';
-    const blurChecked = CONFIG.hoverBlur ? 'checked' : '';
     const deskSyncChecked = CONFIG.enableDesktopSync ? 'checked' : '';
 
     const filterModePure = CONFIG.filterMode === 'pure' ? 'selected' : '';
@@ -1426,10 +1284,6 @@
                 <input type="checkbox" id="setting-show-user-messages" ${userMsgChecked} />
                 <span>显示用户消息 (默认仅阅读AI)</span>
               </label>
-              <label class="st-thief-checkbox-item">
-                <input type="checkbox" id="setting-hover-blur" ${blurChecked} />
-                <span>防窥毛玻璃 (鼠标移开模糊)</span>
-              </label>
             </div>
           </div>
 
@@ -1450,7 +1304,7 @@
                      placeholder="桌面端右键菜单 → 复制桥接密钥，粘贴到此处"
                      style="flex:1; background:#1e1e1e; color:#cccccc; border:1px solid #3c3c3c; border-radius:3px; padding:4px 8px; font-size:12px; font-family:Consolas,monospace;" />
             </div>
-            <div class="st-thief-hint">默认保持纯网页模式。仅在启动本地 start_desktop.bat 时开启同步；首次同步需填入桌面端桥接密钥完成配对。</div>
+            <div class="st-thief-hint">网页端仅负责过滤与桥接，阅读界面为本地桌面摸鱼条 (start_desktop.bat)。首次同步需填入桌面端桥接密钥完成配对。</div>
           </div>
         </div>
 
@@ -1579,8 +1433,6 @@
       if (userMsg) userMsg.checked = false;
       const actions = modal.querySelector('#setting-filter-actions');
       if (actions) actions.checked = false;
-      const blur = modal.querySelector('#setting-hover-blur');
-      if (blur) blur.checked = false;
       const privacy = modal.querySelector('#setting-privacy-mode');
       if (privacy) privacy.checked = false;
       const mode = modal.querySelector('#setting-filtermode');
@@ -1588,7 +1440,7 @@
       const barW = modal.querySelector('#setting-barwidth');
       if (barW) barW.value = '840';
       const deskSync = modal.querySelector('#setting-enable-desktopsync');
-      if (deskSync) deskSync.checked = false;
+      if (deskSync) deskSync.checked = true;
       const bridgeToken = modal.querySelector('#setting-bridge-token');
       if (bridgeToken) bridgeToken.value = '';
       syncCurrentChips();
@@ -1612,7 +1464,6 @@
       const minMode = modal.querySelector('#setting-minimal-mode');
       const userMsg = modal.querySelector('#setting-show-user-messages');
       const actions = modal.querySelector('#setting-filter-actions');
-      const blur = modal.querySelector('#setting-hover-blur');
       const privacy = modal.querySelector('#setting-privacy-mode');
       const mode = modal.querySelector('#setting-filtermode');
       const barW = modal.querySelector('#setting-barwidth');
@@ -1628,11 +1479,6 @@
         const w = parseInt(barW.value, 10);
         if (!isNaN(w) && w >= 360 && w <= 2560) {
           CONFIG.barWidth = w;
-          if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-            try {
-              STATE.thiefWindow.resizeTo(CONFIG.barWidth, STATE.thiefWindow.outerHeight || 74);
-            } catch (e) {}
-          }
         }
       }
 
@@ -1653,7 +1499,6 @@
       }
 
       if (actions) CONFIG.filterActions = actions.checked;
-      if (blur) CONFIG.hoverBlur = blur.checked;
       if (mode) CONFIG.filterMode = mode.value;
 
       const tokenInput = modal.querySelector('#setting-bridge-token');
@@ -1676,9 +1521,6 @@
       saveCurrentConfig();
       closeSettingsModal();
       flashStatusHint('设置已保存并生效');
-      if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-        renderThiefBar();
-      }
       refreshLatestMessage(false);
       syncToDesktop();
     });
@@ -1694,1444 +1536,7 @@
   }
 
   // ------------------------------------------------------------------------------------
-  // UI 渲染与样式构造 (VS Code 状态栏仿真)
-  // ------------------------------------------------------------------------------------
-  const CSS_STYLES = `
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      width: 100%;
-      height: 100%;
-      overflow: hidden;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, Consolas, monospace;
-      font-size: 12px;
-      user-select: none;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    /* 主题令牌：所有组件颜色统一消费 CSS 变量，换肤只改这三组定义 */
-    body.theme-vscode-dark, #st-thief-inpage-container.theme-vscode-dark {
-      --tb-bg: #181818; --tb-fg: #cccccc; --tb-border: #2d2d2d;
-      --tb-text: #f1f1f1; --tb-muted: #858585;
-      --tb-accent: #4ec9b0; --tb-accent-strong: #73e6cf;
-      --tb-accent-bg: rgba(78, 201, 176, 0.12); --tb-accent-border: rgba(78, 201, 176, 0.3);
-      --tb-link: #9cdcfe; --tb-focus: #007acc;
-      --tb-btn: #0e639c; --tb-btn-hover: #1177bb;
-      --tb-menu-bg: #1f1f1f; --tb-menu-border: #454545; --tb-menu-hover: #094771;
-      --tb-bg-minimal: #121212;
-      background-color: var(--tb-bg);
-      color: var(--tb-fg);
-      border-top: 1px solid var(--tb-border);
-    }
-    body.theme-vscode-blue, #st-thief-inpage-container.theme-vscode-blue {
-      --tb-bg: #007acc; --tb-fg: #ffffff; --tb-border: #0062a3;
-      --tb-text: #ffffff; --tb-muted: #858585;
-      --tb-accent: #ffe699; --tb-accent-strong: #fff3c4;
-      --tb-accent-bg: rgba(255, 230, 153, 0.15); --tb-accent-border: rgba(255, 230, 153, 0.35);
-      --tb-link: #9cdcfe; --tb-focus: #007acc;
-      --tb-btn: #0e639c; --tb-btn-hover: #1177bb;
-      --tb-menu-bg: #1f1f1f; --tb-menu-border: #454545; --tb-menu-hover: #094771;
-      --tb-bg-minimal: #0d283d;
-      background-color: var(--tb-bg);
-      color: var(--tb-fg);
-      border-top: 1px solid var(--tb-border);
-    }
-    body.theme-terminal, #st-thief-inpage-container.theme-terminal {
-      --tb-bg: #0c0c0c; --tb-fg: #00ff66; --tb-border: #1a1a1a;
-      --tb-text: #00ff66; --tb-muted: #3d8f5f;
-      --tb-accent: #00ff66; --tb-accent-strong: #66ff99;
-      --tb-accent-bg: rgba(0, 255, 102, 0.1); --tb-accent-border: rgba(0, 255, 102, 0.3);
-      --tb-link: #00cc55; --tb-focus: #00ff66;
-      --tb-btn: #0f3d24; --tb-btn-hover: #1a5c38;
-      --tb-menu-bg: #0c0c0c; --tb-menu-border: #1f4d33; --tb-menu-hover: #0f3d24;
-      --tb-bg-minimal: #000000;
-      background-color: var(--tb-bg);
-      color: var(--tb-fg);
-      border-top: 1px solid var(--tb-border);
-      font-family: Consolas, 'Courier New', monospace;
-    }
-
-    #tb-container {
-      display: flex;
-      flex-direction: column;
-      width: 100%;
-      height: 100%;
-      justify-content: center;
-      position: relative;
-    }
-
-    /* 第一行：正文阅读栏 */
-    .tb-row-reading {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      min-height: 32px;
-      padding: 3px 10px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    }
-    body.single-mode .tb-row-reading {
-      border-bottom: none;
-    }
-
-    /* 拖拽手柄 */
-    .tb-drag-handle {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      cursor: grab;
-      padding: 0 4px;
-      font-size: 13px;
-      color: #777777;
-      user-select: none;
-      touch-action: none;
-      transition: color 0.15s ease, transform 0.1s ease;
-      line-height: 1;
-    }
-    .tb-drag-handle:hover {
-      color: #4ec9b0;
-      transform: scale(1.15);
-    }
-    .tb-drag-handle:active {
-      cursor: grabbing;
-      color: #73e6cf;
-    }
-
-    /* 左侧 Git 分支与楼层导航器 */
-    .tb-section-left {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      flex-shrink: 0;
-      font-size: 11px;
-    }
-    .tb-git-branch {
-      color: var(--tb-muted, #858585);
-      font-family: Consolas, monospace;
-      padding: 1px 4px;
-      border-radius: 3px;
-      cursor: default;
-      transition: background 0.15s, color 0.15s;
-    }
-    .tb-git-branch:hover {
-      color: #cccccc;
-      background: rgba(255, 255, 255, 0.06);
-    }
-
-    /* 楼层导航组件 */
-    .tb-floor-nav-wrap {
-      display: inline-flex;
-      align-items: center;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 3px;
-      padding: 0 2px;
-      height: 20px;
-      transition: all 0.15s ease;
-    }
-    .tb-floor-nav-wrap:hover {
-      border-color: var(--tb-focus, #007acc);
-      background: var(--tb-accent-bg, rgba(0, 122, 204, 0.1));
-    }
-    .tb-floor-btn-step {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 14px;
-      height: 18px;
-      font-size: 8px;
-      color: #888888;
-      cursor: pointer;
-      user-select: none;
-      transition: all 0.12s ease;
-      border-radius: 2px;
-    }
-    .tb-floor-btn-step:hover {
-      background: rgba(255, 255, 255, 0.18);
-      color: #ffffff;
-    }
-    .tb-floor-btn-step:active {
-      transform: scale(0.88);
-    }
-    .tb-floor-num-badge {
-      padding: 0 5px;
-      font-family: Consolas, monospace;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--tb-link, #9cdcfe);
-      cursor: pointer;
-      user-select: none;
-      transition: all 0.12s ease;
-      border-radius: 2px;
-    }
-    .tb-floor-num-badge:hover {
-      background: var(--tb-btn, #0e639c);
-      color: #ffffff;
-    }
-
-    .tb-spin-icon {
-      display: inline-block;
-      animation: spin 1s linear infinite;
-    }
-    @keyframes spin { 100% { transform: rotate(360deg); } }
-
-    /* 中间正文区域 */
-    .tb-section-center {
-      display: flex;
-      align-items: center;
-      flex: 1;
-      overflow: hidden;
-      margin: 0 8px;
-      cursor: pointer;
-      padding: 2px 6px;
-      border-radius: 3px;
-      transition: background 0.15s ease;
-    }
-    .tb-section-center:hover {
-      background: rgba(255, 255, 255, 0.05);
-    }
-
-    /* 角色名徽章 */
-    .tb-char-badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 1px 6px;
-      margin-right: 6px;
-      font-size: 11px;
-      font-weight: 600;
-      border-radius: 3px;
-      background: var(--tb-accent-bg, rgba(78, 201, 176, 0.12));
-      color: var(--tb-accent, #4ec9b0);
-      border: 1px solid var(--tb-accent-border, rgba(78, 201, 176, 0.3));
-      cursor: pointer;
-      user-select: none;
-      flex-shrink: 0;
-      transition: all 0.15s ease;
-    }
-    .tb-char-badge:hover {
-      background: var(--tb-accent-bg, rgba(78, 201, 176, 0.22));
-      border-color: var(--tb-accent, #4ec9b0);
-      color: var(--tb-accent-strong, #73e6cf);
-      filter: brightness(1.15);
-    }
-    .tb-char-compact {
-      max-width: 68px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .tb-char-hidden-pill {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 18px;
-      height: 18px;
-      margin-right: 4px;
-      font-size: 11px;
-      border-radius: 3px;
-      background: rgba(255, 255, 255, 0.05);
-      color: #888888;
-      cursor: pointer;
-      user-select: none;
-      flex-shrink: 0;
-      transition: all 0.15s ease;
-    }
-    .tb-char-hidden-pill:hover {
-      background: var(--tb-accent-bg, rgba(78, 201, 176, 0.2));
-      color: var(--tb-accent, #4ec9b0);
-    }
-
-    .tb-sentence-text {
-      flex: 1;
-      min-width: 0;
-      color: var(--tb-text, #f1f1f1);
-      font-size: 12.5px;
-      letter-spacing: 0.2px;
-      line-height: 1.4;
-      white-space: normal;
-      overflow-wrap: break-word;
-      transition: filter 0.2s, opacity 0.15s;
-    }
-    .tb-sentence-text.nowrap {
-      overflow: hidden;
-      text-overflow: clip;
-      white-space: nowrap;
-    }
-
-    body.tb-blur-mode .tb-sentence-text { filter: blur(4px); }
-    body.tb-blur-mode:hover .tb-sentence-text { filter: blur(0); }
-
-    /* 👻 隐私模式 (移开隐藏，鼠标悬浮在窗口上方时才显示工具条) */
-    body.tb-privacy-mode {
-      background-color: transparent !important;
-      transition: opacity 0.22s ease-in, background-color 0.22s ease-in;
-    }
-    body.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active) {
-      opacity: 0 !important;
-      background-color: transparent !important;
-      border-color: transparent !important;
-      box-shadow: none !important;
-      pointer-events: auto;
-      transition: opacity 0.22s ease-in, background-color 0.22s ease-in;
-    }
-    body.tb-privacy-mode:hover,
-    body.tb-privacy-mode.tb-mouse-over,
-    body.tb-privacy-mode.tb-privacy-active {
-      opacity: var(--tb-user-opacity, 0.95) !important;
-      pointer-events: auto;
-      background-color: var(--tb-bg, #181818) !important;
-      border-top: 1px solid var(--tb-border, #2d2d2d) !important;
-      transition: opacity 0.15s ease-out, background-color 0.15s ease-out;
-    }
-
-    #st-thief-inpage-container.tb-privacy-mode {
-      background-color: transparent !important;
-      transition: bottom 0.2s cubic-bezier(0.2, 0, 0, 1), opacity 0.22s ease-in, background-color 0.22s ease-in;
-    }
-    #st-thief-inpage-container.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active) {
-      opacity: 0 !important;
-      background-color: transparent !important;
-      border: none !important;
-      box-shadow: none !important;
-      pointer-events: auto;
-      transition: opacity 0.22s ease-in;
-    }
-    #st-thief-inpage-container.tb-privacy-mode:hover,
-    #st-thief-inpage-container.tb-privacy-mode.tb-mouse-over,
-    #st-thief-inpage-container.tb-privacy-mode.tb-privacy-active {
-      opacity: var(--tb-user-opacity, 0.95) !important;
-      pointer-events: auto;
-      background-color: var(--tb-bg, #181818) !important;
-      border-top: 1px solid var(--tb-border, #2d2d2d) !important;
-      box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.7);
-      transition: opacity 0.15s ease-out;
-    }
-
-    /* 移动端/触屏环境豁免：触屏无 hover 特性，防止隐私模式导致移动端完全不可见 */
-    @media (hover: none), (max-width: 768px) {
-      body.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active),
-      #st-thief-inpage-container.tb-privacy-mode:not(:hover):not(.tb-mouse-over):not(.tb-privacy-active) {
-        opacity: var(--tb-user-opacity, 0.95) !important;
-      }
-      #st-thief-inpage-container.tb-privacy-mode {
-        background-color: var(--tb-bg, #181818) !important;
-        border-top: 1px solid var(--tb-border, #2d2d2d) !important;
-      }
-    }
-
-    /* 右侧精简状态与功能触发器 */
-    .tb-section-right {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      flex-shrink: 0;
-      font-size: 11px;
-      opacity: 0.9;
-    }
-    .tb-progress-badge {
-      font-family: Consolas, monospace;
-      font-size: 11px;
-      color: var(--tb-muted, #858585);
-      background: rgba(255, 255, 255, 0.05);
-      padding: 1px 6px;
-      border-radius: 3px;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      user-select: none;
-      cursor: default;
-    }
-    .tb-menu-trigger {
-      font-size: 15px;
-      font-weight: bold;
-      color: var(--tb-link, #9cdcfe);
-      padding: 1px 6px;
-      border-radius: 3px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-      line-height: 1;
-    }
-    .tb-menu-trigger:hover {
-      background: rgba(255, 255, 255, 0.16);
-      color: #ffffff;
-    }
-
-    /* VS Code 风格右键上下文菜单 */
-    #tb-context-menu {
-      position: fixed;
-      z-index: 999999;
-      background: var(--tb-menu-bg, #1f1f1f);
-      border: 1px solid var(--tb-menu-border, #454545);
-      border-radius: 5px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.75);
-      padding: 4px 0;
-      min-width: 230px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Consolas, sans-serif;
-      font-size: 12px;
-      color: var(--tb-fg, #cccccc);
-      user-select: none;
-      animation: tbMenuFade 0.1s ease-out;
-    }
-    @keyframes tbMenuFade {
-      from { opacity: 0; transform: scale(0.96); }
-      to { opacity: 1; transform: scale(1); }
-    }
-    .tb-menu-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 5px 12px;
-      cursor: pointer;
-      transition: background 0.1s;
-    }
-    .tb-menu-item:hover {
-      background: var(--tb-menu-hover, #094771);
-      color: #ffffff;
-    }
-    .tb-menu-item-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .tb-menu-item-icon {
-      width: 14px;
-      text-align: center;
-      font-size: 12px;
-      opacity: 0.85;
-    }
-    .tb-menu-mark {
-      width: 14px;
-      text-align: center;
-      font-size: 11px;
-      color: var(--tb-accent, #4ec9b0);
-      font-weight: bold;
-      display: inline-block;
-      flex-shrink: 0;
-    }
-    .tb-menu-shortcut {
-      font-size: 10px;
-      color: var(--tb-muted, #858585);
-      margin-left: 14px;
-      font-family: Consolas, monospace;
-    }
-    .tb-menu-item:hover .tb-menu-shortcut {
-      color: #b8d9fc;
-    }
-    .tb-menu-separator {
-      height: 1px;
-      background: #333333;
-      margin: 4px 0;
-    }
-    .tb-menu-tag {
-      font-size: 10px;
-      padding: 1px 5px;
-      border-radius: 2px;
-      background: rgba(255, 255, 255, 0.08);
-      color: var(--tb-accent, #4ec9b0);
-      margin-left: 6px;
-    }
-    .tb-menu-item:hover .tb-menu-tag {
-      background: rgba(255, 255, 255, 0.2);
-      color: #ffffff;
-    }
-
-    .tb-btn {
-      cursor: pointer;
-      padding: 2px 5px;
-      border-radius: 3px;
-      transition: all 0.12s ease;
-      display: inline-flex;
-      align-items: center;
-      gap: 2px;
-    }
-    .tb-btn:hover {
-      background: rgba(255, 255, 255, 0.16);
-      color: #ffffff;
-      opacity: 1;
-    }
-    .tb-btn:active {
-      transform: scale(0.92);
-    }
-
-    /* 第二行：单行回复区 */
-    .tb-row-reply {
-      display: flex;
-      align-items: center;
-      height: 30px;
-      padding: 0 10px;
-      background: rgba(0, 0, 0, 0.22);
-      border-top: 1px solid rgba(255, 255, 255, 0.04);
-      gap: 6px;
-    }
-    .tb-reply-prefix {
-      color: var(--tb-accent, #4ec9b0);
-      font-family: Consolas, monospace;
-      font-weight: bold;
-      font-size: 13px;
-    }
-    .tb-reply-input {
-      flex: 1;
-      height: 22px;
-      line-height: 22px;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 3px;
-      color: #ffffff;
-      padding: 0 8px;
-      font-size: 12px;
-      outline: none;
-      font-family: inherit;
-      transition: all 0.15s ease;
-    }
-    .tb-reply-input:focus {
-      border-color: var(--tb-focus, #007acc);
-      background: rgba(0, 0, 0, 0.4);
-      box-shadow: 0 0 0 1px var(--tb-focus, #007acc);
-    }
-    .tb-send-btn {
-      padding: 2px 10px;
-      background: var(--tb-btn, #0e639c);
-      color: #ffffff;
-      border-radius: 3px;
-      cursor: pointer;
-      font-size: 11px;
-      font-weight: 600;
-      user-select: none;
-      transition: all 0.15s ease;
-    }
-    .tb-send-btn:hover {
-      background: var(--tb-btn-hover, #1177bb);
-      box-shadow: 0 1px 4px rgba(0, 122, 204, 0.4);
-    }
-    .tb-send-btn:active {
-      transform: scale(0.95);
-    }
-
-    /* 楼层跳转快速浮窗 */
-    #tb-floor-popover {
-      position: absolute;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.8);
-      backdrop-filter: blur(8px);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 9999;
-      padding: 4px;
-      animation: tbFadeIn 0.15s ease-out;
-    }
-    @keyframes tbFadeIn {
-      from { opacity: 0; transform: scale(0.98); }
-      to { opacity: 1; transform: scale(1); }
-    }
-    .tb-floor-popover-card {
-      background: #1e1e1e;
-      border: 1px solid #3c3c3c;
-      border-radius: 4px;
-      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.7);
-      padding: 6px 12px;
-      width: 100%;
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      font-size: 11px;
-      color: #cccccc;
-    }
-    .tb-pop-btn {
-      padding: 2px 8px;
-      background: #2a2a2a;
-      border: 1px solid #3c3c3c;
-      border-radius: 3px;
-      color: #cccccc;
-      font-size: 11px;
-      cursor: pointer;
-      user-select: none;
-      transition: all 0.15s ease;
-    }
-    .tb-pop-btn:hover {
-      background: #3a3a3a;
-      color: #ffffff;
-      border-color: #555555;
-    }
-    .tb-pop-btn:active {
-      transform: scale(0.95);
-    }
-    .tb-pop-btn.tb-pop-primary {
-      background: var(--tb-btn, #0e639c);
-      border-color: var(--tb-btn-hover, #1177bb);
-      color: #ffffff;
-      font-weight: 600;
-    }
-    .tb-pop-btn.tb-pop-primary:hover {
-      background: var(--tb-btn-hover, #1177bb);
-    }
-
-    /* 设置模态弹窗 (视口自适应居中) */
-    #tb-settings-overlay {
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      width: 100vw;
-      height: 100vh;
-      background: rgba(0, 0, 0, 0.88);
-      backdrop-filter: blur(8px);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 9999999;
-      padding: 10px;
-      animation: tbFadeIn 0.15s ease-out;
-      box-sizing: border-box;
-    }
-    .tb-settings-card {
-      background: #1e1e1e;
-      color: #cccccc;
-      border: 1px solid #3c3c3c;
-      border-radius: 6px;
-      width: 100%;
-      max-width: 720px;
-      max-height: 88vh;
-      height: auto;
-      padding: 10px 14px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      overflow-y: auto;
-      font-size: 11px;
-      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.85);
-      box-sizing: border-box;
-    }
-
-    /* 宿主页内悬浮条专属容器 (手机端与无弹窗环境) */
-    #st-thief-inpage-container {
-      position: fixed;
-      bottom: max(0px, env(safe-area-inset-bottom, 0px));
-      left: 0;
-      width: 100%;
-      max-width: 100vw;
-      z-index: 999998;
-      box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.7);
-      user-select: none;
-      box-sizing: border-box;
-      touch-action: none;
-      transition: bottom 0.2s cubic-bezier(0.2, 0, 0, 1), opacity 0.15s ease;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, Consolas, monospace;
-    }
-    #st-thief-inpage-container #tb-container {
-      width: 100%;
-      height: 100%;
-    }
-
-    @media (max-width: 768px) {
-      .tb-git-branch {
-        display: none !important;
-      }
-      .tb-section-left {
-        gap: 2px !important;
-      }
-      .tb-char-compact {
-        max-width: 50px !important;
-      }
-      .tb-sentence-text {
-        font-size: 13px !important;
-      }
-      #tb-context-menu {
-        max-width: 90vw !important;
-      }
-      .tb-settings-card {
-        max-height: 86vh !important;
-        padding: 8px 10px !important;
-      }
-    }
-    .tb-settings-card::-webkit-scrollbar {
-      width: 5px;
-    }
-    .tb-settings-card::-webkit-scrollbar-thumb {
-      background: #3c3c3c;
-      border-radius: 3px;
-    }
-    .tb-settings-card::-webkit-scrollbar-thumb:hover {
-      background: #555555;
-    }
-
-    .tb-tag-chip {
-      padding: 1px 6px;
-      background: #252526;
-      color: #9cdcfe;
-      border: 1px solid #3c3c3c;
-      border-radius: 3px;
-      font-size: 10px;
-      cursor: pointer;
-      user-select: none;
-      transition: background 0.15s, color 0.15s;
-    }
-    .tb-tag-chip:hover {
-      background: #37373d;
-      color: #ffffff;
-      border-color: #007acc;
-    }
-    .tb-wl-chip, .tb-bl-chip {
-      padding: 1px 6px;
-      background: #252526;
-      border: 1px solid #3c3c3c;
-      border-radius: 3px;
-      font-size: 10px;
-      cursor: pointer;
-      user-select: none;
-      transition: background 0.15s, color 0.15s;
-    }
-    .tb-wl-chip { color: #4ec9b0; }
-    .tb-wl-chip:hover {
-      background: #1e3a35;
-      color: #73e6cf;
-      border-color: #4ec9b0;
-    }
-    .tb-bl-chip { color: #f48771; }
-    .tb-bl-chip:hover {
-      background: #3c2420;
-      color: #ffa593;
-      border-color: #f48771;
-    }
-
-    /* 极简模式 (纯文字+背景，完全符合参考图规范) */
-    body.minimal-mode {
-      border: none !important;
-      background-color: var(--tb-bg-minimal, #141414) !important;
-    }
-    body.minimal-mode .tb-section-left {
-      display: none !important;
-    }
-    body.minimal-mode .tb-section-right {
-      display: none !important;
-    }
-    body.minimal-mode .tb-char-badge,
-    body.minimal-mode .tb-char-hidden-pill {
-      display: none !important;
-    }
-    body.minimal-mode .tb-row-reading {
-      padding: 3px 12px !important;
-      border-bottom: none !important;
-      min-height: 26px !important;
-    }
-    body.minimal-mode .tb-section-center {
-      margin: 0 !important;
-      padding: 2px 4px !important;
-    }
-    body.minimal-mode .tb-sentence-text {
-      font-size: 13px !important;
-      color: #dddddd !important;
-      letter-spacing: 0.3px !important;
-    }
-    body.minimal-mode.double-mode .tb-row-reply {
-      height: 26px !important;
-      padding: 0 12px 4px 12px !important;
-      background: transparent !important;
-      border-top: none !important;
-      gap: 0 !important;
-    }
-    body.minimal-mode .tb-reply-prefix {
-      display: none !important;
-    }
-    body.minimal-mode .tb-send-btn {
-      display: none !important;
-    }
-    body.minimal-mode .tb-reply-input {
-      height: 20px !important;
-      line-height: 20px !important;
-      font-size: 11px !important;
-      background: rgba(255, 255, 255, 0.05) !important;
-      border: 1px solid rgba(255, 255, 255, 0.08) !important;
-      border-radius: 2px !important;
-      color: #ccc !important;
-      padding: 0 6px !important;
-      width: 100% !important;
-    }
-    body.minimal-mode .tb-reply-input:focus {
-      background: rgba(255, 255, 255, 0.1) !important;
-      border-color: rgba(255, 255, 255, 0.25) !important;
-      box-shadow: none !important;
-    }
-  `;
-
-  // 事件委托：container 本体不随 innerHTML 重建销毁，所有点击/按键只需绑定一次
-  function bindContainerDelegates(container, doc) {
-    const clickActions = {
-      'tb-text-wrapper': () => nextSentence(),
-      'tb-char-badge': () => toggleCharNameMode(),
-      'btn-floor-prev': () => changeMessageFloor(-1),
-      'btn-floor-next': () => changeMessageFloor(1),
-      'btn-floor-picker': () => toggleFloorPicker(),
-      'btn-context-menu': (e, el) => {
-        if (STATE.isContextMenuOpen) {
-          closeContextMenu();
-        } else {
-          const rect = el.getBoundingClientRect();
-          openContextMenu(rect.left - 200, rect.bottom + 4);
-        }
-      },
-      'btn-inpage-close': () => closeThiefBar(),
-      'btn-boss': () => toggleBossKey(false),
-      'btn-send': () => {
-        const input = doc.getElementById('tb-input');
-        if (input) { const val = input.value; input.value = ''; submitReply(val); }
-      },
-      'menu-toggle-minimal': () => { closeContextMenu(); toggleMinimalMode(); },
-      'menu-toggle-privacy': () => { closeContextMenu(); togglePrivacyMode(); },
-      'menu-toggle-user-messages': () => { closeContextMenu(); toggleShowUserMessages(); },
-      'menu-prev': () => { closeContextMenu(); prevSentence(); },
-      'menu-next': () => { closeContextMenu(); nextSentence(); },
-      'menu-floor-prev': () => { closeContextMenu(); changeMessageFloor(-1); },
-      'menu-floor-next': () => { closeContextMenu(); changeMessageFloor(1); },
-      'menu-floor-jump': () => { closeContextMenu(); toggleFloorPicker(true); },
-      'menu-swipe': () => { closeContextMenu(); swipeMessage(); },
-      'menu-stop': () => { closeContextMenu(); stopGeneration(); },
-      'menu-toggle-char': () => { closeContextMenu(); toggleCharNameMode(); },
-      'menu-toggle-wrap': () => { closeContextMenu(); toggleWrapMode(); },
-      'menu-toggle-width': () => { closeContextMenu(); cycleBarWidth(); },
-      'menu-toggle-filter': () => { closeContextMenu(); toggleFilterMode(); },
-      'menu-toggle-desktopsync': () => { closeContextMenu(); toggleDesktopSync(); },
-      'menu-toggle-layout': () => { closeContextMenu(); toggleLayoutMode(); },
-      'menu-boss': () => { closeContextMenu(); toggleBossKey(true); },
-      'menu-settings': () => { closeContextMenu(); openSettingsModal(); },
-      'menu-inpage-close': () => { closeContextMenu(); closeThiefBar(); },
-      'btn-close-floor-popover': () => toggleFloorPicker(false),
-      'btn-floor-first': () => jumpToMessageFloor(0),
-      'btn-floor-pop-prev': () => changeMessageFloor(-1),
-      'btn-floor-pop-next': () => changeMessageFloor(1),
-      'btn-floor-last': () => {
-        const lid = typeof getLastMessageId === 'function' ? getLastMessageId() : Math.max(0, STATE.currentMsgId);
-        jumpToMessageFloor(lid);
-      },
-      'btn-floor-go': () => {
-        const floorInput = doc.getElementById('tb-floor-input');
-        const val = floorInput ? parseInt(floorInput.value, 10) : NaN;
-        if (!isNaN(val)) jumpToMessageFloor(val);
-      }
-    };
-
-    container.addEventListener('click', e => {
-      let el = e.target;
-      while (el && el !== container) {
-        if (el.id && clickActions[el.id]) {
-          e.stopPropagation();
-          clickActions[el.id](e, el);
-          return;
-        }
-        el = el.parentElement;
-      }
-    });
-
-    container.addEventListener('dblclick', e => {
-      if (e.target.closest && e.target.closest('#tb-drag-handle')) {
-        e.stopPropagation();
-        if (STATE.isHostInpage && STATE.inpageContainer) {
-          STATE.inpageContainer.style.bottom = 'max(0px, env(safe-area-inset-bottom, 0px))';
-          try { localStorage.removeItem('ST_THIEF_INPAGE_BOTTOM'); } catch (err) {}
-          flashStatusHint('摸鱼条已贴底复位');
-        }
-      }
-    });
-
-    container.addEventListener('keydown', e => {
-      const t = e.target;
-      if (t.id === 'tb-input') {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          const val = t.value;
-          t.value = '';
-          submitReply(val);
-        } else if (e.key === 'Escape') {
-          e.preventDefault();
-          t.value = '';
-          t.blur();
-        }
-      } else if (t.id === 'tb-floor-input') {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          const val = parseInt(t.value, 10);
-          if (!isNaN(val)) jumpToMessageFloor(val);
-        } else if (e.key === 'Escape') {
-          toggleFloorPicker(false);
-        }
-      }
-    });
-
-    container.addEventListener('focusin', e => {
-      if (e.target.id === 'tb-input') {
-        const targetEl = STATE.isHostInpage ? STATE.inpageContainer : doc.body;
-        if (targetEl) targetEl.classList.add('tb-privacy-active');
-      }
-    });
-    container.addEventListener('focusout', e => {
-      if (e.target.id === 'tb-input') {
-        const targetEl = STATE.isHostInpage ? STATE.inpageContainer : doc.body;
-        if (targetEl) targetEl.classList.remove('tb-privacy-active');
-      }
-    });
-  }
-
-  // 折行模式下窗口高度跟随正文实际行数；单行模式恢复基准高度。页内模式容器高度自适应，无需处理
-  function adjustWrapHeight(doc) {
-    if (STATE.isHostInpage || STATE.isBossKey) return;
-    if (STATE.isFloorPickerOpen || STATE.isSettingsOpen || STATE.isContextMenuOpen) return;
-    const win = STATE.thiefWindow;
-    if (!win || win.closed || typeof win.resizeTo !== 'function') return;
-    let contentH;
-    if (CONFIG.wrapMode === 'wrap') {
-      const readingRow = doc.querySelector('.tb-row-reading');
-      if (!readingRow) return;
-      const replyRow = doc.querySelector('.tb-row-reply');
-      contentH = readingRow.offsetHeight + (replyRow ? replyRow.offsetHeight : 0);
-      contentH = Math.max(CONFIG.layoutMode === 'double' ? 62 : 32, Math.min(300, contentH));
-    } else {
-      contentH = CONFIG.minimalMode
-        ? (CONFIG.layoutMode === 'double' ? 56 : 30)
-        : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
-    }
-    const target = contentH + 35;
-    if (Math.abs((win.outerHeight || 0) - target) > 2) {
-      try { win.resizeTo(CONFIG.barWidth, target); } catch (e) {}
-    }
-  }
-
-  function renderThiefBar() {
-    if (!STATE.thiefWindow || !STATE.thiefWindow.document) return;
-    const doc = STATE.thiefWindow.document;
-
-    if (!doc.getElementById('tb-style')) {
-      const style = doc.createElement('style');
-      style.id = 'tb-style';
-      style.textContent = CSS_STYLES;
-      doc.head.appendChild(style);
-    }
-
-    const isInteracting = STATE.isContextMenuOpen || STATE.isSettingsOpen || STATE.isFloorPickerOpen || (doc.activeElement && doc.activeElement.tagName === 'INPUT');
-    const activePrivacyClass = isInteracting ? 'tb-privacy-active' : '';
-
-    if (!STATE.isHostInpage) {
-      doc.body.className = `theme-${CONFIG.theme} ${CONFIG.hoverBlur ? 'tb-blur-mode' : ''} ${CONFIG.privacyMode ? 'tb-privacy-mode' : ''} ${CONFIG.layoutMode === 'single' ? 'single-mode' : 'double-mode'} ${CONFIG.minimalMode ? 'minimal-mode' : ''} ${activePrivacyClass}`.trim();
-      doc.body.style.setProperty('--tb-user-opacity', CONFIG.opacity);
-      if (CONFIG.privacyMode) {
-        doc.body.style.opacity = '';
-      } else {
-        doc.body.style.opacity = CONFIG.opacity;
-      }
-    }
-
-    let container = doc.getElementById('tb-container');
-    if (!container) {
-      container = doc.createElement('div');
-      container.id = 'tb-container';
-      if (STATE.isHostInpage && STATE.inpageContainer) {
-        STATE.inpageContainer.appendChild(container);
-      } else {
-        doc.body.appendChild(container);
-      }
-      bindWindowEvents(STATE.thiefWindow);
-      bindContainerDelegates(container, doc);
-    }
-
-    if (STATE.isHostInpage && STATE.inpageContainer) {
-      STATE.inpageContainer.className = `theme-${CONFIG.theme} ${CONFIG.hoverBlur ? 'tb-blur-mode' : ''} ${CONFIG.privacyMode ? 'tb-privacy-mode' : ''} ${CONFIG.layoutMode === 'single' ? 'single-mode' : 'double-mode'} ${CONFIG.minimalMode ? 'minimal-mode' : ''} ${activePrivacyClass}`.trim();
-      STATE.inpageContainer.style.setProperty('--tb-user-opacity', CONFIG.opacity);
-      if (CONFIG.privacyMode) {
-        STATE.inpageContainer.style.opacity = '';
-      } else {
-        STATE.inpageContainer.style.opacity = CONFIG.opacity;
-      }
-    }
-
-    const totalSentences = STATE.sentences.length;
-    const currentSentence = STATE.sentences[STATE.currentSentenceIndex] || '(空)';
-    const curIdx = totalSentences > 0 ? STATE.currentSentenceIndex + 1 : 0;
-    const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : Math.max(0, STATE.currentMsgId);
-    const displayFloor = STATE.currentMsgId >= 0 ? STATE.currentMsgId : 0;
-
-    // 差量渲染：结构签名未变时只更新文本节点，不重建 DOM、不触碰回复框（生成期间打字不丢失）
-    const structureSig = [STATE.isBossKey, STATE.isGenerating, CONFIG.layoutMode, CONFIG.charNameMode,
-      CONFIG.wrapMode, STATE.isFloorPickerOpen, STATE.isContextMenuOpen, STATE.isHostInpage].join('|');
-    if (container._tbSig === structureSig && container.firstChild) {
-      if (STATE.isBossKey) return;
-      if (!STATE.isFloorPickerOpen && !STATE.isContextMenuOpen) {
-        const textEl = doc.getElementById('tb-text');
-        if (textEl && textEl.textContent !== currentSentence) {
-          textEl.textContent = currentSentence;
-          if (textEl.animate) textEl.animate([{ opacity: 0.35 }, { opacity: 1 }], { duration: 140, easing: 'ease-out' });
-          if (CONFIG.wrapMode === 'wrap') adjustWrapHeight(doc);
-        }
-        const progressEl = doc.getElementById('tb-progress');
-        const progressText = `${curIdx}/${totalSentences}`;
-        if (progressEl && progressEl.textContent !== progressText) progressEl.textContent = progressText;
-        const floorBadge = doc.getElementById('btn-floor-picker');
-        if (floorBadge) {
-          floorBadge.textContent = `#${displayFloor} ▾`;
-          floorBadge.title = `当前: 第 #${displayFloor} 楼 / 共 ${lastId} 楼\n[点击] 打开楼层快速跳转面板`;
-        }
-        const charBadge = doc.getElementById('tb-char-badge');
-        if (charBadge && CONFIG.charNameMode !== 'hidden' && charBadge.textContent.trim() !== STATE.characterName) {
-          charBadge.textContent = STATE.characterName;
-        }
-        return;
-      }
-    }
-    container._tbSig = structureSig;
-
-    // 1. 老板键伪装模式
-    if (STATE.isBossKey) {
-      container.innerHTML = `
-        <div class="tb-row-reading">
-          <div class="tb-section-left">
-            <span>⎇ main*</span>
-            <span>✓ 0 ⨉ 0</span>
-          </div>
-          <div class="tb-section-center" style="cursor:default;">
-            <span style="opacity:0.9;">${CONFIG.bossTemplates[0]}</span>
-          </div>
-          <div class="tb-section-right">
-            <span>TypeScript 5.4.5</span>
-            <span>UTF-8</span>
-            <span>Ln 142, Col 8</span>
-            <span class="tb-btn" id="btn-boss" title="退出伪装 (Esc)">🕶️</span>
-          </div>
-        </div>
-        ${
-          CONFIG.layoutMode === 'double'
-            ? `
-          <div class="tb-row-reply">
-            <span style="opacity:0.6;font-size:11px;font-family:Consolas,monospace;">${CONFIG.bossTemplates[1]}</span>
-          </div>
-        `
-            : ''
-        }
-      `;
-      return;
-    }
-
-    // 2. 正常阅读模式
-    const leftIconHtml = STATE.isGenerating
-      ? `<span class="tb-drag-handle" id="tb-drag-handle" title="按住拖拽调节摸鱼条上下高度 (双击贴底复位)">⠿</span> <span class="tb-spin-icon" title="AI 生成中...">⟳</span> <span style="color:#dcdcaa;font-size:11px;">Building...</span>`
-      : `
-        <span class="tb-drag-handle" id="tb-drag-handle" title="按住拖拽调节摸鱼条上下高度 (双击贴底复位)">⠿</span>
-        <span class="tb-git-branch" title="Git 分支">⎇ main*</span>
-        <div class="tb-floor-nav-wrap" title="楼层导航 (点击跳转)">
-          <span class="tb-floor-btn-step" id="btn-floor-prev" role="button" aria-label="上一楼" title="上一楼 (快捷键: PageUp)">▲</span>
-          <span class="tb-floor-num-badge" id="btn-floor-picker" role="button" aria-label="打开楼层快速跳转面板" title="当前: 第 #${displayFloor} 楼 / 共 ${lastId} 楼\n[点击] 打开楼层快速跳转面板">#${displayFloor} ▾</span>
-          <span class="tb-floor-btn-step" id="btn-floor-next" role="button" aria-label="下一楼" title="下一楼 (快捷键: PageDown)">▼</span>
-        </div>
-      `;
-
-    let charBadgeHtml = '';
-    if (CONFIG.charNameMode === 'hidden') {
-      charBadgeHtml = `<span class="tb-char-hidden-pill" id="tb-char-badge" title="角色名已隐藏 (点击恢复显示: ${escapeHtml(STATE.characterName)})">👤</span>`;
-    } else {
-      const isCompact = CONFIG.charNameMode === 'compact';
-      charBadgeHtml = `
-        <span class="tb-char-badge ${isCompact ? 'tb-char-compact' : ''}" id="tb-char-badge" title="当前角色: ${escapeHtml(STATE.characterName)}\n[点击切换模式]: 精简胶囊 / 完全隐藏 / 完整显示">
-          ${escapeHtml(STATE.characterName)}
-        </span>
-      `;
-    }
-
-    const isNowrap = CONFIG.wrapMode === 'single';
-    const centerHtml = `
-      <div class="tb-section-center" id="tb-text-wrapper" role="button" aria-label="点击阅读下一句" title="点击阅读下一句 (也可按 ←/→ 翻句，滚轮滚动)">
-        ${charBadgeHtml}
-        <span class="tb-sentence-text ${isNowrap ? 'nowrap' : ''}" id="tb-text">${escapeHtml(currentSentence)}</span>
-      </div>
-    `;
-
-    const rightHtml = `
-      <div class="tb-section-right">
-        <span class="tb-progress-badge" id="tb-progress" title="当前阅读进度">${curIdx}/${totalSentences}</span>
-        <span class="tb-menu-trigger" id="btn-context-menu" role="button" aria-label="功能菜单" aria-haspopup="menu" aria-expanded="${STATE.isContextMenuOpen}" title="功能菜单 (鼠标右键任意处也可唤出)">⋮</span>
-        ${STATE.isHostInpage ? `<span class="tb-menu-trigger tb-close-btn" id="btn-inpage-close" role="button" aria-label="收起摸鱼条" title="收起摸鱼条" style="color:#e06c75; font-size:12px; margin-left:2px; font-weight:bold;">✕</span>` : ''}
-      </div>
-    `;
-
-    let replyRowHtml = '';
-    if (CONFIG.layoutMode === 'double') {
-      replyRowHtml = `
-        <div class="tb-row-reply">
-          <span class="tb-reply-prefix">&gt;</span>
-          <input type="text" class="tb-reply-input" id="tb-input" aria-label="回复输入框，回车发送" placeholder="输入回复并按 Enter 发送..." />
-          <span class="tb-send-btn" id="btn-send" role="button" aria-label="发送回复">发送</span>
-        </div>
-      `;
-    }
-
-    // 楼层跳转快速浮窗 HTML
-    let floorPopoverHtml = '';
-    if (STATE.isFloorPickerOpen) {
-      floorPopoverHtml = `
-        <div id="tb-floor-popover" role="dialog" aria-label="快速楼层跳转">
-          <div class="tb-floor-popover-card">
-            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #333; padding-bottom:3px; margin-bottom:5px;">
-              <span style="font-weight:600; color:#4ec9b0; font-size:11px;">📖 快速楼层跳转 (当前: #${displayFloor} / 共 ${lastId} 楼)</span>
-              <span id="btn-close-floor-popover" style="cursor:pointer; font-size:13px; color:#888; padding:0 4px; font-weight:bold;" title="关闭">✕</span>
-            </div>
-            <div style="display:flex; align-items:center; justify-content:space-between; gap:5px; flex-wrap:wrap;">
-              <div style="display:flex; gap:4px;">
-                <button class="tb-pop-btn" id="btn-floor-first" title="回到第一楼 (#0)">⏮ 首页</button>
-                <button class="tb-pop-btn" id="btn-floor-pop-prev" title="上一楼">◀ 上楼</button>
-              </div>
-              <div style="display:flex; align-items:center; gap:4px;">
-                <span style="font-size:11px; opacity:0.8;">跳转到第</span>
-                <input type="number" id="tb-floor-input" value="${displayFloor}" min="0" max="${lastId}" style="width:48px; background:#141414; border:1px solid #3c3c3c; color:#fff; padding:2px 4px; border-radius:3px; font-size:11px; text-align:center; outline:none;" />
-                <span style="font-size:11px; opacity:0.8;">楼</span>
-                <button class="tb-pop-btn tb-pop-primary" id="btn-floor-go">GO</button>
-              </div>
-              <div style="display:flex; gap:4px;">
-                <button class="tb-pop-btn" id="btn-floor-pop-next" title="下一楼">下楼 ▶</button>
-                <button class="tb-pop-btn" id="btn-floor-last" title="跳转到最新楼 (#${lastId})">最新 ⏭</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      `;
-    }
-
-    // 右键上下文菜单 HTML
-    let contextMenuHtml = '';
-    if (STATE.isContextMenuOpen) {
-      const topWin = window.top || window;
-      const vp = topWin.visualViewport;
-      const docW = (vp ? vp.width : topWin.innerWidth) || doc.documentElement.clientWidth || 800;
-      const docH = (vp ? vp.height : topWin.innerHeight) || doc.documentElement.clientHeight || 400;
-      let posStyle = '';
-
-      if (STATE.isHostInpage || isMobileDevice()) {
-        // 页内浮窗贴底时，菜单向上展开，避免被软键盘或屏幕边缘截断
-        posStyle = `right: 10px; bottom: calc(65px + env(safe-area-inset-bottom, 0px));`;
-      } else {
-        const posX = Math.min(docW - 240, Math.max(10, STATE.contextMenuPos.x || (docW - 240)));
-        const posY = Math.min(docH - 280, Math.max(5, STATE.contextMenuPos.y || 25));
-        posStyle = `left: ${posX}px; top: ${posY}px;`;
-      }
-      contextMenuHtml = `
-        <div id="tb-context-menu" role="menu" aria-label="摸鱼条功能菜单" style="${posStyle}">
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-minimal">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.minimalMode ? '✓' : ''}</span><span>极简模式</span></div>
-            <span class="tb-menu-shortcut">${CONFIG.minimalMode ? '已开启' : ''}</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-privacy">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.privacyMode ? '✓' : ''}</span><span>隐私模式 (悬停显示)</span></div>
-            <span class="tb-menu-shortcut">${CONFIG.privacyMode ? '已开启' : ''}</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-layout">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.layoutMode === 'double' ? '✓' : ''}</span><span>双行布局 (含回复框)</span></div>
-            <span class="tb-menu-shortcut">${CONFIG.layoutMode === 'double' ? '双行' : '单行'}</span>
-          </div>
-          <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" role="menuitem" id="menu-prev">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>上一句</span></div>
-            <span class="tb-menu-shortcut">←</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-next">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>下一句</span></div>
-            <span class="tb-menu-shortcut">→</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-swipe">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>重新生成</span></div>
-            <span class="tb-menu-shortcut">Alt+S</span>
-          </div>
-          ${STATE.isGenerating ? `
-          <div class="tb-menu-item" role="menuitem" id="menu-stop" style="color:#f44747;">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>中止生成</span></div>
-            <span class="tb-menu-shortcut">Alt+X</span>
-          </div>
-          ` : ''}
-          <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" role="menuitem" id="menu-floor-prev">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>上一楼</span></div>
-            <span class="tb-menu-shortcut">PageUp</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-floor-next">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>下一楼</span></div>
-            <span class="tb-menu-shortcut">PageDown</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-floor-jump">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>跳转楼层...</span></div>
-            <span class="tb-menu-shortcut">#${displayFloor}</span>
-          </div>
-          <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-wrap">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.wrapMode === 'wrap' ? '✓' : ''}</span><span>自动折行全显</span></div>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-user-messages">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.showUserMessages ? '✓' : ''}</span><span>显示用户消息</span></div>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-width">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>窗口长度</span></div>
-            <span class="tb-menu-shortcut">${CONFIG.barWidth}px</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-char">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>角色名模式</span></div>
-            <span class="tb-menu-shortcut">${CONFIG.charNameMode === 'compact' ? '精简' : (CONFIG.charNameMode === 'hidden' ? '隐藏' : '完整')}</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-filter">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>过滤模式</span></div>
-            <span class="tb-menu-shortcut">${CONFIG.filterMode === 'pure' ? '纯净' : '正则'}</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-toggle-desktopsync">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark">${CONFIG.enableDesktopSync ? '✓' : ''}</span><span>桌面端同步</span></div>
-            <span class="tb-menu-shortcut">${CONFIG.enableDesktopSync ? (STATE.wsAuthenticated ? '已连接' : (STATE.wsClient ? '待认证' : '未连接')) : '未开启'}</span>
-          </div>
-          <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" role="menuitem" id="menu-boss">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>老板键 (伪装)</span></div>
-            <span class="tb-menu-shortcut">Esc</span>
-          </div>
-          <div class="tb-menu-item" role="menuitem" id="menu-settings">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>设置...</span></div>
-          </div>
-          <div class="tb-menu-separator"></div>
-          <div class="tb-menu-item" role="menuitem" id="menu-inpage-close" style="color:#e06c75;">
-            <div class="tb-menu-item-left"><span class="tb-menu-mark"></span><span>退出摸鱼条</span></div>
-          </div>
-        </div>
-      `;
-    }
-
-    // 全量重建前保留回复草稿与焦点，重建后恢复
-    const oldInput = doc.getElementById('tb-input');
-    const draft = oldInput ? oldInput.value : '';
-    const hadFocus = !!(oldInput && doc.activeElement === oldInput);
-    const selStart = hadFocus ? oldInput.selectionStart : 0;
-
-    container.innerHTML = `
-      <div class="tb-row-reading">
-        <div class="tb-section-left">${leftIconHtml}</div>
-        ${centerHtml}
-        ${rightHtml}
-      </div>
-      ${replyRowHtml}
-      ${floorPopoverHtml}
-      ${contextMenuHtml}
-    `;
-
-    const newInput = doc.getElementById('tb-input');
-    if (newInput) {
-      newInput.value = draft;
-      if (hadFocus) {
-        newInput.focus();
-        try { newInput.setSelectionRange(selStart, selStart); } catch (e) {}
-      }
-    }
-    adjustWrapHeight(doc);
-  }
-
-  // ------------------------------------------------------------------------------------
-  // 窗口按键与鼠标事件监听
-  // ------------------------------------------------------------------------------------
-  function bindWindowEvents(win) {
-    if (!win || !win.document) return;
-    if (win.document._tbEventsBound) return;
-    win.document._tbEventsBound = true;
-
-    // 1. 键盘快捷键监听
-    win.document.addEventListener('keydown', e => {
-      if (STATE.isContextMenuOpen) {
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          closeContextMenu();
-          return;
-        }
-      }
-
-      if (STATE.isSettingsOpen) {
-        if (e.key === 'Escape') {
-          closeSettingsModal();
-        }
-        return;
-      }
-
-      if (STATE.isFloorPickerOpen) {
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          toggleFloorPicker(false);
-          return;
-        }
-      }
-
-      const activeEl = win.document.activeElement;
-      const isInputActive = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable);
-
-      if (isInputActive) {
-        if (e.key === 'Escape') {
-          activeEl.blur();
-        }
-        return;
-      }
-
-      // 页内模式作用域保护：若摸鱼条未显示，或者鼠标/焦点并未位于摸鱼条内部，绝不拦截单键导航快捷键 (j, k, 方向键, Enter 等)
-      if (STATE.isHostInpage) {
-        const inpage = STATE.inpageContainer || win.document.getElementById('st-thief-inpage-container');
-        if (!inpage || inpage.style.display === 'none') return;
-
-        const isHovered = inpage.matches(':hover') || inpage.classList.contains('tb-mouse-over');
-        const isFocusedInside = inpage.contains(activeEl);
-
-        // 未与摸鱼条交互时，放行所有单键快捷键，避免破坏酒馆正常操作
-        if (!isHovered && !isFocusedInside) {
-          if (e.key === 'Escape') {
-            e.preventDefault();
-            closeThiefBar();
-          }
-          return;
-        }
-      }
-
-      switch (e.key) {
-        case 'Escape':
-          e.preventDefault();
-          if (STATE.isHostInpage) {
-            closeThiefBar();
-          } else {
-            toggleBossKey();
-          }
-          break;
-        case 'ArrowRight':
-        case 'k':
-        case 'K':
-          e.preventDefault();
-          nextSentence();
-          break;
-        case 'ArrowLeft':
-        case 'j':
-        case 'J':
-          e.preventDefault();
-          prevSentence();
-          break;
-        case 'Enter':
-          e.preventDefault();
-          win.document.getElementById('tb-input')?.focus();
-          break;
-        case 'PageDown':
-          e.preventDefault();
-          changeMessageFloor(1);
-          break;
-        case 'PageUp':
-          e.preventDefault();
-          changeMessageFloor(-1);
-          break;
-      }
-
-      if (e.altKey && (e.key === 's' || e.key === 'S')) {
-        e.preventDefault();
-        swipeMessage();
-      }
-      if (e.altKey && (e.key === 'x' || e.key === 'X')) {
-        e.preventDefault();
-        stopGeneration();
-      }
-    });
-
-    // 2. 鼠标滚轮翻句：严格限制作用域，杜绝劫持酒馆页面/聊天历史/弹窗列表等任何滚动组件
-    const onWheelHandler = e => {
-      if (STATE.isSettingsOpen) return;
-      const activeEl = win.document.activeElement;
-      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable)) return;
-
-      // 仅在明确滚轮发生在摸鱼条上方时翻句
-      e.preventDefault();
-      if (e.deltaY > 0) {
-        nextSentence();
-      } else if (e.deltaY < 0) {
-        prevSentence();
-      }
-    };
-
-    // 如果是页内模式，滚轮事件监听器严格只绑定到摸鱼条容器元素上；绝不挂载到 window.document，确保酒馆主界面任何组件滚动零干扰
-    if (STATE.isHostInpage) {
-      const inpage = STATE.inpageContainer || win.document.getElementById('st-thief-inpage-container');
-      if (inpage && !inpage._tbWheelBound) {
-        inpage._tbWheelBound = true;
-        inpage.addEventListener('wheel', onWheelHandler, { passive: false });
-      }
-    } else {
-      win.document.addEventListener('wheel', onWheelHandler, { passive: false });
-    }
-
-    // 3. 点击菜单外部关闭右键上下文菜单
-    win.document.addEventListener('click', e => {
-      if (STATE.isContextMenuOpen) {
-        const menu = win.document.getElementById('tb-context-menu');
-        const trigger = win.document.getElementById('btn-context-menu');
-        if (menu && !menu.contains(e.target) && (!trigger || !trigger.contains(e.target))) {
-          closeContextMenu();
-        }
-      }
-    });
-
-    // 4. 右键呼出摸鱼条专属上下文菜单：仅在摸鱼条范围内生效，坚决不劫持酒馆全局右键菜单
-    const onContextMenuHandler = e => {
-      if (STATE.isSettingsOpen || STATE.isFloorPickerOpen) return;
-      const target = e.target;
-      // 输入框内右键保留系统原生编辑菜单 (复制/粘贴/剪切)
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-      openContextMenu(e.clientX, e.clientY);
-    };
-
-    // 页内模式下右键事件严格只绑定至摸鱼条容器，绝不拦截酒馆聊天内容或其他区域的原生右键操作
-    if (STATE.isHostInpage) {
-      const inpage = STATE.inpageContainer || win.document.getElementById('st-thief-inpage-container');
-      if (inpage && !inpage._tbContextMenuBound) {
-        inpage._tbContextMenuBound = true;
-        inpage.addEventListener('contextmenu', onContextMenuHandler);
-      }
-    } else {
-      win.document.addEventListener('contextmenu', onContextMenuHandler);
-    }
-
-    // 5. 隐私模式鼠标悬停与移开显隐联动
-    let mouseLeaveTimer = null;
-    const updateHoverState = isHovering => {
-      if (mouseLeaveTimer) {
-        clearTimeout(mouseLeaveTimer);
-        mouseLeaveTimer = null;
-      }
-      const targetEl = STATE.isHostInpage ? STATE.inpageContainer : win.document.body;
-      if (!targetEl) return;
-      if (isHovering) {
-        targetEl.classList.add('tb-mouse-over');
-      } else {
-        mouseLeaveTimer = setTimeout(() => {
-          const isInteracting = STATE.isContextMenuOpen || STATE.isSettingsOpen || STATE.isFloorPickerOpen || (win.document.activeElement && win.document.activeElement.tagName === 'INPUT');
-          if (!isInteracting) {
-            targetEl.classList.remove('tb-mouse-over');
-          }
-        }, 120);
-      }
-    };
-
-    if (STATE.isHostInpage && STATE.inpageContainer) {
-      STATE.inpageContainer.addEventListener('mouseenter', () => updateHoverState(true));
-      STATE.inpageContainer.addEventListener('mouseleave', () => updateHoverState(false));
-      STATE.inpageContainer.addEventListener('mousemove', () => updateHoverState(true));
-    } else {
-      win.document.addEventListener('mouseenter', () => updateHoverState(true));
-      win.document.addEventListener('mouseleave', () => updateHoverState(false));
-      win.document.addEventListener('mousemove', () => updateHoverState(true));
-      if (win.document.body) {
-        win.document.body.addEventListener('mouseenter', () => updateHoverState(true));
-        win.document.body.addEventListener('mouseleave', () => updateHoverState(false));
-        win.document.body.addEventListener('mousemove', () => updateHoverState(true));
-      }
-    }
-
-    if (typeof win.addEventListener === 'function') {
-      win.addEventListener('blur', () => {
-        if (CONFIG.privacyMode) {
-          const isInteracting = STATE.isContextMenuOpen || STATE.isSettingsOpen || STATE.isFloorPickerOpen || (win.document.activeElement && win.document.activeElement.tagName === 'INPUT');
-          if (!isInteracting) {
-            updateHoverState(false);
-          }
-        }
-      });
-    }
-  }
-
-  // ------------------------------------------------------------------------------------
-  // 酒馆网页常驻悬浮入口注入 (完美跟随页面变化与移动端触控)
+  // 宿主文档安全访问与全局快捷键
   // ------------------------------------------------------------------------------------
   function getSafeTopDoc() {
     try {
@@ -3151,357 +1556,6 @@
     return window;
   }
 
-  function clampFloatingButton(btn) {
-    if (!btn) return;
-    try {
-      const topDoc = getSafeTopDoc();
-      const topWin = getSafeTopWin();
-      const vp = topWin.visualViewport;
-      const winW = (vp ? vp.width : topWin.innerWidth) || topDoc.documentElement.clientWidth || 360;
-      const winH = (vp ? vp.height : topWin.innerHeight) || topDoc.documentElement.clientHeight || 640;
-      const rect = btn.getBoundingClientRect();
-      const btnW = rect.width || btn.offsetWidth || 38;
-      const btnH = rect.height || btn.offsetHeight || 38;
-      const margin = 6;
-
-      // 如果按钮被拖拽过（设置了具体的 left/top），确保其绝不会超出当前视口
-      if (btn.style.left && btn.style.left !== 'auto') {
-        let curLeft = parseFloat(btn.style.left) || 0;
-        let curTop = parseFloat(btn.style.top) || 0;
-        let safeLeft = Math.max(margin, Math.min(curLeft, winW - btnW - margin));
-        let safeTop = Math.max(margin, Math.min(curTop, winH - btnH - margin));
-        btn.style.left = `${safeLeft}px`;
-        btn.style.top = `${safeTop}px`;
-        btn.style.right = 'auto';
-        btn.style.bottom = 'auto';
-      } else {
-        // 默认贴在右下角安全区
-        btn.style.right = 'max(15px, env(safe-area-inset-right, 15px))';
-        btn.style.bottom = 'max(80px, calc(80px + env(safe-area-inset-bottom, 0px)))';
-      }
-    } catch (e) {}
-  }
-
-  let entranceObserver = null;
-  let entranceRetryTimer = null;
-  let entranceViewportCleanup = null;
-
-  function injectSillyTavernEntrance() {
-    try {
-      const topDoc = getSafeTopDoc();
-      if (!topDoc || topDoc.getElementById('st-thief-floating-btn')) return;
-
-      // 重注入前先卸载旧按钮遗留的视口监听，防止多次注入后监听器累积泄漏
-      if (entranceViewportCleanup) {
-        entranceViewportCleanup();
-        entranceViewportCleanup = null;
-      }
-
-      const btn = topDoc.createElement('div');
-      btn.id = 'st-thief-floating-btn';
-      btn.innerHTML = `🐟`;
-      btn.title = '🐟 Thief摸鱼条\n[左键点击]：展开 / 收起摸鱼条 (Alt+M)\n[右键点击]：直接打开设置面板\n[按住拖拽]：高效移动位置 (双击复位)';
-      btn.style.cssText = `
-        position: fixed;
-        bottom: max(80px, calc(80px + env(safe-area-inset-bottom, 0px)));
-        right: max(15px, env(safe-area-inset-right, 15px));
-        z-index: 999999;
-        width: 38px;
-        height: 38px;
-        box-sizing: border-box;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: linear-gradient(135deg, #252830 0%, #17181c 100%);
-        color: #4ec9b0;
-        border: 1.5px solid rgba(78, 201, 176, 0.45);
-        border-radius: 50%;
-        font-size: 19px;
-        line-height: 1;
-        cursor: grab;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.65), 0 0 10px rgba(78, 201, 176, 0.2);
-        user-select: none;
-        -webkit-user-select: none;
-        opacity: 0.92;
-        transition: transform 0.15s ease, opacity 0.2s ease, border-color 0.15s ease, box-shadow 0.15s ease;
-        touch-action: none;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Consolas, sans-serif;
-      `;
-
-      // 还原拖拽记忆位置
-      try {
-        const savedPos = JSON.parse(localStorage.getItem('ST_THIEF_PILL_POS') || 'null');
-        if (savedPos && typeof savedPos.left === 'number' && typeof savedPos.top === 'number') {
-          btn.style.left = `${savedPos.left}px`;
-          btn.style.top = `${savedPos.top}px`;
-          btn.style.right = 'auto';
-          btn.style.bottom = 'auto';
-        }
-      } catch (err) {}
-
-      btn.addEventListener('mouseenter', () => {
-        if (!isDragging) {
-          btn.style.opacity = '1';
-          btn.style.borderColor = '#4ec9b0';
-          btn.style.boxShadow = '0 6px 18px rgba(0, 0, 0, 0.8), 0 0 14px rgba(78, 201, 176, 0.4)';
-          btn.style.transform = 'scale(1.12)';
-        }
-      });
-      btn.addEventListener('mouseleave', () => {
-        if (!isDragging) {
-          btn.style.opacity = '0.92';
-          btn.style.borderColor = 'rgba(78, 201, 176, 0.45)';
-          btn.style.boxShadow = '0 4px 14px rgba(0, 0, 0, 0.65), 0 0 10px rgba(78, 201, 176, 0.2)';
-          btn.style.transform = 'scale(1)';
-        }
-      });
-
-      function resetBtnPosition() {
-        btn.style.left = 'auto';
-        btn.style.top = 'auto';
-        btn.style.right = 'max(15px, env(safe-area-inset-right, 15px))';
-        btn.style.bottom = 'max(80px, calc(80px + env(safe-area-inset-bottom, 0px)))';
-        try {
-          localStorage.removeItem('ST_THIEF_PILL_POS');
-        } catch (err) {}
-        flashStatusHint('悬浮入口已复位至右下角安全区');
-      }
-
-      // 现代高性能 Pointer Events 交互模型 (GPU 加速、requestAnimationFrame 节流防掉帧)
-      let activePointerId = null;
-      let startX = 0, startY = 0;
-      let origLeft = 0, origTop = 0;
-      let isDragging = false;
-      let hasTriggeredLongPress = false;
-      let longPressTimer = null;
-      let lastTapTime = 0;
-      let rafPending = false;
-      let nextTargetX = 0, nextTargetY = 0;
-      let cachedWinW = 360, cachedWinH = 640;
-      let cachedBtnW = 38, cachedBtnH = 38;
-
-      function applyPosition() {
-        btn.style.left = `${nextTargetX}px`;
-        btn.style.top = `${nextTargetY}px`;
-        rafPending = false;
-      }
-
-      btn.addEventListener('pointerdown', e => {
-        // 仅处理鼠标左键 (0) 或触屏/手写笔
-        if (e.button !== 0) return;
-
-        activePointerId = e.pointerId;
-        startX = e.clientX;
-        startY = e.clientY;
-        isDragging = false;
-        hasTriggeredLongPress = false;
-
-        const rect = btn.getBoundingClientRect();
-        origLeft = rect.left;
-        origTop = rect.top;
-
-        // 一次性预缓存窗口与按钮几何尺寸，彻底杜绝 pointermove 过程中的 DOM layout thrashing 回流
-        const topWin = getSafeTopWin();
-        const topDoc = getSafeTopDoc();
-        const vp = topWin.visualViewport;
-        cachedWinW = (vp ? vp.width : topWin.innerWidth) || topDoc.documentElement.clientWidth || 360;
-        cachedWinH = (vp ? vp.height : topWin.innerHeight) || topDoc.documentElement.clientHeight || 640;
-        cachedBtnW = rect.width || 38;
-        cachedBtnH = rect.height || 38;
-
-        try {
-          btn.setPointerCapture(e.pointerId);
-        } catch (err) {}
-
-        btn.style.willChange = 'left, top, transform';
-
-        // 移动端长按检测 (480ms)：触屏长按可直接唤起设置面板
-        if (longPressTimer) clearTimeout(longPressTimer);
-        longPressTimer = setTimeout(() => {
-          if (!isDragging && activePointerId === e.pointerId) {
-            hasTriggeredLongPress = true;
-            if (activePointerId !== null) {
-              try { btn.releasePointerCapture(activePointerId); } catch (err) {}
-              activePointerId = null;
-            }
-            openSettingsModal();
-          }
-        }, 480);
-
-        // 阻止原生文字选中与 HTML 拖拽，防止事件被浏览器抢占中断
-        e.preventDefault();
-      });
-
-      btn.addEventListener('pointermove', e => {
-        if (activePointerId !== e.pointerId) return;
-
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
-        const dist = Math.hypot(dx, dy);
-
-        // 4px 响应阈值：既能过滤人类手指极微小颤动，又能实现一触即发的高性能即时拖拽反馈
-        if (!isDragging && dist > 4) {
-          isDragging = true;
-          if (longPressTimer) {
-            clearTimeout(longPressTimer);
-            longPressTimer = null;
-          }
-          btn.style.transition = 'none';
-          btn.style.cursor = 'grabbing';
-          btn.style.transform = 'scale(1.1)';
-          btn.style.right = 'auto';
-          btn.style.bottom = 'auto';
-        }
-
-        if (isDragging) {
-          const margin = 4;
-          let targetX = origLeft + dx;
-          let targetY = origTop + dy;
-
-          targetX = Math.max(margin, Math.min(targetX, cachedWinW - cachedBtnW - margin));
-          targetY = Math.max(margin, Math.min(targetY, cachedWinH - cachedBtnH - margin));
-
-          nextTargetX = targetX;
-          nextTargetY = targetY;
-
-          if (!rafPending) {
-            rafPending = true;
-            requestAnimationFrame(applyPosition);
-          }
-        }
-      });
-
-      function onPointerEnd(e, isCancel) {
-        if (activePointerId !== e.pointerId) return;
-
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
-
-        try {
-          btn.releasePointerCapture(e.pointerId);
-        } catch (err) {}
-        activePointerId = null;
-
-        btn.style.willChange = 'auto';
-        btn.style.cursor = 'grab';
-        btn.style.transition = 'transform 0.15s ease, opacity 0.2s ease, border-color 0.15s ease, box-shadow 0.15s ease';
-        btn.style.transform = 'scale(1)';
-
-        if (hasTriggeredLongPress) {
-          hasTriggeredLongPress = false;
-          isDragging = false;
-          return;
-        }
-
-        if (isDragging && !isCancel) {
-          if (rafPending) {
-            applyPosition();
-          }
-          clampFloatingButton(btn);
-          try {
-            const curLeft = parseFloat(btn.style.left) || 0;
-            const curTop = parseFloat(btn.style.top) || 0;
-            localStorage.setItem('ST_THIEF_PILL_POS', JSON.stringify({ left: curLeft, top: curTop }));
-          } catch (err) {}
-          isDragging = false;
-          return;
-        }
-
-        const wasDragging = isDragging;
-        isDragging = false;
-
-        if (isCancel || wasDragging) return;
-
-        // 双击/双触快速复位 (350ms 内连续两次点击)
-        const now = Date.now();
-        if (now - lastTapTime < 350) {
-          lastTapTime = 0;
-          resetBtnPosition();
-          return;
-        }
-        lastTapTime = now;
-
-        // 左键干净点击 / 触屏轻触：开启或收起摸鱼条
-        toggleThiefBar();
-      }
-
-      btn.addEventListener('pointerup', e => onPointerEnd(e, false));
-      btn.addEventListener('pointercancel', e => onPointerEnd(e, true));
-
-      // 右键悬浮窗直接打开设置
-      btn.addEventListener('contextmenu', e => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
-        openSettingsModal();
-      });
-
-      // 阻止原生合成点击事件二次触发干扰
-      btn.addEventListener('click', e => {
-        e.stopPropagation();
-        e.preventDefault();
-      });
-
-      // 双击鼠标一键复位
-      btn.addEventListener('dblclick', e => {
-        e.stopPropagation();
-        resetBtnPosition();
-      });
-
-      topDoc.body.appendChild(btn);
-      clampFloatingButton(btn);
-
-      // 监听屏幕尺寸、旋转与视口缩放变化，确保悬浮窗始终紧紧跟随页面变化
-      const topWin = getSafeTopWin();
-      const onViewportChange = () => {
-        clampFloatingButton(btn);
-        if (STATE.isHostInpage) {
-          updateInpageFloatingPosition();
-          refreshLatestMessage(false);
-        }
-      };
-      topWin.addEventListener('resize', onViewportChange);
-      topWin.addEventListener('orientationchange', onViewportChange);
-      if (topWin.visualViewport) {
-        topWin.visualViewport.addEventListener('resize', onViewportChange);
-        topWin.visualViewport.addEventListener('scroll', onViewportChange);
-      }
-      entranceViewportCleanup = () => {
-        topWin.removeEventListener('resize', onViewportChange);
-        topWin.removeEventListener('orientationchange', onViewportChange);
-        if (topWin.visualViewport) {
-          topWin.visualViewport.removeEventListener('resize', onViewportChange);
-          topWin.visualViewport.removeEventListener('scroll', onViewportChange);
-        }
-      };
-
-      console.log('[ST-Thief-Book] 成功在酒馆主界面注入“🐟”精简图标入口 (右键直接设置 / 移动超高效)');
-    } catch (e) {
-      console.warn('[ST-Thief-Book] 注入悬浮入口异常:', e);
-    }
-  }
-
-  // 事件驱动补注入：按钮是 body 直接子节点，只需盯 body 的 childList；
-  // 宿主重绘移除入口时自动补回，替代原先每 3 秒一次的 setInterval 轮询
-  function ensureSillyTavernEntrance() {
-    injectSillyTavernEntrance();
-    const topDoc = getSafeTopDoc();
-    if (!topDoc || !topDoc.body) {
-      entranceRetryTimer = setTimeout(ensureSillyTavernEntrance, 1000);
-      return;
-    }
-    if (entranceObserver) return;
-    entranceObserver = new MutationObserver(() => {
-      if (!topDoc.getElementById('st-thief-floating-btn')) injectSillyTavernEntrance();
-    });
-    entranceObserver.observe(topDoc.body, { childList: true });
-  }
-
   function setupHostGlobalShortcuts() {
     try {
       const topDoc = getSafeTopDoc();
@@ -3511,36 +1565,12 @@
       }
 
       const handler = e => {
-        if (e.altKey && (e.key === 'm' || e.key === 'M')) {
-          e.preventDefault();
-          toggleThiefBar();
-          return;
-        }
-        if (e.key === 'Escape') {
+        if (e.key === 'Escape' && STATE.isSettingsOpen) {
           const activeEl = topDoc.activeElement;
           const isInputActive = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable);
           if (isInputActive) return;
-
-          if (STATE.isSettingsOpen) {
-            e.preventDefault();
-            closeSettingsModal();
-            return;
-          }
-          if (STATE.isContextMenuOpen) {
-            e.preventDefault();
-            closeContextMenu();
-            return;
-          }
-          if (STATE.isFloorPickerOpen) {
-            e.preventDefault();
-            toggleFloorPicker(false);
-            return;
-          }
-          if (STATE.isHostInpage && STATE.inpageContainer && STATE.inpageContainer.style.display !== 'none') {
-            closeThiefBar();
-          } else if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isHostInpage) {
-            toggleBossKey();
-          }
+          e.preventDefault();
+          closeSettingsModal();
         }
       };
       topDoc._tbHostKeydownHandler = handler;
@@ -3554,244 +1584,6 @@
       });
     } catch (e) {
       console.warn('[ST-Thief-Book] 注入宿主按键监听受限:', e);
-    }
-  }
-
-  // ------------------------------------------------------------------------------------
-  // 画中画（Document Picture-in-Picture）、独立弹窗与页内原生悬浮条支持
-  // ------------------------------------------------------------------------------------
-  function setupInpageDraggable(inpage) {
-    if (!inpage || inpage.dataset.dragInit === 'true') return;
-    inpage.dataset.dragInit = 'true';
-
-    // 还原历史记录的垂直高度位置
-    try {
-      const savedBottom = localStorage.getItem('ST_THIEF_INPAGE_BOTTOM');
-      if (savedBottom !== null && !isNaN(parseFloat(savedBottom))) {
-        inpage.style.bottom = `${Math.max(0, parseFloat(savedBottom))}px`;
-      }
-    } catch (e) {}
-
-    let isDragging = false;
-    let startY = 0;
-    let origBottom = 0;
-    let dragPointerId = null;
-    let lastHandleTap = 0;
-
-    function onPointerDown(e) {
-      const target = e.target;
-      const isHandle = target && (target.id === 'tb-drag-handle' || target.classList?.contains('tb-drag-handle'));
-      const isReadingRow = target && target.classList?.contains('tb-row-reading');
-      const isSectionLeft = target && target.classList?.contains('tb-section-left');
-      if (!isHandle && !isReadingRow && !isSectionLeft) return;
-
-      if (e.button !== 0) return;
-      dragPointerId = e.pointerId;
-      try {
-        target.setPointerCapture(e.pointerId);
-      } catch (err) {}
-
-      isDragging = false;
-      startY = e.clientY;
-      origBottom = parseFloat(inpage.style.bottom) || 0;
-      e.preventDefault();
-    }
-
-    function onPointerMove(e) {
-      if (dragPointerId !== e.pointerId) return;
-      const dy = startY - e.clientY; // 向上拖动 clientY 变小，dy 为正，bottom 应增大
-      if (!isDragging && Math.abs(dy) > 5) {
-        isDragging = true;
-        inpage.style.transition = 'none';
-      }
-
-      if (isDragging) {
-        const topWin = getSafeTopWin();
-        const maxBottom = Math.max(0, (topWin.innerHeight || 600) - 50);
-        const newBottom = Math.max(0, Math.min(origBottom + dy, maxBottom));
-        inpage.style.bottom = `${newBottom}px`;
-      }
-    }
-
-    function onPointerUp(e) {
-      if (dragPointerId !== e.pointerId) return;
-      const target = e.target;
-      try {
-        target.releasePointerCapture(e.pointerId);
-      } catch (err) {}
-      dragPointerId = null;
-      inpage.style.transition = 'bottom 0.2s cubic-bezier(0.2, 0, 0, 1), opacity 0.15s ease';
-
-      if (isDragging) {
-        isDragging = false;
-        try {
-          const curBottom = parseFloat(inpage.style.bottom) || 0;
-          localStorage.setItem('ST_THIEF_INPAGE_BOTTOM', curBottom.toString());
-        } catch (err) {}
-        return;
-      }
-
-      isDragging = false;
-      // 双击/双触拖拽手柄 ⠿ 一键贴底复位
-      const isHandle = target && (target.id === 'tb-drag-handle' || target.classList?.contains('tb-drag-handle'));
-      if (isHandle) {
-        const now = Date.now();
-        if (now - lastHandleTap < 350) {
-          lastHandleTap = 0;
-          inpage.style.bottom = 'max(0px, env(safe-area-inset-bottom, 0px))';
-          try {
-            localStorage.removeItem('ST_THIEF_INPAGE_BOTTOM');
-          } catch (err) {}
-          flashStatusHint('摸鱼条已贴底复位');
-          return;
-        }
-        lastHandleTap = now;
-      }
-    }
-
-    inpage.addEventListener('pointerdown', onPointerDown);
-    inpage.addEventListener('pointermove', onPointerMove);
-    inpage.addEventListener('pointerup', onPointerUp);
-    inpage.addEventListener('pointercancel', onPointerUp);
-  }
-
-  function updateInpageFloatingPosition() {
-    if (!STATE.isHostInpage || !STATE.inpageContainer) return;
-    try {
-      const topWin = getSafeTopWin();
-      const vp = topWin.visualViewport;
-      if (vp) {
-        // 手机端软键盘弹起时，自适应升至软键盘上方，不遮挡不丢失
-        const keyboardHeight = Math.max(0, topWin.innerHeight - (vp.offsetTop + vp.height));
-        const savedBottom = parseFloat(localStorage.getItem('ST_THIEF_INPAGE_BOTTOM') || '0') || 0;
-        const totalBottom = savedBottom + keyboardHeight;
-        STATE.inpageContainer.style.bottom = `${totalBottom}px`;
-      }
-    } catch (e) {}
-  }
-
-  function openInpageThiefBar() {
-    const topDoc = getSafeTopDoc();
-    let inpage = topDoc.getElementById('st-thief-inpage-container');
-    if (!inpage) {
-      inpage = topDoc.createElement('div');
-      inpage.id = 'st-thief-inpage-container';
-      topDoc.body.appendChild(inpage);
-    }
-
-    inpage.style.display = 'block';
-    STATE.isHostInpage = true;
-    STATE.inpageContainer = inpage;
-
-    // 虚拟 window 适配器，衔接 renderThiefBar
-    STATE.thiefWindow = {
-      document: topDoc,
-      closed: false,
-      isHostInpage: true,
-      focus: () => {
-        if (STATE.inpageContainer) STATE.inpageContainer.style.display = 'block';
-      },
-      close: () => {
-        closeThiefBar();
-      },
-      resizeTo: () => {}
-    };
-
-    setupInpageDraggable(inpage);
-    updateInpageFloatingPosition();
-    renderThiefBar();
-
-    // 唤起时保持临时可见高亮，防止隐私模式下立即变为完全透明看不到
-    if (inpage) {
-      inpage.classList.add('tb-privacy-active');
-      setTimeout(() => {
-        const isInteracting = STATE.isContextMenuOpen || STATE.isSettingsOpen || STATE.isFloorPickerOpen || (topDoc.activeElement && topDoc.activeElement.tagName === 'INPUT');
-        if (!isInteracting && STATE.inpageContainer) {
-          STATE.inpageContainer.classList.remove('tb-privacy-active');
-        }
-      }, 3500);
-    }
-
-    flashStatusHint('摸鱼状态栏已展开 (轻触文字阅读，可拖拽调节高度)');
-  }
-
-  async function openThiefBar() {
-    if (STATE.isHostInpage && STATE.inpageContainer && STATE.inpageContainer.style.display !== 'none') {
-      return;
-    }
-    if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isHostInpage) {
-      try { STATE.thiefWindow.focus(); } catch (e) {}
-      return;
-    }
-
-    refreshLatestMessage(false);
-
-    // 1. 移动端/小屏环境检测：优先使用页内原生悬浮条，彻底解决手机端看不见与弹窗被拦问题
-    if (isMobileDevice()) {
-      openInpageThiefBar();
-      return;
-    }
-
-    const baseH = CONFIG.minimalMode
-      ? (CONFIG.layoutMode === 'double' ? 56 : 30)
-      : (CONFIG.layoutMode === 'double' ? CONFIG.doubleHeight : CONFIG.singleHeight);
-    const winHeight = baseH;
-
-    // 2. 桌面端优先支持画中画 (Picture-in-Picture)
-    if ('documentPictureInPicture' in window) {
-      try {
-        const pipWin = await window.documentPictureInPicture.requestWindow({
-          width: CONFIG.barWidth,
-          height: winHeight
-        });
-
-        STATE.isHostInpage = false;
-        STATE.thiefWindow = pipWin;
-        pipWin.addEventListener('unload', () => {
-          STATE.thiefWindow = null;
-        });
-        pipWin.addEventListener('pagehide', () => {
-          STATE.thiefWindow = null;
-        });
-        pipWin.addEventListener('resize', () => {
-          if (pipWin.innerWidth && pipWin.innerWidth >= 360 && pipWin.innerWidth !== CONFIG.barWidth) {
-            CONFIG.barWidth = pipWin.innerWidth;
-            saveCurrentConfig();
-            syncToDesktop();
-          }
-        });
-
-        renderThiefBar();
-        return;
-      } catch (err) {
-        console.warn('[ST-Thief-Book] Document Picture-in-Picture 启动失败，降级使用页内原生悬浮条:', err);
-      }
-    }
-
-    // 3. 终极自适应保底：若不支持画中画或启动失败，直接开启页内原生悬浮窗 (稳定可靠，绝不被弹窗拦截器阻拦)
-    openInpageThiefBar();
-  }
-
-  function toggleThiefBar() {
-    if (STATE.isHostInpage && STATE.inpageContainer && STATE.inpageContainer.style.display !== 'none') {
-      closeThiefBar();
-    } else if (STATE.thiefWindow && !STATE.thiefWindow.closed && !STATE.isHostInpage) {
-      closeThiefBar();
-    } else {
-      openThiefBar();
-    }
-  }
-
-  function closeThiefBar() {
-    if (STATE.isHostInpage && STATE.inpageContainer) {
-      STATE.inpageContainer.style.display = 'none';
-      STATE.isHostInpage = false;
-      STATE.thiefWindow = null;
-    } else if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-      try {
-        STATE.thiefWindow.close();
-      } catch (e) {}
-      STATE.thiefWindow = null;
     }
   }
 
@@ -3818,23 +1610,21 @@
   }
 
   function toggleDesktopSync(forcedState) {
-    STATE.isContextMenuOpen = false;
     const target = typeof forcedState === 'boolean' ? forcedState : !CONFIG.enableDesktopSync;
     CONFIG.enableDesktopSync = target;
     saveCurrentConfig();
 
     if (CONFIG.enableDesktopSync) {
-      flashStatusHint('🖥️ 已手动开启桌面同步，正在连接 127.0.0.1:18899...');
+      flashStatusHint('🖥️ 已开启桌面同步，正在连接 127.0.0.1:18899...');
       initDesktopBridge(true);
     } else {
       stopDesktopBridge();
-      flashStatusHint('⚪ 已关闭桌面同步 (纯网页模式)');
+      flashStatusHint('⚪ 已关闭桌面同步 (桌面摸鱼条将停止接收消息)');
     }
-    renderThiefBar();
   }
 
   function initDesktopBridge(isManual = false) {
-    // 关键守卫：如果未手动开启桌面端同步，绝不发起任何 WebSocket 连接与重连！
+    // 关键守卫：用户显式关闭桌面同步后，绝不发起任何 WebSocket 连接与重连
     if (!CONFIG.enableDesktopSync) {
       stopDesktopBridge();
       return;
@@ -3864,7 +1654,6 @@
         try {
           ws.send(JSON.stringify({ action: 'hello', token: CONFIG.bridgeToken }));
         } catch (e) {}
-        renderThiefBar();
       };
 
       ws.onmessage = e => {
@@ -3874,7 +1663,6 @@
             STATE.wsAuthenticated = true;
             console.log('[ST-Thief-Book] 桌面端桥接认证成功');
             flashStatusHint('🟢 桌面端认证成功，同步已开启');
-            renderThiefBar();
             syncToDesktop();
             return;
           }
@@ -3902,11 +1690,6 @@
           else if (data.action === 'set_window_width' && typeof data.barWidth === 'number') {
             CONFIG.barWidth = data.barWidth;
             saveCurrentConfig();
-            if (STATE.thiefWindow && !STATE.thiefWindow.closed) {
-              try {
-                STATE.thiefWindow.resizeTo(CONFIG.barWidth, STATE.thiefWindow.outerHeight || 74);
-              } catch (e) {}
-            }
           }
           else if (data.action === 'update_config' && data.config) {
             if (typeof data.config.showUserMessages === 'boolean') CONFIG.showUserMessages = data.config.showUserMessages;
@@ -3936,7 +1719,6 @@
         STATE.wsClient = null;
         STATE.wsConnecting = false;
         STATE.wsAuthenticated = false;
-        renderThiefBar();
 
         // 只有当用户依然开启了桌面同步时，才温和安排重连，若未开启则完全静默
         if (CONFIG.enableDesktopSync) {
@@ -4010,12 +1792,12 @@
     if (typeof replaceScriptButtons === 'function') {
       try {
         replaceScriptButtons([
-          { name: '📖 Thief摸鱼条', visible: true },
+          { name: '⚙️ Thief设置', visible: true },
           { name: '🕶️ 老板键', visible: true }
         ]);
 
         if (typeof getButtonEvent === 'function') {
-          eventOn(getButtonEvent('📖 Thief摸鱼条'), () => toggleThiefBar());
+          eventOn(getButtonEvent('⚙️ Thief设置'), () => openSettingsModal());
           eventOn(getButtonEvent('🕶️ 老板键'), () => toggleBossKey());
         }
       } catch (e) {}
@@ -4038,7 +1820,6 @@
 
       eventOn(tavern_events.GENERATION_STARTED, () => {
         STATE.isGenerating = true;
-        renderThiefBar();
         syncToDesktop();
       });
 
@@ -4086,7 +1867,6 @@
                   } else {
                     STATE.sentences = splitIntoSentences(clean);
                   }
-                  renderThiefBar();
                   syncToDesktop();
                 }
               }
@@ -4104,32 +1884,20 @@
     console.log('[ST-Thief-Book] 插件正在初始化...');
     loadSavedConfig();
     initTavernEvents();
-    ensureSillyTavernEntrance();
     setupHostGlobalShortcuts();
     initDesktopBridge();
     refreshLatestMessage(false);
-    console.log('[ST-Thief-Book] 初始化完成！已在主界面右下角注入悬浮按钮。');
+    console.log('[ST-Thief-Book] 初始化完成！无界面桥接后端就绪，阅读请使用桌面摸鱼条 (start_desktop.bat)。');
   }
 
-  // 脚本被禁用/重载时（Tavern Helper 销毁本 iframe）清理宿主侧残留，避免死按钮与泄漏的监听器
+  // 脚本被禁用/重载时（Tavern Helper 销毁本 iframe）清理宿主侧残留，避免泄漏的监听器
   window.addEventListener('unload', () => {
-    if (entranceRetryTimer) clearTimeout(entranceRetryTimer);
-    if (entranceObserver) {
-      entranceObserver.disconnect();
-      entranceObserver = null;
-    }
-    if (entranceViewportCleanup) {
-      entranceViewportCleanup();
-      entranceViewportCleanup = null;
-    }
+    stopDesktopBridge();
     try {
       const topDoc = getSafeTopDoc();
-      if (topDoc) {
-        topDoc.getElementById('st-thief-floating-btn')?.remove();
-        if (topDoc._tbHostKeydownHandler) {
-          topDoc.removeEventListener('keydown', topDoc._tbHostKeydownHandler);
-          topDoc._tbHostKeydownHandler = null;
-        }
+      if (topDoc && topDoc._tbHostKeydownHandler) {
+        topDoc.removeEventListener('keydown', topDoc._tbHostKeydownHandler);
+        topDoc._tbHostKeydownHandler = null;
       }
     } catch (e) {}
   });
@@ -4137,8 +1905,6 @@
   setTimeout(init, 500);
 
   window.STThiefBook = {
-    open: openThiefBar,
-    toggle: toggleThiefBar,
     boss: toggleBossKey,
     next: nextSentence,
     prev: prevSentence,
@@ -4147,15 +1913,12 @@
     stop: stopGeneration,
     toggleLayout: toggleLayoutMode,
     toggleFilter: toggleFilterMode,
-    toggleFloorPicker: toggleFloorPicker,
     jumpFloor: jumpToMessageFloor,
     toggleUserMessages: toggleShowUserMessages,
     toggleCharMode: toggleCharNameMode,
     toggleWrap: toggleWrapMode,
     toggleMinimal: toggleMinimalMode,
     togglePrivacy: togglePrivacyMode,
-    openMenu: openContextMenu,
-    closeMenu: closeContextMenu,
     openSettings: openSettingsModal,
     toggleDesktopSync: toggleDesktopSync,
     connectDesktop: () => toggleDesktopSync(true),
