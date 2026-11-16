@@ -633,7 +633,7 @@
     }
   }
 
-  function jumpToMessageFloor(targetFloor) {
+  function jumpToMessageFloor(targetFloor, sentenceIdx) {
     try {
       const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : 0;
       let targetId = parseInt(targetFloor, 10);
@@ -659,7 +659,9 @@
 
       const cleanText = filterThinkingAndTags(rawText, targetId);
       STATE.sentences = splitIntoSentences(cleanText);
-      STATE.currentSentenceIndex = 0;
+      // 可选句序（1 起）：桌面端重启恢复阅读位置时传入；缺省回第一句
+      const idx = parseInt(sentenceIdx, 10);
+      STATE.currentSentenceIndex = isNaN(idx) ? 0 : Math.max(0, Math.min(STATE.sentences.length - 1, idx - 1));
       STATE.isFloorPickerOpen = false;
 
       renderThiefBar();
@@ -3890,6 +3892,7 @@
           else if (data.action === 'reply') submitReply(data.text);
           else if (data.action === 'open_settings') openSettingsModal();
           else if (data.action === 'jump_floor') jumpToMessageFloor(data.floor);
+          else if (data.action === 'resume') jumpToMessageFloor(data.floor, data.curIdx);
           else if (data.action === 'change_floor') changeMessageFloor(data.delta || 1);
           else if (data.action === 'toggle_user_messages') toggleShowUserMessages();
           else if (data.action === 'toggle_char_mode') toggleCharNameMode();

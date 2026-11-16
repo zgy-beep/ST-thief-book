@@ -71,10 +71,11 @@ def _enable_dpi_awareness():
 # 零依赖轻量 RFC 6455 WebSocket 服务端实现
 # ------------------------------------------------------------------------------------
 class SimpleWebSocketServer:
-    def __init__(self, host, port, on_message_callback, token='', allowed_origins=None):
+    def __init__(self, host, port, on_message_callback, token='', allowed_origins=None, on_auth_callback=None):
         self.host = host
         self.port = port
         self.on_message = on_message_callback
+        self.on_auth = on_auth_callback
         self.token = token
         self.allowed_origins = self._normalize_origins(allowed_origins or [])
         self.clients = {}  # sock -> {'authed': bool, 'queue': queue.Queue}；发送统一走队列，避免慢客户端拖住广播
@@ -278,6 +279,11 @@ class SimpleWebSocketServer:
                                 self._send_json(sock, {'action': 'hello_ok'})
                                 threading.Thread(target=self._client_sender, args=(sock,), daemon=True).start()
                                 print("[WebSocket Server] 酒馆助手前端认证成功！", flush=True)
+                                if self.on_auth:
+                                    try:
+                                        self.on_auth()
+                                    except Exception:
+                                        pass
                             else:
                                 self._send_json(sock, {'action': 'hello_fail'})
                                 print("[WebSocket Server] hello 认证失败，断开连接", flush=True)
@@ -412,6 +418,10 @@ class ThiefDesktopBar:
         self._pages_ready = False
         self._hovering = False
         self._auto_read_job = None
+        self._pos_save_job = None
+        self._resume_floor = None
+        self._resume_offset = None
+        self._synced_once = False
         self.config = {
             'charNameMode': 'compact',
             'wrapMode': 'wrap',
@@ -443,6 +453,7 @@ class ThiefDesktopBar:
             self.config_file = os.path.join(os.path.expanduser("~"), ".st_thief_bar_config.json")
         self._load_config()
         self._load_or_create_bridge_token()
+        self._resume_pos = self._load_position()
 
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
@@ -470,7 +481,8 @@ class ThiefDesktopBar:
 
         self.server = SimpleWebSocketServer(
             WS_HOST, WS_PORT, self._on_ws_message, token=self.bridge_token,
-            allowed_origins=self.config.get('allowedOrigins', [])
+            allowed_origins=self.config.get('allowedOrigins', []),
+            on_auth_callback=self._on_ws_authed
         )
         self.server.start()
         if self.server.allowed_origins:
@@ -564,6 +576,62 @@ class ThiefDesktopBar:
                 self.config_file = home_cfg
             except Exception as err:
                 print(f"[Save Config Error]: {err}", flush=True)
+
+    # ---------------- 阅读位置记忆 ----------------
+    @staticmethod
+    def _validate_position(data):
+        if not isinstance(data, dict):
+            return None
+        f, c, o = data.get('floor'), data.get('curIdx'), data.get('pageOffset')
+        for v, lo, hi in ((f, 0, 100000), (c, 1, 100000), (o, 0, 10000000)):
+            if isinstance(v, bool) or not isinstance(v, int) or not (lo <= v <= hi):
+                return None
+        return {'floor': f, 'curIdx': c, 'pageOffset': o}
+
+    def _position_file(self):
+        return os.path.join(os.path.dirname(self.config_file), 'thief_bar_position.json')
+
+    def _load_position(self):
+        try:
+            with open(self._position_file(), 'r', encoding='utf-8') as f:
+                return self._validate_position(json.load(f))
+        except Exception:
+            return None
+
+    def _schedule_position_save(self):
+        job = getattr(self, '_pos_save_job', None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._pos_save_job = self.root.after(1500, self._save_position_now)
+
+    def _save_position_now(self):
+        self._pos_save_job = None
+        # 首次同步前是空白初始状态，保存会覆盖掉待恢复的位置
+        if not getattr(self, '_synced_once', False):
+            return
+        pos = {'floor': self.floor, 'curIdx': self.cur_idx, 'pageOffset': self._page_start_offset()}
+        if pos == getattr(self, '_resume_pos', None):
+            return
+        self._resume_pos = pos
+        try:
+            self._atomic_write_json(self._position_file(), pos)
+        except Exception:
+            pass
+
+    def _on_ws_authed(self):
+        # WS 客户端线程回调：只做向 GUI 线程的 marshaling
+        self.root.after(0, self._request_resume)
+
+    def _request_resume(self):
+        pos = getattr(self, '_resume_pos', None)
+        if not pos:
+            return
+        self._resume_floor = pos['floor']
+        self._resume_offset = pos['pageOffset']
+        self.server.broadcast({'action': 'resume', 'floor': pos['floor'], 'curIdx': pos['curIdx']})
 
     def _setup_ui(self):
         self.container = tk.Frame(self.root, bg=self.theme['bg'])
@@ -2302,6 +2370,12 @@ class ThiefDesktopBar:
                 sent_off = data.get('sentenceOffset')
                 if nav_changed and isinstance(sent_off, (int, float)) and sent_off >= 0 and self.config.get('pagedReading', True):
                     self._pending_sentence_offset = int(sent_off)
+                # 重启恢复：用保存的屏偏移覆盖句首偏移（仅一次，楼层须匹配）
+                if getattr(self, '_resume_offset', None) is not None:
+                    if new_floor == self._resume_floor:
+                        self._pending_sentence_offset = self._resume_offset
+                    self._resume_floor = None
+                    self._resume_offset = None
                 self.char_name = data.get('charName', 'AI')
                 self.user_name = data.get('userName', 'User')
                 self.floor = new_floor
@@ -2325,6 +2399,7 @@ class ThiefDesktopBar:
                     if (old_min != self.config.get('minimalMode') or
                         old_layout != self.config.get('layoutMode')):
                         self.root.after(0, self._apply_layout_and_mode)
+                self._synced_once = True
                 self.root.after(0, self._update_display)
         except Exception as e:
             print(f"[UI Sync Error]: {e}")
@@ -2427,6 +2502,7 @@ class ThiefDesktopBar:
 
         self.lbl_prefix.configure(text=" >")
         self._update_geometry_and_wrap()
+        self._schedule_position_save()
 
     def _pid_file_path(self):
         return os.path.join(os.path.dirname(self.config_file), PID_FILENAME)

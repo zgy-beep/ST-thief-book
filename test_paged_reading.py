@@ -226,6 +226,19 @@ def main():
     passed += 1
     print("[PASS] 自动阅读暂停判定")
 
+    # 25. 阅读位置校验：合法通过，缺键/越界/bool/非字典拒绝
+    vp = ThiefDesktopBar._validate_position
+    assert vp({'floor': 3, 'curIdx': 2, 'pageOffset': 40}) == {'floor': 3, 'curIdx': 2, 'pageOffset': 40}
+    assert vp({'floor': 0, 'curIdx': 1, 'pageOffset': 0}) is not None
+    assert vp({'floor': 3, 'curIdx': 2}) is None
+    assert vp({'floor': -1, 'curIdx': 2, 'pageOffset': 0}) is None
+    assert vp({'floor': 3, 'curIdx': 0, 'pageOffset': 0}) is None
+    assert vp({'floor': True, 'curIdx': 2, 'pageOffset': 0}) is None
+    assert vp({'floor': 3, 'curIdx': 2, 'pageOffset': -5}) is None
+    assert vp(None) is None and vp('x') is None
+    passed += 1
+    print("[PASS] 阅读位置校验")
+
     print(f"\n全部 {passed} 项测试通过")
 
 
