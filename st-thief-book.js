@@ -31,8 +31,8 @@
   // 配置与状态管理
   // ------------------------------------------------------------------------------------
   const CONFIG = {
-    // 是否启用本地 Python 桌面端 (WebSocket) 同步 (默认 true：桌面端是唯一阅读 UI，未启动时静默重试)
-    enableDesktopSync: true,
+    // 是否启用本地 Python 桌面端 (WebSocket) 同步 (默认 false：浏览器对失败连接必报控制台错误，纯网页用户零报错；用桌面端时在设置手动开启，之后自动连接/重连)
+    enableDesktopSync: false,
     // 布局模式: 'double' (双行边看边回) | 'single' (32px极窄单行)
     layoutMode: 'double',
     // 文本过滤模式: 'pure' (纯净模式：绝不引入美化HTML，剥离思考块与标签) | 'regex' (正则清洗模式)
@@ -1304,7 +1304,7 @@
                      placeholder="桌面端右键菜单 → 复制桥接密钥，粘贴到此处"
                      style="flex:1; background:#1e1e1e; color:#cccccc; border:1px solid #3c3c3c; border-radius:3px; padding:4px 8px; font-size:12px; font-family:Consolas,monospace;" />
             </div>
-            <div class="st-thief-hint">网页端仅负责过滤与桥接，阅读界面为本地桌面摸鱼条 (start_desktop.bat)。首次同步需填入桌面端桥接密钥完成配对。</div>
+            <div class="st-thief-hint">桌面同步默认关闭，纯网页使用零报错；使用桌面摸鱼条 (start_desktop.bat) 时勾选启用并填入桥接密钥完成配对，之后自动连接/重连。</div>
           </div>
         </div>
 
@@ -1440,7 +1440,7 @@
       const barW = modal.querySelector('#setting-barwidth');
       if (barW) barW.value = '840';
       const deskSync = modal.querySelector('#setting-enable-desktopsync');
-      if (deskSync) deskSync.checked = true;
+      if (deskSync) deskSync.checked = false;
       const bridgeToken = modal.querySelector('#setting-bridge-token');
       if (bridgeToken) bridgeToken.value = '';
       syncCurrentChips();
