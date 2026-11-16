@@ -175,6 +175,29 @@ def main():
     passed += 1
     print("[PASS] 渲染当前页与 _stream 回退")
 
+    # 21. 进度指示：多屏时追加 屏x/y，单屏/关闭分屏只显示句号
+    bar.cur_idx = 3
+    bar.total_sentences = 84
+    bar._pages = [(0, 4), (4, 8), (8, 12), (12, 16), (16, 20)]
+    bar._page_idx = 1
+    bar.config['pagedReading'] = True
+    assert bar._progress_text() == '3/84 屏2/5'
+    bar._pages = [(0, 20)]
+    assert bar._progress_text() == '3/84'
+    bar._pages = [(0, 4), (4, 20)]
+    bar.config['pagedReading'] = False
+    assert bar._progress_text() == '3/84'
+    passed += 1
+    print("[PASS] 进度指示：屏x/y 显隐")
+
+    # 22. 进度指示：页码越界钳制
+    bar.config['pagedReading'] = True
+    bar._pages = [(0, 4), (4, 20)]
+    bar._page_idx = 99
+    assert bar._progress_text() == '3/84 屏2/2'
+    passed += 1
+    print("[PASS] 进度指示：越界钳制")
+
     print(f"\n全部 {passed} 项测试通过")
 
 

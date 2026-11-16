@@ -831,6 +831,14 @@ class ThiefDesktopBar:
     def _has_prev_pages(self):
         return bool(getattr(self, '_pages', None)) and self._page_idx > 0
 
+    def _progress_text(self):
+        base = f"{self.cur_idx}/{self.total_sentences}"
+        pages = getattr(self, '_pages', None) or []
+        if self.config.get('pagedReading', True) and len(pages) > 1:
+            idx = max(0, min(self._page_idx, len(pages) - 1))
+            return f"{base} 屏{idx + 1}/{len(pages)}"
+        return base
+
     def toggle_paged_reading(self):
         self.config['pagedReading'] = not self.config.get('pagedReading', True)
         self._save_config()
@@ -2322,7 +2330,7 @@ class ThiefDesktopBar:
         else:
             self.lbl_text.configure(text=self._truncate_to_width(stream, avail_w), wraplength=0, justify=tk.LEFT)
 
-        self.lbl_right_info.configure(text=f"{self.cur_idx}/{self.total_sentences}")
+        self.lbl_right_info.configure(text=self._progress_text())
 
         self.lbl_prefix.configure(text=" >")
         self._update_geometry_and_wrap()
