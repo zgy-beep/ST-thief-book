@@ -11,6 +11,7 @@ const steps = [
   ['Python 语法检查', 'python -m py_compile thief_desktop_bar.py bar_hotkey_helper.py', pyEnv],
   ['过滤引擎单测', `"${process.execPath}" test_filter_engine.mjs`, {}],
   ['桌面配置/密钥单测', 'python test_desktop_config.py', pyEnv],
+  ['分屏阅读单测', 'python test_paged_reading.py', pyEnv],
   ['WS 认证实测', 'python test_ws_auth.py', pyEnv],
 ];
 

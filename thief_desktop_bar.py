@@ -760,6 +760,19 @@ class ThiefDesktopBar:
     def _stream(self):
         return getattr(self, 'stream_text', '') or self.current_sentence
 
+    @staticmethod
+    def _accumulate_stream(parts, prev_floor, new_floor, cur_i, sentence):
+        """旧版单句载荷拼段：换楼层/回到首句重新开始；同句刷新文本，新句按序插入。
+        返回 (parts, 当前句在整段中的字符偏移)。"""
+        if new_floor != prev_floor or cur_i <= 1 or not parts:
+            parts = [(cur_i, sentence)]
+        elif any(k == cur_i for k, _ in parts):
+            parts = [(k, sentence if k == cur_i else seg) for k, seg in parts]
+        else:
+            parts = sorted(parts + [(cur_i, sentence)], key=lambda kv: kv[0])
+        offset = sum(len(seg) for k, seg in parts if k < cur_i)
+        return parts, offset
+
     def _compute_pages(self, text, width):
         """把整条消息切成若干屏：先尽量填满宽度；本屏内若有句末标点就自然断在那儿
         （所以自然分段的一屏可以不填满）；没有标点就按宽度硬切，断点始终跟着条宽走。"""
@@ -2172,18 +2185,13 @@ class ThiefDesktopBar:
                     prev_floor = getattr(self, '_stream_floor', None)
                     parts = getattr(self, '_stream_parts', None) or []
                     cur_i = new_cur if isinstance(new_cur, int) else 1
-                    if new_floor != prev_floor or cur_i <= 1 or not parts:
-                        parts = [(cur_i, new_sentence)]
-                    elif not any(k == cur_i for k, _ in parts):
-                        parts.append((cur_i, new_sentence))
-                        parts.sort(key=lambda kv: kv[0])
+                    parts, offset = self._accumulate_stream(parts, prev_floor, new_floor, cur_i, new_sentence)
                     self._stream_floor = new_floor
                     self._stream_parts = parts
                     joined = ''.join(seg for _, seg in parts)
                     if joined != getattr(self, 'stream_text', None):
                         self.stream_text = joined
-                        base = len(joined) - len(new_sentence)
-                        self._pending_sentence_offset = max(0, base)
+                    self._pending_sentence_offset = offset
                 sent_off = data.get('sentenceOffset')
                 if isinstance(sent_off, (int, float)) and sent_off >= 0 and self.config.get('pagedReading', True):
                     self._pending_sentence_offset = int(sent_off)
