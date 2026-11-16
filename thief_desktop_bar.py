@@ -41,10 +41,15 @@ import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import simpledialog
 import re
+import bisect
 from urllib.parse import urlparse
 
 WS_HOST = '127.0.0.1'
 WS_PORT = 18899
+# 流式跑马灯：每 60ms 向左移动 2px，到尾部停 1.2s 再从头开始
+MARQUEE_STEP_PX = 3
+MARQUEE_INTERVAL_MS = 50
+MARQUEE_END_HOLD_MS = 900
 MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 WS_MAX_PAYLOAD = 1024 * 1024
 WS_HANDSHAKE_LIMIT = 8192
@@ -407,6 +412,15 @@ class ThiefDesktopBar:
         self.is_generating = False
         self._sub_chunks = []
         self._sub_chunk_idx = 0
+        self.stream_text = ''
+        self._pending_sentence_offset = None
+        self._anim_job = None
+        self._pages = []
+        self._page_idx = 0
+        self._pages_ready = False
+        self._hovering = False
+        self._avail_px = 0
+        self._text_total_px = 0
         self.config = {
             'charNameMode': 'compact',
             'wrapMode': 'wrap',
@@ -423,7 +437,8 @@ class ThiefDesktopBar:
             ],
             'showUserMessages': False,
             'filterActions': False,
-            'filterMode': 'pure'
+            'filterMode': 'pure',
+            'marquee': True
         }
 
         self.width = 860
@@ -484,7 +499,7 @@ class ThiefDesktopBar:
                             self.theme = self.THEMES[self.theme_name]
                         for k in ['minimalMode', 'layoutMode', 'charNameMode', 'wrapMode',
                                   'showUserMessages', 'enableWhitelist', 'tagWhitelist', 'tagBlacklist',
-                                  'filterActions', 'filterMode', 'allowedOrigins']:
+                                  'filterActions', 'filterMode', 'allowedOrigins', 'marquee']:
                             if k in saved:
                                 self.config[k] = saved[k]
         except Exception as e:
@@ -535,7 +550,8 @@ class ThiefDesktopBar:
             'tagBlacklist': self.config.get('tagBlacklist', []),
             'filterActions': self.config.get('filterActions', False),
             'filterMode': self.config.get('filterMode', 'pure'),
-            'allowedOrigins': self.config.get('allowedOrigins', [])
+            'allowedOrigins': self.config.get('allowedOrigins', []),
+            'marquee': self.config.get('marquee', True)
         }
         try:
             self._atomic_write_json(self.config_file, data)
@@ -716,59 +732,128 @@ class ThiefDesktopBar:
 
         self._update_geometry_and_wrap()
 
-    def _paginate_sentence(self, text, max_px_width):
-        """
-        单行顺延切片引擎：
-        在高度固定、单行不折行的前提下，将超过当前单行可视像素宽度的文字切分成子行，
-        在阅读翻句（'下一行'）时无缝逐段显示，绝不裁剪丢字，绝不扩展高度。
-        """
-        if not text:
-            return [""]
-        if max_px_width <= 80:
-            max_px_width = 80
+    def _apply_narrow_chrome(self):
+        """标准模式条很窄时，把分支名和角色名收起来，宽度让给正文；拉宽后自动还原。"""
+        if self.config.get('minimalMode', False):
+            return
+        narrow = self.width < 560
+        try:
+            if narrow:
+                if self.lbl_branch.winfo_manager():
+                    self.lbl_branch.pack_forget()
+                if self.lbl_char.winfo_manager():
+                    self.lbl_char.pack_forget()
+            else:
+                if not self.lbl_branch.winfo_manager():
+                    self.lbl_branch.pack(side=tk.LEFT, before=self.floor_frame)
+                if not self.lbl_char.winfo_manager():
+                    self.lbl_char.pack(side=tk.LEFT, padx=(0, 6), before=self.lbl_text)
+        except Exception:
+            pass
 
-        # 若整句像素小于等于单行可用宽度，直接单行完整显示
-        if self.font_main.measure(text) <= max_px_width:
-            return [text]
+    def _text_width_px(self):
+        """正文一行能用的像素宽度：极简模式整条可用，标准模式扣掉左右装饰件的实际宽度。"""
+        if self.config.get('minimalMode', False):
+            return max(80, int(self.width - 24))
 
-        lines = []
-        remaining = text
-        break_puncts = set("，,、 ；;。！？!?—~～…\n")
+        def _req(widget):
+            try:
+                return widget.winfo_reqwidth() if widget.winfo_manager() else 0
+            except Exception:
+                return 0
+        pad = _req(self.left_frame) + _req(self.right_frame) + _req(self.lbl_char) + 24
+        return max(80, int(self.width - pad))
 
-        while remaining:
-            if self.font_main.measure(remaining) <= max_px_width:
-                lines.append(remaining)
-                break
+    # ---------------- 分页（整句优先，超宽按条宽硬切） ----------------
+    STRONG_BREAKS = set("。！？!?…；\n")
+    TRAILING_PUNCT = set("。！？!?…；\n，,、；;：:\"'”』」）)")
 
-            # 二分查找当前单行可用像素内最多能容纳的字符数
-            low = 1
-            high = len(remaining)
-            best = 1
-            while low <= high:
-                mid = (low + high) // 2
-                if self.font_main.measure(remaining[:mid]) <= max_px_width:
+    def _stream(self):
+        return getattr(self, 'stream_text', '') or self.current_sentence
+
+    def _compute_pages(self, text, width):
+        """把整条消息切成若干屏：先尽量填满宽度；本屏内若有句末标点就自然断在那儿
+        （所以自然分段的一屏可以不填满）；没有标点就按宽度硬切，断点始终跟着条宽走。"""
+        pages = []
+        n = len(text)
+        if n == 0:
+            return [(0, 0)]
+        i = 0
+        while i < n:
+            lo, hi, best = 1, n - i, 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if self.font_main.measure(text[i:i + mid]) <= width:
                     best = mid
-                    low = mid + 1
+                    lo = mid + 1
                 else:
-                    high = mid - 1
+                    hi = mid - 1
+            end = i + best
+            if end < n:
+                # ① 本屏内有句末标点 -> 断在句末（自然分段，不必填满）
+                cut = -1
+                for pos in range(end, i, -1):
+                    if text[pos - 1] in self.STRONG_BREAKS:
+                        cut = pos
+                        break
+                if cut > 0:
+                    end = cut
+                elif text[end] in self.TRAILING_PUNCT:
+                    end += 1          # ② 没有句末标点 -> 按条宽硬切，紧跟的标点留在本页
+            pages.append((i, end))
+            i = end
+        return pages
 
-            # 优先在末尾附近的标点符号处断开，使阅读体验更自然
-            break_pos = best
-            lookback_limit = max(1, best - 8)
-            for pos in range(best, lookback_limit - 1, -1):
-                if remaining[pos - 1] in break_puncts:
-                    break_pos = pos
-                    break
+    def _page_start_offset(self):
+        if not getattr(self, '_pages', None):
+            return 0
+        idx = max(0, min(self._page_idx, len(self._pages) - 1))
+        return self._pages[idx][0]
 
-            chunk = remaining[:break_pos].strip()
-            if not chunk:
-                chunk = remaining[:best]
-                break_pos = best
+    def _page_index_for_offset(self, offset):
+        pages = getattr(self, '_pages', None) or [(0, 0)]
+        for i, (a, b) in enumerate(pages):
+            if a <= offset < max(b, a + 1):
+                return i
+        return len(pages) - 1
 
-            lines.append(chunk)
-            remaining = remaining[break_pos:].strip()
+    def _render_page(self):
+        text = self._stream()
+        pages = getattr(self, '_pages', None) or [(0, len(text))]
+        a, b = pages[max(0, min(self._page_idx, len(pages) - 1))]
+        self.lbl_text.configure(text=text[a:b], wraplength=0, justify=tk.LEFT)
 
-        return lines if lines else [text]
+    def _has_more_pages(self):
+        return bool(getattr(self, '_pages', None)) and self._page_idx < len(self._pages) - 1
+
+    def _has_prev_pages(self):
+        return bool(getattr(self, '_pages', None)) and self._page_idx > 0
+
+    def toggle_marquee(self):
+        self.config['marquee'] = not self.config.get('marquee', True)
+        self._save_config()
+        self._page_idx = 0
+        self._pfx_key = None
+        self._update_display()
+        self.flash_hint("➡ 整句分屏: 已开启" if self.config['marquee'] else "⏸ 整句分屏: 已关闭（整段截断，一次看完）")
+
+    def _truncate_to_width(self, text, max_px):
+        """单行模式：按像素宽度截断并补'…'，尽量切在标点后。"""
+        if not text:
+            return ""
+        if self.font_main.measure(text) <= max_px:
+            return text
+        budget = max(0, int(max_px))
+        low, high, best = 1, len(text), 0
+        while low <= high:
+            mid = (low + high) // 2
+            if self.font_main.measure(text[:mid]) <= budget:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        head = text[:best].rstrip()
+        return head if head else text[:1]
 
     def _update_geometry_and_wrap(self, override_x=None, override_y=None):
         if not hasattr(self, 'lbl_text') or not self.lbl_text.winfo_exists():
@@ -777,13 +862,13 @@ class ThiefDesktopBar:
         is_min = self.config.get('minimalMode', False)
         is_single = self.config.get('layoutMode', 'double') == 'single'
 
-        # 高度恒定不变：严禁向下撑大窗口
+        # 高度恒定：永远单个文字行
         if is_min:
             self.height = 30 if is_single else 56
         else:
             self.height = 36 if is_single else 68
 
-        # 严格保持单行，不显示在第二行
+        # 一行到底：不让 Tk 自己折行
         self.lbl_text.configure(wraplength=0)
 
         # 保持当前绝对坐标（支持多显示器、副屏负坐标与超宽坐标，绝不发生跨屏漂移）
@@ -798,8 +883,30 @@ class ThiefDesktopBar:
             self._last_geometry = geo
             self.root.geometry(geo)
 
-    def _on_text_configure(self, event):
-        pass
+    def _on_text_configure(self, event=None):
+        """工具条被拖边缩放 / 切换布局导致正文宽度变化时，重新折行（120ms 去抖）。"""
+        try:
+            w = event.width if event is not None else self.lbl_text.winfo_width()
+        except Exception:
+            return
+        if w <= 40:
+            return
+        if abs(w - getattr(self, '_label_w_last', 0)) < 6:
+            return
+        self._label_w_last = w
+        job = getattr(self, '_resize_job', None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._resize_job = self.root.after(120, self._on_viewport_changed)
+
+    def _on_viewport_changed(self):
+        self._resize_job = None
+        if getattr(self, 'is_boss_key', False):
+            return
+        self._update_display()
 
     def _cmd(self, func, *args, **kwargs):
         def _handler():
@@ -974,6 +1081,11 @@ class ThiefDesktopBar:
             accelerator="Esc",
             command=self._cmd(self.toggle_boss)
         )
+        mark_marquee = "✓ " if self.config.get('marquee', True) else "   "
+        self.context_menu.add_command(
+            label=f"{mark_marquee}流式滚动 (跑马灯)",
+            command=self._cmd(self.toggle_marquee)
+        )
         self.context_menu.add_command(
             label="设置...",
             command=self._cmd(self.open_settings_dialog)
@@ -1077,10 +1189,12 @@ class ThiefDesktopBar:
         self.root.bind("<Leave>", self._on_window_leave)
 
     def _on_window_enter(self, event=None):
+        self._hovering = True
         if self.config.get('privacyMode', False) and not self.is_boss_key:
             self.root.wm_attributes("-alpha", self.alpha)
 
     def _on_window_leave(self, event=None):
+        self._hovering = False
         if self.config.get('privacyMode', False) and not self.is_boss_key:
             self.root.after(80, self._check_privacy_mouse_leave)
 
@@ -1413,27 +1527,30 @@ class ThiefDesktopBar:
     def action_next(self):
         if self.is_boss_key:
             return
-        # 若当前长句还有未显示完全的顺延子行，先在当前单行条中显示下一行
-        if hasattr(self, '_sub_chunks') and self._sub_chunk_idx < len(self._sub_chunks) - 1:
-            self._sub_chunk_idx += 1
-            self._update_display()
+        # 本条消息还没翻完：翻到下一屏
+        if self.config.get('marquee', True) and self._has_more_pages():
+            self._page_idx += 1
+            self._render_page()
             return
-
-        # 当前句所有顺延行已读完，向酒馆请求下一句
-        self._sub_chunk_idx = 0
+        # 看完了，向酒馆请求下一句（先给个进行中提示，避免看起来卡住）
+        try:
+            self.lbl_spin.configure(text="⟳")
+        except Exception:
+            pass
         self.server.broadcast({'action': 'next'})
 
     def action_prev(self):
         if self.is_boss_key:
             return
-        # 若处于当前长句的后续顺延子行，倒退回上一行显示
-        if hasattr(self, '_sub_chunks') and self._sub_chunk_idx > 0:
-            self._sub_chunk_idx -= 1
-            self._update_display()
+        # 还在消息中间：翻回上一屏
+        if self.config.get('marquee', True) and self._has_prev_pages():
+            self._page_idx -= 1
+            self._render_page()
             return
-
-        # 已处于当前句第一行，倒退回上一句
-        self._sub_chunk_idx = 0
+        try:
+            self.lbl_spin.configure(text="⟳")
+        except Exception:
+            pass
         self.server.broadcast({'action': 'prev'})
 
     def action_floor_prev(self):
@@ -2047,8 +2164,44 @@ class ThiefDesktopBar:
                 new_sentence = data.get('currentSentence', '')
                 new_floor = data.get('floor', 0)
                 new_cur = data.get('curIdx', 1)
+                # 换楼层 = 换了一条消息：累计文本、分屏、页码全部从头开始
+                if new_floor != self.floor or (new_cur <= 1 and new_sentence != self.current_sentence):
+                    self._stream_parts = None
+                    self._pfx_key = None
+                    self._pages_ready = False
+                    self._pages = []
+                    self._page_idx = 0
+                    self.stream_text = ''
+                    self._pending_sentence_offset = 0
                 if new_sentence != self.current_sentence or new_floor != self.floor or new_cur != self.cur_idx:
                     self._sub_chunk_idx = 0
+                full_text = data.get('fullText')
+                if isinstance(full_text, str) and full_text.strip():
+                    # 新版插件：整条消息一起来，直接用它做整段
+                    self._stream_parts = None
+                    if full_text != getattr(self, 'stream_text', None):
+                        self.stream_text = full_text
+                        self._pending_sentence_offset = 0
+                else:
+                    # 旧版插件只发单句：自己把读过的句子拼成一段，效果一样是连续的一整段
+                    prev_floor = getattr(self, '_stream_floor', None)
+                    parts = getattr(self, '_stream_parts', None) or []
+                    cur_i = new_cur if isinstance(new_cur, int) else 1
+                    if new_floor != prev_floor or cur_i <= 1 or not parts:
+                        parts = [(cur_i, new_sentence)]
+                    elif not any(k == cur_i for k, _ in parts):
+                        parts.append((cur_i, new_sentence))
+                        parts.sort(key=lambda kv: kv[0])
+                    self._stream_floor = new_floor
+                    self._stream_parts = parts
+                    joined = ''.join(seg for _, seg in parts)
+                    if joined != getattr(self, 'stream_text', None):
+                        self.stream_text = joined
+                        base = len(joined) - len(new_sentence)
+                        self._pending_sentence_offset = max(0, base)
+                sent_off = data.get('sentenceOffset')
+                if isinstance(sent_off, (int, float)) and sent_off >= 0 and self.config.get('marquee', True):
+                    self._pending_sentence_offset = int(sent_off)
                 self.char_name = data.get('charName', 'AI')
                 self.user_name = data.get('userName', 'User')
                 self.floor = new_floor
@@ -2138,41 +2291,44 @@ class ThiefDesktopBar:
                     bg="#1e2e28" if self.theme_name == 'vscode-dark' else "#005a94"
                 )
 
-        # 1. 计算文字可视区域可用像素宽度
-        if is_min:
-            avail_w = max(120, self.width - 24)
-        else:
-            char_mode = self.config.get('charNameMode', 'compact')
-            char_w = 0 if char_mode == 'hidden' else (
-                self.lbl_char.winfo_reqwidth() if self.lbl_char.winfo_reqwidth() > 0 else 65
-            )
-            avail_w = max(120, self.width - 240 - char_w)
+        # 1. 正文一行可用宽度（像素）：跟着工具条当前宽度走
+        self._apply_narrow_chrome()
+        avail_w = self._text_width_px()
+        text = self.current_sentence or ""
 
-        # 2. 单行顺延分页（长句不裁剪，在下一行显示，高度严格恒定）
-        # 翻子行/进度刷新时句子与宽度不变，直接命中缓存，避免重复二分测量
-        cache = getattr(self, '_paginate_cache', None)
-        if cache is not None and cache[0] == self.current_sentence and cache[1] == avail_w:
-            self._sub_chunks = cache[2]
-        else:
-            self._sub_chunks = self._paginate_sentence(self.current_sentence, avail_w)
-            self._paginate_cache = (self.current_sentence, avail_w, self._sub_chunks)
-        if self._sub_chunk_idx >= len(self._sub_chunks):
-            self._sub_chunk_idx = max(0, len(self._sub_chunks) - 1)
-        elif self._sub_chunk_idx < 0:
-            self._sub_chunk_idx = 0
+        # 2. 一行显示：按条宽分屏；整句优先成屏，超宽才硬切
+        self._avail_px = avail_w
+        stream = self._stream()
+        pages_dirty = (stream, avail_w) != getattr(self, '_pfx_key', None)
+        if pages_dirty:
+            keep_offset = self._page_start_offset()
+            self._pfx_key = (stream, avail_w)
+            self._pages = self._compute_pages(stream, avail_w)
+            self._page_idx = self._page_index_for_offset(keep_offset) if getattr(self, '_pages_ready', False) else 0
+            self._pages_ready = True
+        # 换句/翻页：跳到这一句所在的屏
+        pending = getattr(self, '_pending_sentence_offset', None)
+        if pending is not None:
+            self._pending_sentence_offset = None
+            if not self.is_generating:
+                self._page_idx = self._page_index_for_offset(int(pending))
+        # 生成结束回到第一屏，方便从头读
+        if getattr(self, '_was_generating', False) and not self.is_generating:
+            self._page_idx = 0
+        self._was_generating = self.is_generating
+        # 生成中：始终显示最新那一屏
+        if self.is_generating and self._pages:
+            self._page_idx = len(self._pages) - 1
 
-        display_text = self._sub_chunks[self._sub_chunk_idx] if self._sub_chunks else self.current_sentence
-        self.lbl_text.configure(text=display_text, wraplength=0, justify=tk.LEFT)
+        self._sub_chunks = [text]
+        self._sub_chunk_idx = 0
 
-        # 3. 进度指示：若当前句分多行顺延显示，展示 (当前行/总行)
-        if len(self._sub_chunks) > 1:
-            self.lbl_right_info.configure(
-                text=f"{self.cur_idx}/{self.total_sentences} ({self._sub_chunk_idx + 1}/{len(self._sub_chunks)})"
-            )
+        if self.config.get('marquee', True):
+            self._render_page()
         else:
-            self.lbl_right_info.configure(
-                text=f"{self.cur_idx}/{self.total_sentences}"
-            )
+            self.lbl_text.configure(text=self._truncate_to_width(stream, avail_w), wraplength=0, justify=tk.LEFT)
+
+        self.lbl_right_info.configure(text=f"{self.cur_idx}/{self.total_sentences}")
 
         self.lbl_prefix.configure(text=" >")
         self._update_geometry_and_wrap()
@@ -2198,6 +2354,32 @@ class ThiefDesktopBar:
                 pass
 
 
+def _existing_instance_alive():
+    """同目录下已经有活着的摸鱼条就返回 True，避免起两个条（双 bind 会把消息投给其中一个）。"""
+    pid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PID_FILENAME)
+    try:
+        with open(pid_path, 'r', encoding='utf-8') as f:
+            pid = int(f.read().strip())
+    except Exception:
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if not sys.platform.startswith('win'):
+        return False
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+        k32.CloseHandle(handle)
+        return bool(ok) and code.value == 259          # STILL_ACTIVE
+    except Exception:
+        return False
+
+
 if __name__ == '__main__':
     if sys.platform.startswith('win'):
         try:
@@ -2205,9 +2387,13 @@ if __name__ == '__main__':
         except Exception:
             pass
 
+    if _existing_instance_alive():
+        print("[Thief Bar] 已有实例在运行，本实例直接退出（避免出现两条状态栏）", flush=True)
+        sys.exit(0)
+
     print("""
 ===================================================
- 正在启动 ST-Thief-Book 桌面原生摸鱼状态栏 (v3.4)
+ 正在启动 ST-Thief-Book 桌面原生摸鱼状态栏 (v3.5)
  请在酒馆助手（Tavern Helper）中导入并启用 st-thief-book.json
  快捷操作说明:
    - 鼠标右键点击任意处 : 呼出极简模式/切换楼层/微调透明度等全功能菜单

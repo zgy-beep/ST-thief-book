@@ -1,5 +1,5 @@
 {
-  "barWidth": 360,
+  "barWidth": 431,
   "alpha": 0.5,
   "theme": "vscode-dark",
   "minimalMode": true,
@@ -48,5 +48,6 @@
   "filterMode": "pure",
   "allowedOrigins": [
     "https://st.sobysong.cn:8443"
-  ]
+  ],
+  "marquee": true
 }

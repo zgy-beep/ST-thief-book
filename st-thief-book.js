@@ -1,6 +1,6 @@
 /**
  * ======================================================================================
- * ST-Thief-Book: 酒馆助手（Tavern Helper）隐蔽摸鱼阅读与回复工具 (v3.4 工程化版)
+ * ST-Thief-Book: 酒馆助手（Tavern Helper）隐蔽摸鱼阅读与回复工具 (v3.5 整段分屏版)
  * 仿 VS Code 知名摸鱼插件 Thief-Book 设计
  *
  * 核心升级：
@@ -3973,6 +3973,10 @@
         curIdx: STATE.currentSentenceIndex + 1,
         totalSentences: STATE.sentences.length,
         currentSentence: STATE.sentences[STATE.currentSentenceIndex] || '',
+        // 整条消息连成一段：桌面端据此做流式跑马灯（不再按标点一句一翻）
+        fullText: STATE.sentences.join(''),
+        // 当前句在整段里的字符偏移，供桌面端"跳句"定位
+        sentenceOffset: STATE.sentences.slice(0, STATE.currentSentenceIndex).join('').length,
         isBossKey: STATE.isBossKey,
         isGenerating: STATE.isGenerating,
         barWidth: CONFIG.barWidth,
