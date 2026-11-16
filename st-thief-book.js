@@ -6,9 +6,9 @@
  * 架构：Web 端为无界面桥接后端，桌面端 thief_desktop_bar.py 是唯一阅读 UI。
  * 1. Web 端职责：消息监听、白名单正文提取 + 思考黑名单剥离、整段分句状态机、
  *    回复发送 / Swipe / 中止生成，经 WebSocket (127.0.0.1:18899, 密钥认证) 同步桌面端
- * 2. ⚙️ 设置面板：脚本按钮栏一键呼出，自定义黑白名单标签、阅读配置与桥接密钥配对
+ * 2. ⚙️ 设置面板：魔法棒（扩展）菜单「Thief 设置」一键呼出，自定义黑白名单标签、阅读配置与桥接密钥配对
  * 3. 桌面端职责：置顶隐蔽状态栏渲染、整段分屏翻阅、老板键、自动阅读、贴边隐藏等
- * 4. 一键老板键：脚本按钮或桌面端 Esc 秒切纯代码编译状态
+ * 4. 一键老板键：魔法棒菜单「Thief 老板键」或桌面端 Esc 秒切纯代码编译状态
  * ======================================================================================
  */
 
@@ -1588,6 +1588,45 @@
   }
 
   // ------------------------------------------------------------------------------------
+  // 魔法棒（扩展）菜单入口：Thief 设置与老板键
+  // ------------------------------------------------------------------------------------
+  let wandObserver = null;
+  let wandRetryTimer = null;
+
+  function injectWandMenu() {
+    const topDoc = getSafeTopDoc();
+    const menu = topDoc && topDoc.getElementById('extensionsMenu');
+    if (!menu || topDoc.getElementById('st_thief_wand_container')) return;
+
+    const container = topDoc.createElement('div');
+    container.id = 'st_thief_wand_container';
+    container.className = 'extension_container';
+    container.innerHTML = `
+      <div id="st_thief_wand_settings" class="list-group-item flex-container flexGap5" title="打开 Thief 设置与桥接密钥配对">
+        <div class="fa-solid fa-gear extensionsMenuExtensionButton"></div>Thief 设置
+      </div>
+      <div id="st_thief_wand_boss" class="list-group-item flex-container flexGap5" title="切换老板键伪装（同步桌面端）">
+        <div class="fa-solid fa-user-secret extensionsMenuExtensionButton"></div>Thief 老板键
+      </div>`;
+    menu.appendChild(container);
+    container.querySelector('#st_thief_wand_settings').addEventListener('click', () => openSettingsModal());
+    container.querySelector('#st_thief_wand_boss').addEventListener('click', () => toggleBossKey());
+  }
+
+  function ensureWandMenu() {
+    const topDoc = getSafeTopDoc();
+    if (!topDoc || !topDoc.body) {
+      wandRetryTimer = setTimeout(ensureWandMenu, 1000);
+      return;
+    }
+    injectWandMenu();
+    if (wandObserver) return;
+    // 魔法棒菜单由酒馆启动时动态 append 到 body；整体重建时自动补回我们的条目
+    wandObserver = new MutationObserver(() => injectWandMenu());
+    wandObserver.observe(topDoc.body, { childList: true });
+  }
+
+  // ------------------------------------------------------------------------------------
   // 本地桌面端 WebSocket 同步机制
   // ------------------------------------------------------------------------------------
   function stopDesktopBridge() {
@@ -1789,18 +1828,9 @@
   // 酒馆事件监听绑定
   // ------------------------------------------------------------------------------------
   function initTavernEvents() {
+    // 入口已迁移到魔法棒（扩展）菜单；清空脚本按钮栏（含旧版本残留）
     if (typeof replaceScriptButtons === 'function') {
-      try {
-        replaceScriptButtons([
-          { name: '⚙️ Thief设置', visible: true },
-          { name: '🕶️ 老板键', visible: true }
-        ]);
-
-        if (typeof getButtonEvent === 'function') {
-          eventOn(getButtonEvent('⚙️ Thief设置'), () => openSettingsModal());
-          eventOn(getButtonEvent('🕶️ 老板键'), () => toggleBossKey());
-        }
-      } catch (e) {}
+      try { replaceScriptButtons([]); } catch (e) {}
     }
 
     if (typeof tavern_events !== 'undefined' && typeof eventOn === 'function') {
@@ -1885,19 +1915,28 @@
     loadSavedConfig();
     initTavernEvents();
     setupHostGlobalShortcuts();
+    ensureWandMenu();
     initDesktopBridge();
     refreshLatestMessage(false);
-    console.log('[ST-Thief-Book] 初始化完成！无界面桥接后端就绪，阅读请使用桌面摸鱼条 (start_desktop.bat)。');
+    console.log('[ST-Thief-Book] 初始化完成！入口在魔法棒（扩展）菜单，阅读请使用桌面摸鱼条 (start_desktop.bat)。');
   }
 
   // 脚本被禁用/重载时（Tavern Helper 销毁本 iframe）清理宿主侧残留，避免泄漏的监听器
   window.addEventListener('unload', () => {
     stopDesktopBridge();
+    if (wandRetryTimer) clearTimeout(wandRetryTimer);
+    if (wandObserver) {
+      wandObserver.disconnect();
+      wandObserver = null;
+    }
     try {
       const topDoc = getSafeTopDoc();
-      if (topDoc && topDoc._tbHostKeydownHandler) {
-        topDoc.removeEventListener('keydown', topDoc._tbHostKeydownHandler);
-        topDoc._tbHostKeydownHandler = null;
+      if (topDoc) {
+        topDoc.getElementById('st_thief_wand_container')?.remove();
+        if (topDoc._tbHostKeydownHandler) {
+          topDoc.removeEventListener('keydown', topDoc._tbHostKeydownHandler);
+          topDoc._tbHostKeydownHandler = null;
+        }
       }
     } catch (e) {}
   });
