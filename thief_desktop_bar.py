@@ -427,7 +427,8 @@ class ThiefDesktopBar:
             'showUserMessages': False,
             'filterActions': False,
             'filterMode': 'pure',
-            'pagedReading': True
+            'pagedReading': True,
+            'fontSize': 9
         }
 
         self.width = 860
@@ -446,7 +447,7 @@ class ThiefDesktopBar:
         pos_y = max(0, screen_h - self.height - 45)
         self.root.geometry(f"{self.width}x{self.height}+{pos_x}+{pos_y}")
 
-        self.font_main = tkfont.Font(family="Microsoft YaHei UI", size=9)
+        self.font_main = tkfont.Font(family="Microsoft YaHei UI", size=self.config.get('fontSize', 9))
         self.font_bold = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
         self.font_mono = tkfont.Font(family="Consolas", size=9)
 
@@ -491,6 +492,9 @@ class ThiefDesktopBar:
                                   'filterActions', 'filterMode', 'allowedOrigins', 'pagedReading']:
                             if k in saved:
                                 self.config[k] = saved[k]
+                        fs = self._clamp_font_size(saved.get('fontSize'))
+                        if fs is not None:
+                            self.config['fontSize'] = fs
         except Exception as e:
             print(f"[Load Config Error]: {e}", flush=True)
 
@@ -540,7 +544,8 @@ class ThiefDesktopBar:
             'filterActions': self.config.get('filterActions', False),
             'filterMode': self.config.get('filterMode', 'pure'),
             'allowedOrigins': self.config.get('allowedOrigins', []),
-            'pagedReading': self.config.get('pagedReading', True)
+            'pagedReading': self.config.get('pagedReading', True),
+            'fontSize': self.config.get('fontSize', 9)
         }
         try:
             self._atomic_write_json(self.config_file, data)
@@ -1527,10 +1532,32 @@ class ThiefDesktopBar:
     def _on_mousewheel(self, event):
         if self.is_boss_key:
             return
+        if event.state & 0x0004:  # Ctrl+滚轮：缩放正文字号
+            self._zoom_font(1 if event.delta > 0 else -1)
+            return
         if event.delta < 0:
             self.action_next()
         else:
             self.action_prev()
+
+    @staticmethod
+    def _clamp_font_size(value):
+        # 上限 12pt：恒定高度（最小 30px）在高 DPI 下也放得下
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return max(8, min(12, int(value)))
+
+    def _zoom_font(self, step):
+        cur = self.config.get('fontSize', 9)
+        new = self._clamp_font_size(cur + step)
+        if new == cur:
+            return
+        self.config['fontSize'] = new
+        self.font_main.configure(size=new)
+        self._pfx_key = None  # 字号变了，像素测量全部失效，强制重新分屏
+        self._save_config()
+        self._update_display()
+        self.flash_hint(f"🔠 正文字号: {new}pt（Ctrl+滚轮调节，8~12）")
 
     def action_next(self):
         if self.is_boss_key:

@@ -198,6 +198,14 @@ def main():
     passed += 1
     print("[PASS] 进度指示：越界钳制")
 
+    # 23. 字号钳制：范围 8~12，非法类型拒绝
+    clamp = ThiefDesktopBar._clamp_font_size
+    assert clamp(7) == 8 and clamp(15) == 12 and clamp(10) == 10
+    assert clamp(9.0) == 9
+    assert clamp('x') is None and clamp(True) is None and clamp(None) is None
+    passed += 1
+    print("[PASS] 字号钳制与类型校验")
+
     print(f"\n全部 {passed} 项测试通过")
 
 
