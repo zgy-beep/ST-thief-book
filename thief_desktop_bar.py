@@ -2164,6 +2164,10 @@ class ThiefDesktopBar:
                 new_sentence = data.get('currentSentence', '')
                 new_floor = data.get('floor', 0)
                 new_cur = data.get('curIdx', 1)
+                # 仅真正的导航（换句/换楼/句序变化）才跳屏；配置、老板键、
+                # 生成状态等无关同步不得把读者拽回当前句所在屏
+                nav_changed = (new_sentence != self.current_sentence
+                               or new_floor != self.floor or new_cur != self.cur_idx)
                 # 换楼层 = 换了一条消息：累计文本、分屏、页码全部从头开始
                 if new_floor != self.floor or (new_cur <= 1 and new_sentence != self.current_sentence):
                     self._stream_parts = None
@@ -2179,7 +2183,8 @@ class ThiefDesktopBar:
                     self._stream_parts = None
                     if full_text != getattr(self, 'stream_text', None):
                         self.stream_text = full_text
-                        self._pending_sentence_offset = 0
+                        if nav_changed:
+                            self._pending_sentence_offset = 0
                 else:
                     # 旧版插件只发单句：自己把读过的句子拼成一段，效果一样是连续的一整段
                     prev_floor = getattr(self, '_stream_floor', None)
@@ -2191,9 +2196,10 @@ class ThiefDesktopBar:
                     joined = ''.join(seg for _, seg in parts)
                     if joined != getattr(self, 'stream_text', None):
                         self.stream_text = joined
-                    self._pending_sentence_offset = offset
+                    if nav_changed:
+                        self._pending_sentence_offset = offset
                 sent_off = data.get('sentenceOffset')
-                if isinstance(sent_off, (int, float)) and sent_off >= 0 and self.config.get('pagedReading', True):
+                if nav_changed and isinstance(sent_off, (int, float)) and sent_off >= 0 and self.config.get('pagedReading', True):
                     self._pending_sentence_offset = int(sent_off)
                 self.char_name = data.get('charName', 'AI')
                 self.user_name = data.get('userName', 'User')
