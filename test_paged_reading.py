@@ -95,6 +95,86 @@ def main():
     passed += 1
     print("[PASS] 截断：极窄宽度兜底")
 
+    # 12. 分屏：空文本与恰好整屏
+    assert bar._compute_pages('', 100) == [(0, 0)]
+    assert bar._compute_pages('x' * 10, 100) == [(0, 10)]
+    passed += 1
+    print("[PASS] 分屏：空文本与恰好整屏")
+
+    # 13. 分屏：本屏内有句末标点则自然断句（该屏可以不填满）
+    pages = bar._compute_pages('ab。cdefghijklmn', 100)
+    assert pages == [(0, 3), (3, 13), (13, 15)], f"实际: {pages}"
+    passed += 1
+    print("[PASS] 分屏：句末标点自然断句")
+
+    # 14. 分屏：无句末标点时硬切，紧跟的标点留在本页
+    pages = bar._compute_pages('abcdefghij，klmn', 100)
+    assert pages == [(0, 11), (11, 15)], f"实际: {pages}"
+    passed += 1
+    print("[PASS] 分屏：硬切携带 trailing 标点")
+
+    # 15. 分屏：无标点纯硬切，页页相接不丢字
+    pages = bar._compute_pages('x' * 25, 100)
+    assert pages == [(0, 10), (10, 20), (20, 25)]
+    assert ''.join(('x' * 25)[a:b] for a, b in pages) == 'x' * 25
+    passed += 1
+    print("[PASS] 分屏：纯硬切无缝覆盖")
+
+    # 16. 分屏：宽度不足一个字符也保证前进（不死循环）
+    pages = bar._compute_pages('abc', 5)
+    assert pages == [(0, 1), (1, 2), (2, 3)]
+    passed += 1
+    print("[PASS] 分屏：极窄宽度兜底")
+
+    # 17. 偏移→页码映射：边界、句首、越界
+    bar._pages = [(0, 3), (3, 13), (13, 15)]
+    for off, want in [(0, 0), (2, 0), (3, 1), (12, 1), (13, 2), (14, 2), (15, 2), (99, 2)]:
+        got = bar._page_index_for_offset(off)
+        assert got == want, f"offset={off} 期望页 {want} 实际 {got}"
+    bar._pages = []
+    assert bar._page_index_for_offset(5) == 0
+    passed += 1
+    print("[PASS] 偏移→页码映射")
+
+    # 18. 当前页起始偏移与越界钳制
+    bar._pages = [(0, 3), (3, 13)]
+    bar._page_idx = 1
+    assert bar._page_start_offset() == 3
+    bar._page_idx = 9
+    assert bar._page_start_offset() == 3
+    bar._page_idx = -1
+    assert bar._page_start_offset() == 0
+    passed += 1
+    print("[PASS] 页起始偏移与钳制")
+
+    # 19. 翻页可用性判断
+    bar._pages = [(0, 3), (3, 13)]
+    bar._page_idx = 0
+    assert bar._has_more_pages() and not bar._has_prev_pages()
+    bar._page_idx = 1
+    assert not bar._has_more_pages() and bar._has_prev_pages()
+    bar._pages = []
+    assert not bar._has_more_pages() and not bar._has_prev_pages()
+    passed += 1
+    print("[PASS] 翻页可用性判断")
+
+    # 20. 渲染当前页与 _stream 回退
+    class FakeLabel:
+        def configure(self, **kw):
+            self.kwargs = kw
+    bar.lbl_text = FakeLabel()
+    bar.stream_text = 'abcdefghij'
+    bar._pages = [(0, 4), (4, 10)]
+    bar._page_idx = 1
+    bar._render_page()
+    assert bar.lbl_text.kwargs['text'] == 'efghij'
+    assert bar.lbl_text.kwargs['wraplength'] == 0
+    bar.stream_text = ''
+    bar.current_sentence = '备用句'
+    assert bar._stream() == '备用句'
+    passed += 1
+    print("[PASS] 渲染当前页与 _stream 回退")
+
     print(f"\n全部 {passed} 项测试通过")
 
 
