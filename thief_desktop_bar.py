@@ -422,6 +422,11 @@ class ThiefDesktopBar:
         self._resume_floor = None
         self._resume_offset = None
         self._synced_once = False
+        self._dock_edge = None
+        self._dock_pos = None
+        self._hidden = False
+        self._slide_job = None
+        self._hide_job = None
         self.config = {
             'charNameMode': 'compact',
             'wrapMode': 'wrap',
@@ -441,7 +446,8 @@ class ThiefDesktopBar:
             'filterMode': 'pure',
             'pagedReading': True,
             'fontSize': 9,
-            'autoReadSec': 0
+            'autoReadSec': 0,
+            'autoHide': False
         }
 
         self.width = 860
@@ -488,6 +494,7 @@ class ThiefDesktopBar:
         if self.server.allowed_origins:
             print(f"[WebSocket Server] 额外放行来源: {', '.join(sorted(self.server.allowed_origins))}", flush=True)
         self._restart_auto_read()
+        self.root.after(600, self._eval_dock)
 
     def _load_config(self):
         try:
@@ -505,7 +512,7 @@ class ThiefDesktopBar:
                             self.theme = self.THEMES[self.theme_name]
                         for k in ['minimalMode', 'layoutMode', 'charNameMode', 'wrapMode',
                                   'showUserMessages', 'enableWhitelist', 'tagWhitelist', 'tagBlacklist',
-                                  'filterActions', 'filterMode', 'allowedOrigins', 'pagedReading']:
+                                  'filterActions', 'filterMode', 'allowedOrigins', 'pagedReading', 'autoHide']:
                             if k in saved:
                                 self.config[k] = saved[k]
                         fs = self._clamp_font_size(saved.get('fontSize'))
@@ -565,7 +572,8 @@ class ThiefDesktopBar:
             'allowedOrigins': self.config.get('allowedOrigins', []),
             'pagedReading': self.config.get('pagedReading', True),
             'fontSize': self.config.get('fontSize', 9),
-            'autoReadSec': self.config.get('autoReadSec', 0)
+            'autoReadSec': self.config.get('autoReadSec', 0),
+            'autoHide': self.config.get('autoHide', False)
         }
         try:
             self._atomic_write_json(self.config_file, data)
@@ -1177,6 +1185,11 @@ class ThiefDesktopBar:
             label=f"{mark_paged}整段分屏阅读",
             command=self._cmd(self.toggle_paged_reading)
         )
+        mark_hide = "✓ " if self.config.get('autoHide', False) else "   "
+        self.context_menu.add_command(
+            label=f"{mark_hide}贴边自动隐藏",
+            command=self._cmd(self.toggle_auto_hide)
+        )
         auto_menu = tk.Menu(
             self.context_menu,
             tearoff=0,
@@ -1302,11 +1315,14 @@ class ThiefDesktopBar:
 
     def _on_window_enter(self, event=None):
         self._hovering = True
+        self._cancel_slide()
+        self._auto_hide_reveal()
         if self.config.get('privacyMode', False) and not self.is_boss_key:
             self.root.wm_attributes("-alpha", self.alpha)
 
     def _on_window_leave(self, event=None):
         self._hovering = False
+        self._schedule_auto_hide()
         if self.config.get('privacyMode', False) and not self.is_boss_key:
             self.root.after(80, self._check_privacy_mouse_leave)
 
@@ -1436,6 +1452,7 @@ class ThiefDesktopBar:
         dy = abs(event.y_root - getattr(self, '_drag_start_y', event.y_root))
         if dx > 3 or dy > 3:
             self._has_dragged = True
+            self._cancel_slide()
             new_x = event.x_root - self._drag_offset_x
             new_y = event.y_root - self._drag_offset_y
             # 边界钳制：窗口无边框且不进任务栏/Alt+Tab，被拖出屏幕就再也找不回来
@@ -1459,6 +1476,7 @@ class ThiefDesktopBar:
                 'action': 'set_window_width',
                 'barWidth': self.width
             })
+        self._eval_dock()
 
     def _on_text_click_release(self, event):
         if getattr(self, '_is_resizing', False):
@@ -1467,6 +1485,8 @@ class ThiefDesktopBar:
         if not getattr(self, '_has_dragged', False):
             if not self.is_boss_key:
                 self.action_next()
+        else:
+            self._eval_dock()
         self._has_dragged = False
 
     def set_window_width(self, w):
@@ -1692,6 +1712,129 @@ class ThiefDesktopBar:
         if not self._auto_read_paused(focused):
             self.action_next()
         self._auto_read_job = self.root.after(sec * 1000, self._auto_read_tick)
+
+    # ---------------- 贴边自动隐藏 ----------------
+    DOCK_THRESHOLD = 12
+    DOCK_STRIP = 3
+
+    @staticmethod
+    def _pick_dock_edge(x, y, w, h, rect, threshold=12):
+        """距显示器工作区哪条边最近且 <=threshold 即贴边；否则 None。"""
+        ml, mt, mr, mb = rect
+        dists = {'left': x - ml, 'right': mr - (x + w), 'top': y - mt, 'bottom': mb - (y + h)}
+        edge = min(dists, key=dists.get)
+        return edge if dists[edge] <= threshold else None
+
+    @staticmethod
+    def _hide_target(edge, x, y, w, h, rect, strip=3):
+        """收起后的窗口坐标：沿贴边方向滑出屏外，只留 strip 像素触发条。"""
+        ml, mt, mr, mb = rect
+        if edge == 'bottom':
+            return (x, mb - strip)
+        if edge == 'top':
+            return (x, mt - h + strip)
+        if edge == 'left':
+            return (ml - w + strip, y)
+        return (mr - strip, y)
+
+    def _monitor_rect(self):
+        """窗口所在显示器的工作区矩形（不含任务栏）；失败回退主屏。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [('cbSize', wintypes.DWORD), ('rcMonitor', wintypes.RECT),
+                            ('rcWork', wintypes.RECT), ('dwFlags', wintypes.DWORD)]
+            hwnd = u32.GetParent(self.root.winfo_id())
+            hmon = u32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if hmon and u32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcWork
+                return (r.left, r.top, r.right, r.bottom)
+        except Exception:
+            pass
+        return (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+
+    def _eval_dock(self):
+        if getattr(self, '_hidden', False) or not self.root.winfo_ismapped():
+            return
+        self._dock_edge = self._pick_dock_edge(
+            self.root.winfo_x(), self.root.winfo_y(), self.width, self.height, self._monitor_rect())
+        if self.config.get('autoHide', False) and self._dock_edge and not self._hovering:
+            self._schedule_auto_hide()
+
+    def _cancel_slide(self):
+        for attr in ('_slide_job', '_hide_job'):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+    def _schedule_auto_hide(self):
+        if not self.config.get('autoHide', False) or not self._dock_edge:
+            return
+        job = getattr(self, '_hide_job', None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._hide_job = self.root.after(500, self._auto_hide_now)
+
+    def _auto_hide_now(self):
+        self._hide_job = None
+        if (not self.config.get('autoHide', False) or self.is_boss_key or self._hovering
+                or getattr(self, '_is_resizing', False) or self.config.get('privacyMode', False)
+                or getattr(self, '_hidden', False) or not self._dock_edge):
+            return
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        self._dock_pos = (x, y)
+        tx, ty = self._hide_target(self._dock_edge, x, y, self.width, self.height, self._monitor_rect())
+        self._hidden = True
+        self._slide_to(tx, ty)
+
+    def _auto_hide_reveal(self):
+        if not getattr(self, '_hidden', False):
+            return
+        self._hidden = False
+        pos = getattr(self, '_dock_pos', None)
+        if pos:
+            self._slide_to(*pos)
+
+    def _slide_to(self, tx, ty):
+        self._cancel_slide()
+
+        def step():
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            dx, dy = tx - x, ty - y
+            if abs(dx) <= 1 and abs(dy) <= 1:
+                self._slide_job = None
+                self.root.geometry(f"+{tx}+{ty}")
+                self._last_geometry = f"{self.width}x{self.height}+{tx}+{ty}"
+                return
+            nx = x + (dx // 3 if abs(dx) > 2 else (1 if dx > 0 else -1))
+            ny = y + (dy // 3 if abs(dy) > 2 else (1 if dy > 0 else -1))
+            self.root.geometry(f"+{nx}+{ny}")
+            self._last_geometry = f"{self.width}x{self.height}+{nx}+{ny}"
+            self._slide_job = self.root.after(12, step)
+        self._slide_job = self.root.after(12, step)
+
+    def toggle_auto_hide(self):
+        self.config['autoHide'] = not self.config.get('autoHide', False)
+        self._save_config()
+        if self.config['autoHide']:
+            self._eval_dock()
+            self.flash_hint("🧲 贴边自动隐藏: 已开启（鼠标移开收起，碰边缘滑出）")
+        else:
+            self._cancel_slide()
+            self._auto_hide_reveal()
+            self.flash_hint("🧲 贴边自动隐藏: 已关闭")
 
     def action_next(self):
         if self.is_boss_key:
@@ -2272,7 +2415,7 @@ class ThiefDesktopBar:
         btn_save = tk.Button(btn_frame, text="💾 保存并同步生效", command=save_settings, bg="#0e639c", fg="#ffffff", bd=0, padx=14, pady=4, cursor="hand2")
         btn_save.pack(side=tk.RIGHT)
 
-    _BOOL_CONFIG_KEYS = {'minimalMode', 'showUserMessages', 'enableWhitelist', 'filterActions', 'privacyMode', 'pagedReading'}
+    _BOOL_CONFIG_KEYS = {'minimalMode', 'showUserMessages', 'enableWhitelist', 'filterActions', 'privacyMode', 'pagedReading', 'autoHide'}
     _ENUM_CONFIG_KEYS = {
         'layoutMode': {'single', 'double'},
         'charNameMode': {'compact', 'hidden', 'full'},

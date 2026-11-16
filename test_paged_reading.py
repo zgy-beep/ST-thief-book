@@ -239,6 +239,33 @@ def main():
     passed += 1
     print("[PASS] 阅读位置校验")
 
+    # 26. 贴边判定：四边、阈值边界、屏幕中央不贴边
+    pick = ThiefDesktopBar._pick_dock_edge
+    rect = (0, 0, 1920, 1080)
+    assert pick(100, 1010, 800, 68, rect) == 'bottom'   # 距底 2px
+    assert pick(100, 5, 800, 68, rect) == 'top'
+    assert pick(3, 500, 800, 68, rect) == 'left'
+    assert pick(1110, 500, 800, 68, rect) == 'right'    # 距右 10px
+    assert pick(500, 500, 800, 68, rect) is None
+    assert pick(100, 1000, 800, 68, rect) == 'bottom'   # 距底恰好 12px
+    assert pick(100, 999, 800, 68, rect) is None        # 距底 13px
+    passed += 1
+    print("[PASS] 贴边判定")
+
+    # 27. 贴边判定：副屏负坐标
+    assert pick(-1915, 500, 800, 68, (-1920, 0, 0, 1080)) == 'left'
+    passed += 1
+    print("[PASS] 贴边判定：副屏负坐标")
+
+    # 28. 收起目标：四边都只留 3px 触发条
+    ht = ThiefDesktopBar._hide_target
+    assert ht('bottom', 100, 1010, 800, 68, rect) == (100, 1077)
+    assert ht('top', 100, 5, 800, 68, rect) == (100, -65)
+    assert ht('left', 3, 500, 800, 68, rect) == (-797, 500)
+    assert ht('right', 1110, 500, 800, 68, rect) == (1917, 500)
+    passed += 1
+    print("[PASS] 收起目标坐标")
+
     print(f"\n全部 {passed} 项测试通过")
 
 
