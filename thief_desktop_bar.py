@@ -840,12 +840,12 @@ class ThiefDesktopBar:
         self.flash_hint("➡ 整段分屏: 已开启" if self.config['pagedReading'] else "⏸ 整段分屏: 已关闭（单行截断，一次看完）")
 
     def _truncate_to_width(self, text, max_px):
-        """单行模式：按像素宽度截断并补'…'，尽量切在标点后。"""
+        """关闭分屏时的单行截断：预留省略号宽度，超出部分以'…'结尾。"""
         if not text:
             return ""
         if self.font_main.measure(text) <= max_px:
             return text
-        budget = max(0, int(max_px))
+        budget = max(0, int(max_px) - self.font_main.measure('…'))
         low, high, best = 1, len(text), 0
         while low <= high:
             mid = (low + high) // 2
@@ -855,7 +855,7 @@ class ThiefDesktopBar:
             else:
                 high = mid - 1
         head = text[:best].rstrip()
-        return head if head else text[:1]
+        return (head + '…') if head else '…'
 
     def _update_geometry_and_wrap(self, override_x=None, override_y=None):
         if not hasattr(self, 'lbl_text') or not self.lbl_text.winfo_exists():

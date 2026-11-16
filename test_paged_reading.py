@@ -8,6 +8,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from thief_desktop_bar import ThiefDesktopBar
 
 
+class FakeFont:
+    """每字符恒定 10px，便于精确推算截断点"""
+    def measure(self, s):
+        return len(s) * 10
+
+
+def make_bar():
+    # 绕过 __init__（不创建 Tk 窗口），只测纯逻辑
+    bar = object.__new__(ThiefDesktopBar)
+    bar.config = {}
+    bar.font_main = FakeFont()
+    return bar
+
+
 def main():
     passed = 0
     acc = ThiefDesktopBar._accumulate_stream
@@ -54,6 +68,32 @@ def main():
     assert off == 6
     passed += 1
     print("[PASS] 中间句偏移")
+
+    # 8. 单行截断：未超宽原样返回
+    bar = make_bar()
+    assert bar._truncate_to_width('你好', 100) == '你好'
+    assert bar._truncate_to_width('', 100) == ''
+    passed += 1
+    print("[PASS] 截断：短文本与空文本")
+
+    # 9. 单行截断：超宽补省略号且总宽不超限（10px/字符，'…'占 10px）
+    out = bar._truncate_to_width('abcdefghij', 55)
+    assert out == 'abcd…', f"实际: {out}"
+    assert bar.font_main.measure(out) <= 55
+    passed += 1
+    print("[PASS] 截断：补省略号且不超宽")
+
+    # 10. 截断点落在空白上时先剥离再补省略号
+    out = bar._truncate_to_width('ab     cdefghij', 45)
+    assert out == 'ab…', f"实际: {out}"
+    passed += 1
+    print("[PASS] 截断：剥离尾部空白")
+
+    # 11. 极窄宽度连一个字都放不下：至少显示省略号
+    out = bar._truncate_to_width('abcdef', 5)
+    assert out == '…', f"实际: {out}"
+    passed += 1
+    print("[PASS] 截断：极窄宽度兜底")
 
     print(f"\n全部 {passed} 项测试通过")
 
