@@ -206,6 +206,26 @@ def main():
     passed += 1
     print("[PASS] 字号钳制与类型校验")
 
+    # 24. 自动阅读暂停判定：伪装/生成中/悬停/回复聚焦任一即暂停
+    bar = make_bar()
+    bar.is_boss_key = False
+    bar.is_generating = False
+    bar._hovering = False
+    bar.entry_reply = object()
+    assert not bar._auto_read_paused(None)
+    assert not bar._auto_read_paused(object())
+    assert bar._auto_read_paused(bar.entry_reply)
+    bar._hovering = True
+    assert bar._auto_read_paused(None)
+    bar._hovering = False
+    bar.is_generating = True
+    assert bar._auto_read_paused(None)
+    bar.is_generating = False
+    bar.is_boss_key = True
+    assert bar._auto_read_paused(None)
+    passed += 1
+    print("[PASS] 自动阅读暂停判定")
+
     print(f"\n全部 {passed} 项测试通过")
 
 

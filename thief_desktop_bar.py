@@ -410,6 +410,8 @@ class ThiefDesktopBar:
         self._pages = []
         self._page_idx = 0
         self._pages_ready = False
+        self._hovering = False
+        self._auto_read_job = None
         self.config = {
             'charNameMode': 'compact',
             'wrapMode': 'wrap',
@@ -428,7 +430,8 @@ class ThiefDesktopBar:
             'filterActions': False,
             'filterMode': 'pure',
             'pagedReading': True,
-            'fontSize': 9
+            'fontSize': 9,
+            'autoReadSec': 0
         }
 
         self.width = 860
@@ -472,6 +475,7 @@ class ThiefDesktopBar:
         self.server.start()
         if self.server.allowed_origins:
             print(f"[WebSocket Server] 额外放行来源: {', '.join(sorted(self.server.allowed_origins))}", flush=True)
+        self._restart_auto_read()
 
     def _load_config(self):
         try:
@@ -495,6 +499,9 @@ class ThiefDesktopBar:
                         fs = self._clamp_font_size(saved.get('fontSize'))
                         if fs is not None:
                             self.config['fontSize'] = fs
+                        sec = saved.get('autoReadSec')
+                        if isinstance(sec, int) and not isinstance(sec, bool) and 0 <= sec <= 60:
+                            self.config['autoReadSec'] = sec
         except Exception as e:
             print(f"[Load Config Error]: {e}", flush=True)
 
@@ -545,7 +552,8 @@ class ThiefDesktopBar:
             'filterMode': self.config.get('filterMode', 'pure'),
             'allowedOrigins': self.config.get('allowedOrigins', []),
             'pagedReading': self.config.get('pagedReading', True),
-            'fontSize': self.config.get('fontSize', 9)
+            'fontSize': self.config.get('fontSize', 9),
+            'autoReadSec': self.config.get('autoReadSec', 0)
         }
         try:
             self._atomic_write_json(self.config_file, data)
@@ -1101,6 +1109,27 @@ class ThiefDesktopBar:
             label=f"{mark_paged}整段分屏阅读",
             command=self._cmd(self.toggle_paged_reading)
         )
+        auto_menu = tk.Menu(
+            self.context_menu,
+            tearoff=0,
+            bg="#1e1e1e",
+            fg="#cccccc",
+            activebackground="#094771",
+            activeforeground="#ffffff",
+            font=self.font_main,
+            bd=1,
+            relief=tk.SOLID
+        )
+        self._auto_read_var = tk.IntVar(value=self.config.get('autoReadSec', 0))
+        for sec, label in [(0, "关闭"), (3, "每 3 秒翻屏"), (5, "每 5 秒翻屏"), (8, "每 8 秒翻屏")]:
+            auto_menu.add_radiobutton(
+                label=label,
+                variable=self._auto_read_var,
+                value=sec,
+                command=self._cmd(lambda s=sec: self.set_auto_read(s))
+            )
+        auto_label = f"自动阅读 ({self.config.get('autoReadSec', 0)}s)" if self.config.get('autoReadSec', 0) > 0 else "自动阅读 (关)"
+        self.context_menu.add_cascade(label=auto_label, menu=auto_menu)
         self.context_menu.add_command(
             label="设置...",
             command=self._cmd(self.open_settings_dialog)
@@ -1204,10 +1233,12 @@ class ThiefDesktopBar:
         self.root.bind("<Leave>", self._on_window_leave)
 
     def _on_window_enter(self, event=None):
+        self._hovering = True
         if self.config.get('privacyMode', False) and not self.is_boss_key:
             self.root.wm_attributes("-alpha", self.alpha)
 
     def _on_window_leave(self, event=None):
+        self._hovering = False
         if self.config.get('privacyMode', False) and not self.is_boss_key:
             self.root.after(80, self._check_privacy_mouse_leave)
 
@@ -1558,6 +1589,41 @@ class ThiefDesktopBar:
         self._save_config()
         self._update_display()
         self.flash_hint(f"🔠 正文字号: {new}pt（Ctrl+滚轮调节，8~12）")
+
+    def set_auto_read(self, sec):
+        self.config['autoReadSec'] = sec
+        self._save_config()
+        self._restart_auto_read()
+        self.flash_hint(f"▶ 自动阅读: 每{sec}秒翻屏（悬停/伪装/生成中暂停）" if sec > 0 else "⏸ 自动阅读: 已关闭")
+
+    def _restart_auto_read(self):
+        job = getattr(self, '_auto_read_job', None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._auto_read_job = None
+        sec = self.config.get('autoReadSec', 0)
+        if sec > 0:
+            self._auto_read_job = self.root.after(sec * 1000, self._auto_read_tick)
+
+    def _auto_read_paused(self, focused):
+        return bool(self.is_boss_key or self.is_generating or self._hovering
+                    or focused is self.entry_reply)
+
+    def _auto_read_tick(self):
+        self._auto_read_job = None
+        sec = self.config.get('autoReadSec', 0)
+        if sec <= 0:
+            return
+        try:
+            focused = self.root.focus_get()
+        except Exception:
+            focused = None
+        if not self._auto_read_paused(focused):
+            self.action_next()
+        self._auto_read_job = self.root.after(sec * 1000, self._auto_read_tick)
 
     def action_next(self):
         if self.is_boss_key:
