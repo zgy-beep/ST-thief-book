@@ -1245,6 +1245,22 @@ class ThiefDesktopBar:
         # 初始化布局与极简模式
         self._apply_layout_and_mode()
 
+    def _set_boss_chrome_extra(self, disguised):
+        """楼层导航（▲ #12 ▾）和 ⋮ 菜单按钮都是阅读态的东西，伪装时必须藏掉——
+        假的状态栏里冒出翻页箭头，一眼就看穿了。右键菜单不受影响（全窗口都绑了 Button-3）。"""
+        floor = getattr(self, 'floor_frame', None)
+        menu_btn = getattr(self, 'btn_menu', None)
+        if disguised:
+            if floor is not None and floor.winfo_manager():
+                floor.pack_forget()
+            if menu_btn is not None and menu_btn.winfo_manager():
+                menu_btn.pack_forget()
+        else:
+            if floor is not None and not floor.winfo_manager():
+                floor.pack(side=tk.LEFT, padx=(6, 2))
+            if menu_btn is not None and not menu_btn.winfo_manager():
+                menu_btn.pack(side=tk.LEFT)
+
     def _ensure_boss_chrome(self):
         """伪装时强制显示状态栏零件。
         极简模式平时把左右两翼和前缀都藏了（纯正文最不显眼），但假的"系统状态条/歌词条"
@@ -1255,6 +1271,7 @@ class ThiefDesktopBar:
             self.right_frame.pack(side=tk.RIGHT, padx=(4, 8))
             self.center_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
             self._boss_chrome_forced = True
+        self._set_boss_chrome_extra(True)
         if (self.row2.winfo_manager() and self.entry_reply.winfo_manager()
                 and not self.lbl_prefix.winfo_manager()):
             self.lbl_prefix.pack(side=tk.LEFT, before=self.entry_reply)
@@ -3845,10 +3862,12 @@ class ThiefDesktopBar:
             self._update_geometry_and_wrap()
             return
 
-        # 退出伪装：把被强制放出来的左右两翼/前缀交还给极简模式自己决定
+        # 退出伪装：把被强制放出来的左右两翼/前缀交还给极简模式自己决定，
+        # 楼层导航和 ⋮ 按钮也要还回去
         if getattr(self, '_boss_chrome_forced', False):
             self._boss_chrome_forced = False
             self._apply_layout_and_mode()
+        self._set_boss_chrome_extra(False)
 
         self.lbl_branch.configure(text="⎇ main*")
         floor_str = f"#{self.floor} ▾" if self.floor >= 0 else "#-- ▾"
