@@ -3846,7 +3846,8 @@ class ThiefDesktopBar:
             branch = (live or {}).get('branch') or disguise['branch']
             text = (live or {}).get('text') or disguise['text']
             right = (live or {}).get('right') or disguise['right']
-            self.lbl_branch.configure(text=branch)
+            # 伪装时这一格是指标（CPU%/页面/时间），不是阅读态的弱提示，必须和正文同亮度
+            self.lbl_branch.configure(text=branch, fg=self.theme['fg'])
             if hasattr(self, 'lbl_floor'):
                 self.lbl_floor.configure(text="")
             self.lbl_char.configure(text="", bg=self.theme['bg'])
@@ -3869,7 +3870,7 @@ class ThiefDesktopBar:
             self._apply_layout_and_mode()
         self._set_boss_chrome_extra(False)
 
-        self.lbl_branch.configure(text="⎇ main*")
+        self.lbl_branch.configure(text="⎇ main*", fg='#858585')
         floor_str = f"#{self.floor} ▾" if self.floor >= 0 else "#-- ▾"
         if hasattr(self, 'lbl_floor'):
             self.lbl_floor.configure(text=floor_str)
