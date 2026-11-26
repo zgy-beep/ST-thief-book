@@ -17,9 +17,11 @@ ST-Thief-Desktop-Bar: 酒馆助手桌面原生双行摸鱼状态栏 (仿 VS Code
    - 点击正文: 翻到下一屏
    - Enter (输入框内): 发送回复并触发 AI 续写
    - Esc: 一键老板键（秒变纯净代码编译与 Git 状态）
+   - Alt + Y: 同 Alt+T，循环切换主题
+   - 无操作自动伪装: 设置里拖时间滑块，空闲达到时长自动切伪装（Esc 退出）
    - Alt + S: 触发重 roll (Swipe)
    - Alt + X: 中止 AI 生成
-   - Alt + T: 切换主题（深暗 / 经典蓝）
+   - Alt + T: 切换主题（= 伪装风格，16 套，伪装中按了立刻换皮）
    - Alt + 1 ~ 9: 快速调整透明度 (15% ~ 100%)
 ======================================================================================
 """
@@ -28,12 +30,14 @@ import sys
 import os
 import time
 import json
+import ctypes
 import queue
 import socket
 import select
 import struct
 import base64
 import hashlib
+from html import unescape
 import hmac
 import ipaddress
 import secrets
@@ -50,7 +54,387 @@ MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 WS_MAX_PAYLOAD = 1024 * 1024
 WS_HANDSHAKE_LIMIT = 8192
 PID_FILENAME = 'thief_bar.pid'
-BOSS_REPLY_TEXT = "Compiled successfully in 1240 ms. Watching for file changes..."
+# ---------------- 老板键伪装方案：条的外观 + 输入框占位文案 ----------------
+# 分四组：开发工具 / 办公软件 / 影音 / 系统工具，越像平时就摆在那儿的界面越不显眼。
+# 想加新风格：往这里塞一项即可（group 决定挂在菜单哪一组），菜单 / 快捷键 / 设置面板会自动带上它。
+BOSS_GROUPS = [('dev', '开发工具'), ('office', '办公软件'), ('media', '影音播放'), ('system', '系统工具')]
+BOSS_STYLES = {
+    'vscode-ts': {
+        'group': 'dev',
+        'label': 'VS Code · TypeScript',
+        'branch': '⎇ main*  ✓ 0 ⨉ 0',
+        'text': 'TypeScript 5.4.5  UTF-8  LF  Ln 142, Col 8  Ready',
+        'right': 'Ln 142, Col 8',
+        'prefix': ' [webpack]',
+        'reply': 'Compiled successfully in 1240 ms. Watching for file changes...',
+    },
+    'git': {
+        'group': 'dev',
+        'label': 'Git · 仓库状态',
+        'branch': '⎇ feature/refactor ↑2',
+        'text': "Your branch is ahead of 'origin/main' by 2 commits.",
+        'right': '4 changed',
+        'prefix': ' [git]',
+        'reply': 'nothing to commit, working tree clean',
+    },
+    'maven': {
+        'group': 'dev',
+        'label': 'Maven · Java 构建',
+        'branch': '⎇ main  JDK 17',
+        'text': '[INFO] BUILD SUCCESS  Tests run: 214, Failures: 0',
+        'right': '00:41 min',
+        'prefix': ' [mvn]',
+        'reply': '[INFO] Total time: 00:41 min  Finished at: 14:32:07',
+    },
+    'npm': {
+        'group': 'dev',
+        'label': 'npm · 单元测试',
+        'branch': '⎇ main  node 20',
+        'text': 'PASS service.spec.ts  42 passed, 42 total',
+        'right': '42/42',
+        'prefix': ' [npm]',
+        'reply': '> jest --coverage --silent  Done in 3.29s. Watching for changes...',
+    },
+    'docker': {
+        'group': 'dev',
+        'label': 'Docker · 容器编排',
+        'branch': '⎇ main  compose v2',
+        'text': '[+] Running 6/6  Container app-api-1 Started',
+        'right': '6/6',
+        'prefix': ' [compose]',
+        'reply': 'Attaching to app-api-1, app-worker-1, app-db-1',
+    },
+    'pytest': {
+        'group': 'dev',
+        'label': 'Python · pytest',
+        'branch': '⎇ main  py 3.12',
+        'text': 'tests/test_pipeline.py  128 passed in 6.42s',
+        'right': '128 passed',
+        'prefix': ' [pytest]',
+        'reply': 'collected 128 items  ===== 128 passed, 4 warnings in 6.42s =====',
+    },
+    'ci': {
+        'group': 'dev',
+        'label': 'CI · 流水线',
+        'branch': '⎇ main  ✓ pipeline',
+        'text': 'Pipeline #4821  build ✓  test ✓  deploy in progress',
+        'right': '3/4',
+        'prefix': ' [ci]',
+        'reply': 'Waiting for runner-07 to finish deploy stage...',
+    },
+    # ---------------------------- 办公软件 ----------------------------
+    'word': {
+        'group': 'office',
+        'label': 'Word · 文档状态',
+        'branch': '页面 3/7',
+        'text': '字数 1,284   字符数 1,102   段落 46',
+        'right': '100%',
+        'prefix': ' 中文(中国)',
+        'reply': '已保存到 OneDrive - 个人  自动保存已开启',
+    },
+    'excel': {
+        'group': 'office',
+        'label': 'Excel · 表格状态',
+        'branch': 'Sheet1',
+        'text': '平均值: 42.7    计数: 128    求和: 5,465',
+        'right': '就绪',
+        'prefix': ' 常规',
+        'reply': '正在计算 (8 个处理器): 100%',
+    },
+    # ---------------------------- 影音播放 ----------------------------
+    'lyric': {
+        'group': 'media',
+        'label': '音乐 · 桌面歌词',
+        'branch': '♪',
+        'text': '窗外的麻雀 在电线杆上多嘴',
+        'right': '01:42 / 04:51',
+        'prefix': ' [00:42.18]',
+        'reply': '▶ 七里香 - 周杰伦   单曲循环',
+    },
+    'player': {
+        'group': 'media',
+        'label': '播放器 · 迷你进度',
+        'branch': '▶',
+        'text': '七里香 - 周杰伦   高品音质 · 本地文件',
+        'right': '38%',
+        'prefix': ' [播放中]',
+        'reply': '下一首: 晴天 - 周杰伦 (04:29)',
+    },
+    # ---------------------------- 系统工具 ----------------------------
+    'sysmon': {
+        'group': 'system',
+        'live': 'sysmon',      # 真实采样：CPU / 内存 / GPU / 磁盘 / 网络 / 进程数
+        'label': '系统 · 性能监控',
+        'branch': 'CPU 12%',
+        'text': '内存 41%   磁盘 3%   进程 214',
+        'right': '↓ 1.2M ↑ 0.3M',
+        'prefix': ' [监控]',
+        'reply': '采样间隔 1s  ·  无异常进程',
+    },
+    'download': {
+        'group': 'system',
+        'label': '下载 · 进度条',
+        'branch': '⤓',
+        'text': 'ubuntu-24.04.1-desktop.iso   8.4 MB/s   剩余 00:12:31',
+        'right': '62%',
+        'prefix': ' [下载中]',
+        'reply': '目标文件夹: D:\\\\Downloads   同时下载 1 个任务',
+    },
+    'cloud': {
+        'group': 'system',
+        'label': '网盘 · 同步状态',
+        'branch': '☁',
+        'text': '已同步 2,431 个文件   最近更新 1 分钟前   无冲突',
+        'right': '100%',
+        'prefix': ' [OneDrive]',
+        'reply': '同步完成  ·  下次自动同步 10 分钟后',
+    },
+    'ticker': {
+        'group': 'system',
+        'label': '行情 · 股票滚动',
+        'branch': '行情',
+        'text': '上证 3,142.68 +0.42%   深证 9,864.21 -0.18%   创业板 1,932.55 +0.91%',
+        'right': '14:59',
+        'prefix': ' ',
+        'reply': '数据来源: 行情推送  ·  延迟 3s',
+    },
+    'clock': {
+        'group': 'system',
+        'live': 'clock',       # 时间/日期走系统本地时间，只有天气是写死的
+        'label': '桌面 · 时钟天气',
+        'branch': '14:59',
+        'text': '周三 11/26   多云 18°C   湿度 62%   AQI 42',
+        'right': '北京',
+        'prefix': ' ',
+        'reply': '今天 18°C / 9°C  ·  明日有小雨 记得带伞',
+    },
+}
+# 时钟皮的天气部分是固定文案（没有联网取天气的打算），时间日期是真时间
+CLOCK_WEATHER = '多云 18°C   湿度 62%   AQI 42'
+DEFAULT_BOSS_STYLE = 'vscode-ts'
+BOSS_PLACEHOLDERS = frozenset(cfg['reply'] for cfg in BOSS_STYLES.values())
+BOSS_REPLY_TEXT = BOSS_STYLES[DEFAULT_BOSS_STYLE]['reply']   # 兼容旧名：默认风格的占位文案
+
+
+try:
+    from ctypes import wintypes as _wintypes
+except Exception:      # 非 Windows 上只影响性能采样，其余功能照常
+    _wintypes = None
+
+
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [('CStatus', _wintypes.DWORD), ('doubleValue', ctypes.c_double)]
+
+
+class _PDH_FMT_ITEM_W(ctypes.Structure):
+    _fields_ = [('szName', _wintypes.LPWSTR), ('FmtValue', _PDH_FMT_COUNTERVALUE)]
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [('dwLength', _wintypes.DWORD), ('dwMemoryLoad', _wintypes.DWORD),
+                ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+
+
+def _fmt_rate(bps):
+    """字节/秒 → 1.2M 这种短写法。"""
+    try:
+        bps = float(bps)
+    except (TypeError, ValueError):
+        return '0B'
+    if bps >= 1048576:
+        return f"{bps / 1048576:.1f}M"
+    if bps >= 1024:
+        return f"{bps / 1024:.1f}K"
+    return f"{bps:.0f}B"
+
+
+class SysSampler:
+    """性能监控主题的真实数据源：纯 ctypes，不引入 psutil / nvidia-smi。
+
+    - CPU：GetSystemTimes 前后差值（含 idle，busy = total - idle）
+    - 内存：GlobalMemoryStatusEx 的 dwMemoryLoad
+    - GPU / 磁盘 / 网络 / 进程数：系统 PDH 计数器
+        \\GPU Engine(*)\\Utilization Percentage      （只累加 engtype_3D 实例）
+        \\PhysicalDisk(_Total)\\% Disk Time
+        \\Network Interface(*)\\Bytes Received/sec / Bytes Sent/sec
+        \\System\\Processes
+
+    任何一项拿不到就返回 None，由调用方降级显示，绝不让伪装条崩掉。
+    """
+
+    PDH_FMT_DOUBLE = 0x00000200
+    PDH_MORE_DATA = 0x800007D2   # 第一次问 size 时的正常返回码，不是错误
+    NET_SKIP = ('loopback', 'pseudo-interface', 'isatap', 'teredo')
+
+    def __init__(self):
+        self._pdh = None
+        self._query = None
+        self._counters = {}
+        self._cpu_prev = None
+        self._arr_buf = None      # 复用数组缓冲：GPU Engine 实例上千个，每秒新建 160KB 太浪费
+        self._last = {'gpu': None, 'disk': None, 'proc': None, 'net_down': 0.0, 'net_up': 0.0}
+
+    # ---------------- PDH ----------------
+    def _pdh_init(self):
+        if _wintypes is None:
+            return False
+        try:
+            pdh = ctypes.WinDLL('pdh')
+            pdh.PdhOpenQueryW.argtypes = [_wintypes.LPCWSTR, ctypes.c_size_t,
+                                          ctypes.POINTER(_wintypes.HANDLE)]
+            pdh.PdhOpenQueryW.restype = _wintypes.DWORD
+            pdh.PdhAddCounterW.argtypes = [_wintypes.HANDLE, _wintypes.LPCWSTR,
+                                           ctypes.c_size_t, ctypes.POINTER(_wintypes.HANDLE)]
+            pdh.PdhAddCounterW.restype = _wintypes.DWORD
+            pdh.PdhCollectQueryData.argtypes = [_wintypes.HANDLE]
+            pdh.PdhCollectQueryData.restype = _wintypes.DWORD
+            pdh.PdhGetFormattedCounterValue.argtypes = [
+                _wintypes.HANDLE, _wintypes.DWORD, ctypes.c_void_p,
+                ctypes.POINTER(_PDH_FMT_COUNTERVALUE)]
+            pdh.PdhGetFormattedCounterValue.restype = _wintypes.DWORD
+            pdh.PdhGetFormattedCounterArrayW.argtypes = [
+                _wintypes.HANDLE, _wintypes.DWORD, ctypes.POINTER(_wintypes.DWORD),
+                ctypes.POINTER(_wintypes.DWORD), ctypes.c_void_p]
+            pdh.PdhGetFormattedCounterArrayW.restype = _wintypes.DWORD
+
+            query = _wintypes.HANDLE()
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+                return False
+            self._pdh, self._query = pdh, query
+            for key, path in (
+                ('gpu', r'\GPU Engine(*)\Utilization Percentage'),
+                ('disk', r'\PhysicalDisk(_Total)\% Disk Time'),
+                ('net_in', r'\Network Interface(*)\Bytes Received/sec'),
+                ('net_out', r'\Network Interface(*)\Bytes Sent/sec'),
+                ('proc', r'\System\Processes'),
+            ):
+                handle = _wintypes.HANDLE()
+                if pdh.PdhAddCounterW(self._query, path, 0, ctypes.byref(handle)) == 0:
+                    self._counters[key] = handle
+            return bool(self._counters)
+        except Exception as err:
+            print(f"[SysSampler] PDH 初始化失败: {err}", flush=True)
+            self._pdh = None
+            return False
+
+    def _pdh_single(self, key):
+        handle = self._counters.get(key)
+        if handle is None:
+            return None
+        value = _PDH_FMT_COUNTERVALUE()
+        if self._pdh.PdhGetFormattedCounterValue(
+                handle, self.PDH_FMT_DOUBLE, None, ctypes.byref(value)) != 0:
+            return None
+        return float(value.doubleValue) if value.CStatus == 0 else None
+
+    def _pdh_items(self, key):
+        handle = self._counters.get(key)
+        if handle is None:
+            return None
+        size, count = _wintypes.DWORD(0), _wintypes.DWORD(0)
+        rc = self._pdh.PdhGetFormattedCounterArrayW(
+            handle, self.PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), None)
+        if rc not in (0, self.PDH_MORE_DATA) or not size.value:
+            return None
+        if self._arr_buf is None or len(self._arr_buf) < size.value:
+            self._arr_buf = ctypes.create_string_buffer(size.value)
+        buf = self._arr_buf
+        rc = self._pdh.PdhGetFormattedCounterArrayW(
+            handle, self.PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count),
+            ctypes.cast(buf, ctypes.c_void_p))
+        if rc != 0:
+            return None
+        items = ctypes.cast(buf, ctypes.POINTER(_PDH_FMT_ITEM_W))
+        out = []
+        for i in range(count.value):
+            if items[i].FmtValue.CStatus != 0:
+                continue
+            out.append((items[i].szName or '', float(items[i].FmtValue.doubleValue)))
+        return out
+
+    def _pdh_sum(self, key, only_3d=False):
+        items = self._pdh_items(key)
+        if items is None:
+            return None
+        total, seen = 0.0, False
+        for name, value in items:
+            low = name.lower()
+            if only_3d and 'engtype_3d' not in low:
+                continue
+            if any(skip in low for skip in self.NET_SKIP):
+                continue
+            total += value
+            seen = True
+        return total if seen else None
+
+    # ---------------- 单项采样 ----------------
+    def _cpu(self):
+        try:
+            idle, kernel, user = _wintypes.FILETIME(), _wintypes.FILETIME(), _wintypes.FILETIME()
+            if not ctypes.windll.kernel32.GetSystemTimes(
+                    ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+
+            def ticks(ft):
+                return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+            current = (ticks(idle), ticks(kernel) + ticks(user))
+            previous, self._cpu_prev = self._cpu_prev, current
+            if previous is None:
+                return None
+            d_idle = current[0] - previous[0]
+            d_total = current[1] - previous[1]
+            if d_total <= 0:
+                return None
+            return max(0.0, min(100.0, 100.0 * (1.0 - d_idle / d_total)))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _mem():
+        try:
+            status = _MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+            return float(status.dwMemoryLoad)
+        except Exception:
+            return None
+
+    def read(self):
+        """返回一次完整采样；取不到的字段是 None，调用方降级显示。"""
+        result = {'cpu': self._cpu(), 'mem': self._mem(),
+                  'gpu': None, 'disk': None, 'proc': None,
+                  'net_down': 0.0, 'net_up': 0.0}
+        if self._pdh is None and not self._pdh_init():
+            return result
+        try:
+            if self._pdh.PdhCollectQueryData(self._query) != 0:
+                return result
+        except Exception:
+            return result
+
+        gpu = self._pdh_sum('gpu', only_3d=True)
+        if gpu is not None:
+            self._last['gpu'] = max(0.0, min(100.0, gpu))
+        disk = self._pdh_single('disk')
+        if disk is not None:
+            self._last['disk'] = max(0.0, min(100.0, disk))
+        proc = self._pdh_single('proc')
+        if proc is not None:
+            self._last['proc'] = int(round(proc))
+        down = self._pdh_sum('net_in')
+        if down is not None:
+            self._last['net_down'] = max(0.0, down)
+        up = self._pdh_sum('net_out')
+        if up is not None:
+            self._last['net_up'] = max(0.0, up)
+
+        result.update(self._last)
+        return result
 
 
 def _enable_dpi_awareness():
@@ -355,20 +739,28 @@ class SimpleWebSocketServer:
 
     def broadcast(self, data_dict):
         frame = self._encode_text_frame(json.dumps(data_dict, ensure_ascii=False))
+        queued = False
+        stalled = []
         with self.lock:
-            targets = [(s, info) for s, info in self.clients.items() if info['authed']]
-        for sock, info in targets:
-            try:
-                info['queue'].put_nowait(frame)
-            except queue.Full:
-                # 慢客户端积压超过 256 帧直接丢弃，保护广播线程与其他客户端
-                self._drop_client(sock)
+            for sock, info in self.clients.items():
+                if not info['authed']:
+                    continue
+                try:
+                    info['queue'].put_nowait(frame)
+                    queued = True
+                except queue.Full:
+                    stalled.append(sock)
+        # 慢客户端积压超过 256 帧直接断开，避免拖累其他客户端。
+        for sock in stalled:
+            self._drop_client(sock)
+        return queued
 
 
 # ------------------------------------------------------------------------------------
 # 桌面原生双行摸鱼状态栏 GUI
 # ------------------------------------------------------------------------------------
 class ThiefDesktopBar:
+    # 条的基础配色只有这一套（原来的"经典蓝"主题已并入伪装风格，见 BOSS_STYLES）
     THEMES = {
         'vscode-dark': {
             'bg': '#181818',
@@ -379,16 +771,6 @@ class ThiefDesktopBar:
             'input_bg': '#222222',
             'input_fg': '#ffffff',
             'accent': '#007acc'
-        },
-        'vscode-blue': {
-            'bg': '#007acc',
-            'row2_bg': '#006ab3',
-            'fg': '#ffffff',
-            'border': '#0062a3',
-            'char': '#ffe699',
-            'input_bg': '#005994',
-            'input_fg': '#ffffff',
-            'accent': '#ffffff'
         }
     }
 
@@ -399,6 +781,7 @@ class ThiefDesktopBar:
 
         self.root.overrideredirect(True)
         self.root.wm_attributes("-topmost", True)
+        self.root.protocol("WM_DELETE_WINDOW", self.root.quit)
         self.alpha = 0.95
         self.root.wm_attributes("-alpha", self.alpha)
 
@@ -410,18 +793,35 @@ class ThiefDesktopBar:
         self.cur_idx = 1
         self.total_sentences = 1
         self.floor = 0
+        self._chat_id = None
         self.is_boss_key = False
         self.is_generating = False
+        self._generation_status = ('idle', None, 'idle')
+        self._generation_hint = ''
+        self._generation_hint_job = None
+        self._can_retry_generation = False
+        self.reply_choices = ()
+        self._choices_window = None
+        self._ime_composing = False
+        self._ime_confirm_until = 0
         self.stream_text = ''
-        self._pending_sentence_offset = None
+        self._has_full_text = False
+        self._reading_offset = 0
         self._pages = []
         self._page_idx = 0
-        self._pages_ready = False
+        self._floor_request_id = 0
+        self._pending_floor_step = None
+        self._pending_floor_job = None
+        self._queued_navigation = None
         self._hovering = False
         self._auto_read_job = None
+        self._idle_job = None
+        self._last_activity = time.monotonic()
         self._pos_save_job = None
         self._resume_floor = None
         self._resume_offset = None
+        self._resume_chat_id = None
+        self._legacy_width = None
         self._synced_once = False
         self._dock_edge = None
         self._dock_pos = None
@@ -447,8 +847,11 @@ class ThiefDesktopBar:
             'filterMode': 'pure',
             'pagedReading': True,
             'fontSize': 9,
+            'chinesePunctuation': False,
             'autoReadSec': 0,
-            'autoHide': False
+            'autoHide': False,
+            'autoBossSec': 0,
+            'bossStyle': DEFAULT_BOSS_STYLE
         }
 
         self.width = 860
@@ -461,12 +864,7 @@ class ThiefDesktopBar:
         self._load_config()
         self._load_or_create_bridge_token()
         self._resume_pos = self._load_position()
-
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        pos_x = max(0, (screen_w - self.width) // 2)
-        pos_y = max(0, screen_h - self.height - 45)
-        self.root.geometry(f"{self.width}x{self.height}+{pos_x}+{pos_y}")
+        self._saved_window_position = self._load_window_position()
 
         self.font_main = tkfont.Font(family="Microsoft YaHei UI", size=self.config.get('fontSize', 9))
         self.font_bold = tkfont.Font(family="Microsoft YaHei UI", size=9, weight="bold")
@@ -484,6 +882,8 @@ class ThiefDesktopBar:
         self._resize_start_win_x = 0
 
         self._setup_ui()
+        x, y = self._initial_window_position()
+        self._update_geometry_and_wrap(override_x=x, override_y=y)
         self._bind_events()
 
         self.server = SimpleWebSocketServer(
@@ -495,6 +895,7 @@ class ThiefDesktopBar:
         if self.server.allowed_origins:
             print(f"[WebSocket Server] 额外放行来源: {', '.join(sorted(self.server.allowed_origins))}", flush=True)
         self._restart_auto_read()
+        self._start_idle_watch()
         self.root.after(600, self._eval_dock)
 
     def _load_config(self):
@@ -504,7 +905,7 @@ class ThiefDesktopBar:
                     saved = json.load(f)
                     if isinstance(saved, dict):
                         if 'barWidth' in saved and isinstance(saved['barWidth'], (int, float)):
-                            self.width = max(360, min(2560, int(saved['barWidth'])))
+                            self.width = max(360, min(3840, int(saved['barWidth'])))
                         if 'alpha' in saved and isinstance(saved['alpha'], (int, float)):
                             self.alpha = max(0.15, min(1.0, float(saved['alpha'])))
                             self.root.wm_attributes("-alpha", self.alpha)
@@ -512,16 +913,24 @@ class ThiefDesktopBar:
                             self.theme_name = saved['theme']
                             self.theme = self.THEMES[self.theme_name]
                         for k in ['minimalMode', 'layoutMode', 'charNameMode', 'wrapMode',
-                                  'showUserMessages', 'enableWhitelist', 'tagWhitelist', 'tagBlacklist',
+                                  'showUserMessages', 'enableWhitelist',
                                   'filterActions', 'filterMode', 'allowedOrigins', 'pagedReading', 'autoHide']:
                             if k in saved:
                                 self.config[k] = saved[k]
+                        if isinstance(saved.get('chinesePunctuation'), bool):
+                            self.config['chinesePunctuation'] = saved['chinesePunctuation']
+                        self._merge_sync_config({k: saved.get(k) for k in ('tagWhitelist', 'tagBlacklist')})
                         fs = self._clamp_font_size(saved.get('fontSize'))
                         if fs is not None:
                             self.config['fontSize'] = fs
                         sec = saved.get('autoReadSec')
                         if isinstance(sec, int) and not isinstance(sec, bool) and 0 <= sec <= 60:
                             self.config['autoReadSec'] = sec
+                        idle_sec = self._clamp_auto_boss(saved.get('autoBossSec'))
+                        if idle_sec is not None:
+                            self.config['autoBossSec'] = idle_sec
+                        if saved.get('bossStyle') in BOSS_STYLES:
+                            self.config['bossStyle'] = saved['bossStyle']
         except Exception as e:
             print(f"[Load Config Error]: {e}", flush=True)
 
@@ -573,8 +982,11 @@ class ThiefDesktopBar:
             'allowedOrigins': self.config.get('allowedOrigins', []),
             'pagedReading': self.config.get('pagedReading', True),
             'fontSize': self.config.get('fontSize', 9),
+            'chinesePunctuation': self.config.get('chinesePunctuation', False),
             'autoReadSec': self.config.get('autoReadSec', 0),
-            'autoHide': self.config.get('autoHide', False)
+            'autoHide': self.config.get('autoHide', False),
+            'autoBossSec': self.config.get('autoBossSec', 0),
+            'bossStyle': self.config.get('bossStyle', DEFAULT_BOSS_STYLE)
         }
         try:
             self._atomic_write_json(self.config_file, data)
@@ -595,7 +1007,11 @@ class ThiefDesktopBar:
         for v, lo, hi in ((f, 0, 100000), (c, 1, 100000), (o, 0, 10000000)):
             if isinstance(v, bool) or not isinstance(v, int) or not (lo <= v <= hi):
                 return None
-        return {'floor': f, 'curIdx': c, 'pageOffset': o}
+        pos = {'floor': f, 'curIdx': c, 'pageOffset': o}
+        chat_id = data.get('chatId')
+        if isinstance(chat_id, str) and 0 < len(chat_id) <= 512:
+            pos['chatId'] = chat_id
+        return pos
 
     def _position_file(self):
         return os.path.join(os.path.dirname(self.config_file), 'thief_bar_position.json')
@@ -607,40 +1023,100 @@ class ThiefDesktopBar:
         except Exception:
             return None
 
+    def _window_position_file(self):
+        return os.path.join(os.path.dirname(self.config_file), 'thief_bar_window_position.json')
+
+    def _load_window_position(self):
+        try:
+            with open(self._window_position_file(), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if isinstance(data, dict):
+            x, y = data.get('x'), data.get('y')
+            if all(type(n) is int and abs(n) <= 1_000_000 for n in (x, y)):
+                return x, y
+        return None
+
+    def _initial_window_position(self):
+        if self._saved_window_position is None:
+            return (max(0, (self.root.winfo_screenwidth() - self.width) // 2),
+                    max(0, self.root.winfo_screenheight() - self.height - 45))
+        x, y = self._saved_window_position
+        left, top, right, bottom = self._monitor_rect((x, y, x + self.width, y + self.height))
+        if min(x + self.width, right) - max(x, left) < min(self.width, 80):
+            x = max(left, min(x, right - self.width))
+        if min(y + self.height, bottom) - max(y, top) < min(self.height, 12):
+            y = max(top, min(y, bottom - self.height))
+        return x, y
+
+    def _save_window_position(self):
+        if not self.root.winfo_ismapped():
+            return
+        if self._dock_pos is not None and (self._hidden or self._slide_job is not None):
+            position = self._dock_pos
+        else:
+            position = (self.root.winfo_x(), self.root.winfo_y())
+        if position == self._saved_window_position:
+            return
+        x, y = position
+        try:
+            self._atomic_write_json(self._window_position_file(), {'x': x, 'y': y})
+        except OSError as err:
+            print(f"[Save Window Position] {err}")
+            return
+        self._saved_window_position = position
+
     def _schedule_position_save(self):
-        job = getattr(self, '_pos_save_job', None)
-        if job:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        self._pos_save_job = self.root.after(1500, self._save_position_now)
+        if self._pos_save_job is None:
+            self._pos_save_job = self.root.after(350, self._save_position_now)
 
     def _save_position_now(self):
         self._pos_save_job = None
-        # 首次同步前是空白初始状态，保存会覆盖掉待恢复的位置
-        if not getattr(self, '_synced_once', False):
+        # 握手中的临时首屏不能覆盖磁盘上已保存的位置。
+        if not self._synced_once or self._resume_offset is not None:
             return
-        pos = {'floor': self.floor, 'curIdx': self.cur_idx, 'pageOffset': self._page_start_offset()}
-        if pos == getattr(self, '_resume_pos', None):
+        pos = self._current_position()
+        if pos is None or pos == self._resume_pos:
             return
-        self._resume_pos = pos
         try:
             self._atomic_write_json(self._position_file(), pos)
-        except Exception:
-            pass
+        except OSError as err:
+            print(f"[Save Reading Position] {err}")
+            return
+        self._resume_pos = pos
+
+    def _current_position(self):
+        offset = self._reading_offset if self.config.get('pagedReading', True) else 0
+        return self._validate_position({
+            'floor': self.floor, 'curIdx': self.cur_idx, 'pageOffset': offset, 'chatId': self._chat_id
+        })
 
     def _on_ws_authed(self):
         # WS 客户端线程回调：只做向 GUI 线程的 marshaling
         self.root.after(0, self._request_resume)
 
     def _request_resume(self):
-        pos = getattr(self, '_resume_pos', None)
+        self.server.broadcast({'action': 'set_window_width', 'barWidth': self.width})
+        if self._synced_once and self._resume_offset is None:
+            if self._pos_save_job is not None:
+                self.root.after_cancel(self._pos_save_job)
+            self._save_position_now()
+        pos = self._resume_pos if self._resume_offset is not None or not self._synced_once else self._current_position()
         if not pos:
             return
-        self._resume_floor = pos['floor']
-        self._resume_offset = pos['pageOffset']
-        self.server.broadcast({'action': 'resume', 'floor': pos['floor'], 'curIdx': pos['curIdx']})
+        resume = {'action': 'resume', 'floor': pos['floor'], 'curIdx': pos['curIdx']}
+        if 'chatId' in pos:
+            resume['chatId'] = pos['chatId']
+        if self.server.broadcast(resume):
+            self._resume_floor = pos['floor']
+            self._resume_offset = pos['pageOffset']
+            self._resume_chat_id = pos.get('chatId')
+
+    def _clear_pending_resume(self):
+        self._resume_floor = None
+        self._resume_offset = None
+        self._resume_chat_id = None
 
     def _setup_ui(self):
         self.container = tk.Frame(self.root, bg=self.theme['bg'])
@@ -664,12 +1140,13 @@ class ThiefDesktopBar:
         self.floor_frame = tk.Frame(self.left_frame, bg="#252526", bd=1, relief=tk.SOLID)
         self.floor_frame.pack(side=tk.LEFT, padx=(6, 2))
 
-        self.btn_floor_prev = tk.Label(
+        self.btn_floor_prev = tk.Button(
             self.floor_frame, text="▲", font=self.font_mono,
-            bg="#252526", fg="#888888", cursor="hand2", padx=3
+            bg="#252526", fg=self.theme['fg'], activebackground=self.theme['bg'],
+            activeforeground=self.theme['fg'], cursor="hand2", padx=3, pady=0,
+            relief=tk.FLAT, bd=0, highlightthickness=0, command=self.action_floor_prev
         )
         self.btn_floor_prev.pack(side=tk.LEFT)
-        self.btn_floor_prev.bind("<Button-1>", lambda e: self.action_floor_prev())
 
         self.lbl_floor = tk.Label(
             self.floor_frame, text="#0 ▾", font=self.font_mono,
@@ -678,18 +1155,13 @@ class ThiefDesktopBar:
         self.lbl_floor.pack(side=tk.LEFT)
         self.lbl_floor.bind("<Button-1>", lambda e: self.open_floor_jump_dialog())
 
-        self.btn_floor_next = tk.Label(
+        self.btn_floor_next = tk.Button(
             self.floor_frame, text="▼", font=self.font_mono,
-            bg="#252526", fg="#888888", cursor="hand2", padx=3
+            bg="#252526", fg=self.theme['fg'], activebackground=self.theme['bg'],
+            activeforeground=self.theme['fg'], cursor="hand2", padx=3, pady=0,
+            relief=tk.FLAT, bd=0, highlightthickness=0, command=self.action_floor_next
         )
         self.btn_floor_next.pack(side=tk.LEFT)
-        self.btn_floor_next.bind("<Button-1>", lambda e: self.action_floor_next())
-
-        self.lbl_spin = tk.Label(
-            self.left_frame, text="", font=self.font_main,
-            bg=self.theme['bg'], fg='#dcdcaa'
-        )
-        self.lbl_spin.pack(side=tk.LEFT, padx=(4, 0))
 
         # 1.2 右侧状态 & 按钮 (精简为紧凑阅读进度徽章 + 菜单按钮 ⋮，全部按钮收纳至右键菜单，留出最大正文阅读视口)
         self.right_frame = tk.Frame(self.row1, bg=self.theme['bg'])
@@ -709,9 +1181,10 @@ class ThiefDesktopBar:
         self.btn_menu.pack(side=tk.LEFT)
         self.btn_menu.bind("<Button-1>", self._popup_menu_from_btn)
 
-        # 1.3 中间正文阅读（支持自动换行，长句折行全显绝不漏字截断；点击文字直接下一句）
+        # 1.3 中间正文阅读：窗口分配正文视口，文字长度不参与布局
         self.center_frame = tk.Frame(self.row1, bg=self.theme['bg'])
         self.center_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        self.center_frame.pack_propagate(False)
 
         self.lbl_char = tk.Label(
             self.center_frame, text="[ST]:", font=self.font_bold,
@@ -723,13 +1196,21 @@ class ThiefDesktopBar:
         self.lbl_text = tk.Label(
             self.center_frame, text=self.current_sentence, font=self.font_main,
             bg=self.theme['bg'], fg=self.theme['fg'], anchor="w", cursor="hand2",
-            justify=tk.LEFT, wraplength=620
+            justify=tk.LEFT, padx=0, bd=0, highlightthickness=0
         )
         self.lbl_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.lbl_text.bind("<ButtonPress-1>", self._start_drag)
         self.lbl_text.bind("<B1-Motion>", self._on_drag)
         self.lbl_text.bind("<ButtonRelease-1>", self._on_text_click_release)
         self.lbl_text.bind("<Configure>", self._on_text_configure)
+
+        self.btn_generation = tk.Label(self.row1, font=self.font_main, bg=self.theme['bg'], padx=4)
+        self.btn_generation.bind("<Button-1>", self._on_generation_click)
+        self.btn_choices = tk.Button(
+            self.row1, text="选项", font=self.font_main, padx=4, pady=0, bd=0,
+            bg=self.theme['bg'], fg=self.theme['accent'], cursor="hand2",
+            highlightthickness=0, command=self.open_reply_choices
+        )
 
         # ----------------- 第二行：单行快捷回复行 -----------------
         self.row2 = tk.Frame(self.container, bg=self.theme['row2_bg'], height=31)
@@ -747,7 +1228,12 @@ class ThiefDesktopBar:
             insertbackground=self.theme['fg'], relief=tk.FLAT, bd=2
         )
         self.entry_reply.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6), pady=4)
-        self.entry_reply.bind("<Return>", self._submit_reply)
+        self.entry_reply.bind("<Return>", self._on_reply_return)
+        self.entry_reply.bind("<KP_Enter>", self._on_reply_return)
+        self._chinese_punctuation = tk.BooleanVar(value=self.config.get('chinesePunctuation', False))
+        self.entry_reply.bind("<KeyPress>", self._on_reply_key)
+        self.entry_reply.bind("<Button-3>", self._popup_reply_menu)
+        self._watch_reply_ime()
 
         self.btn_send = tk.Label(
             self.row2, text="发送", font=self.font_main,
@@ -758,6 +1244,21 @@ class ThiefDesktopBar:
 
         # 初始化布局与极简模式
         self._apply_layout_and_mode()
+
+    def _ensure_boss_chrome(self):
+        """伪装时强制显示状态栏零件。
+        极简模式平时把左右两翼和前缀都藏了（纯正文最不显眼），但假的"系统状态条/歌词条"
+        恰恰靠左右两翼才像真的，所以只在这时候临时放出来，退出伪装再还原。"""
+        if not (self.left_frame.winfo_manager() and self.right_frame.winfo_manager()):
+            self.center_frame.pack_forget()
+            self.left_frame.pack(side=tk.LEFT, padx=(8, 4))
+            self.right_frame.pack(side=tk.RIGHT, padx=(4, 8))
+            self.center_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+            self._boss_chrome_forced = True
+        if (self.row2.winfo_manager() and self.entry_reply.winfo_manager()
+                and not self.lbl_prefix.winfo_manager()):
+            self.lbl_prefix.pack(side=tk.LEFT, before=self.entry_reply)
+            self._boss_chrome_forced = True
 
     def _apply_layout_and_mode(self):
         is_min = self.config.get('minimalMode', False)
@@ -789,13 +1290,6 @@ class ThiefDesktopBar:
             self.right_frame.pack(side=tk.RIGHT, padx=(4, 8))
             self.center_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
 
-            char_mode = self.config.get('charNameMode', 'compact')
-            if char_mode != 'hidden':
-                self.lbl_char.pack_forget()
-                self.lbl_char.pack(side=tk.LEFT, padx=(0, 6))
-            else:
-                self.lbl_char.pack_forget()
-
             if is_single:
                 self.row2.pack_forget()
                 self.height = 36
@@ -816,32 +1310,17 @@ class ThiefDesktopBar:
         if self.config.get('minimalMode', False):
             return
         narrow = self.width < 560
-        try:
-            if narrow:
-                if self.lbl_branch.winfo_manager():
-                    self.lbl_branch.pack_forget()
-                if self.lbl_char.winfo_manager():
-                    self.lbl_char.pack_forget()
-            else:
-                if not self.lbl_branch.winfo_manager():
-                    self.lbl_branch.pack(side=tk.LEFT, before=self.floor_frame)
-                if not self.lbl_char.winfo_manager():
-                    self.lbl_char.pack(side=tk.LEFT, padx=(0, 6), before=self.lbl_text)
-        except Exception:
-            pass
+        if narrow:
+            self.lbl_branch.pack_forget()
+        elif not self.lbl_branch.winfo_manager():
+            self.lbl_branch.pack(side=tk.LEFT, before=self.floor_frame)
 
-    def _text_width_px(self):
-        """正文一行能用的像素宽度：极简模式整条可用，标准模式扣掉左右装饰件的实际宽度。"""
-        if self.config.get('minimalMode', False):
-            return max(80, int(self.width - 24))
-
-        def _req(widget):
-            try:
-                return widget.winfo_reqwidth() if widget.winfo_manager() else 0
-            except Exception:
-                return 0
-        pad = _req(self.left_frame) + _req(self.right_frame) + _req(self.lbl_char) + 24
-        return max(80, int(self.width - pad))
+        show_char = (not narrow and self.config.get('charNameMode', 'compact') != 'hidden'
+                     and self.lbl_char.winfo_reqwidth() <= self.width // 2)
+        if not show_char:
+            self.lbl_char.pack_forget()
+        elif not self.lbl_char.winfo_manager():
+            self.lbl_char.pack(side=tk.LEFT, padx=(0, 6), before=self.lbl_text)
 
     # ---------------- 分页（整句优先，超宽按条宽硬切） ----------------
     STRONG_BREAKS = set("。！？!?…；\n")
@@ -872,15 +1351,7 @@ class ThiefDesktopBar:
             return [(0, 0)]
         i = 0
         while i < n:
-            lo, hi, best = 1, n - i, 1
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                if self.font_main.measure(text[i:i + mid]) <= width:
-                    best = mid
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
-            end = i + best
+            end = max(i + 1, self._fitting_end(text, i, width))
             if end < n:
                 # ① 本屏内有句末标点 -> 断在句末（自然分段，不必填满）
                 cut = -1
@@ -890,8 +1361,17 @@ class ThiefDesktopBar:
                         break
                 if cut > 0:
                     end = cut
-                elif text[end] in self.TRAILING_PUNCT:
-                    end += 1          # ② 没有句末标点 -> 按条宽硬切，紧跟的标点留在本页
+                elif (end > i + 1 and text[end] in self.TRAILING_PUNCT
+                      and self.font_main.measure(text[end - 1:end + 1]) <= width):
+                    # 标点放不下时，把前一个字也移到下一屏。
+                    end -= 1
+                elif not text[end - 1].isspace() and not text[end].isspace():
+                    # 附近有词间空格时，把本来会从中间切开的词移到下一屏。
+                    lookback = max(i + 1, end - max(4, (end - i) // 4))
+                    for pos in range(end - 1, lookback - 1, -1):
+                        if text[pos - 1].isspace() and not text[pos].isspace():
+                            end = pos
+                            break
             pages.append((i, end))
             i = end
         return pages
@@ -926,16 +1406,15 @@ class ThiefDesktopBar:
         pages = getattr(self, '_pages', None) or []
         if self.config.get('pagedReading', True) and len(pages) > 1:
             idx = max(0, min(self._page_idx, len(pages) - 1))
-            return f"{base} 屏{idx + 1}/{len(pages)}"
+            digits = len(str(len(pages)))
+            return f"{base} 屏{idx + 1:>{digits}}/{len(pages)}"
         return base
 
     def toggle_paged_reading(self):
         self.config['pagedReading'] = not self.config.get('pagedReading', True)
         self._save_config()
-        self._page_idx = 0
-        self._pfx_key = None
         self._update_display()
-        self.flash_hint("➡ 整段分屏: 已开启" if self.config['pagedReading'] else "⏸ 整段分屏: 已关闭（单行截断，一次看完）")
+        self.flash_hint("已切换为整段分屏" if self.config['pagedReading'] else "已切换为逐句截断")
 
     def _truncate_to_width(self, text, max_px):
         """关闭分屏时的单行截断：预留省略号宽度，超出部分以'…'结尾。"""
@@ -943,17 +1422,25 @@ class ThiefDesktopBar:
             return ""
         if self.font_main.measure(text) <= max_px:
             return text
-        budget = max(0, int(max_px) - self.font_main.measure('…'))
-        low, high, best = 1, len(text), 0
+        ellipsis = '…'
+        if self.font_main.measure(ellipsis) > max_px:
+            return ""
+        end = self._fitting_end(text, 0, max_px, suffix=ellipsis)
+        return text[:end].rstrip() + ellipsis
+
+    def _fitting_end(self, text, start, width, suffix=''):
+        low, high = start, min(len(text), start + 32)
+        while self.font_main.measure(text[start:high] + suffix) <= width:
+            if high == len(text):
+                return high
+            low, high = high, min(len(text), start + 2 * (high - start))
         while low <= high:
             mid = (low + high) // 2
-            if self.font_main.measure(text[:mid]) <= budget:
-                best = mid
+            if self.font_main.measure(text[start:mid] + suffix) <= width:
                 low = mid + 1
             else:
                 high = mid - 1
-        head = text[:best].rstrip()
-        return (head + '…') if head else '…'
+        return high
 
     def _update_geometry_and_wrap(self, override_x=None, override_y=None):
         if not hasattr(self, 'lbl_text') or not self.lbl_text.winfo_exists():
@@ -968,9 +1455,6 @@ class ThiefDesktopBar:
         else:
             self.height = 36 if is_single else 68
 
-        # 一行到底：不让 Tk 自己折行
-        self.lbl_text.configure(wraplength=0)
-
         # 保持当前绝对坐标（支持多显示器、副屏负坐标与超宽坐标，绝不发生跨屏漂移）
         # 窗口尚未映射时 winfo_x/y 恒为 0，此时改写几何会把 __init__ 的初始定位冲掉
         if override_x is None and override_y is None and not self.root.winfo_ismapped():
@@ -983,30 +1467,17 @@ class ThiefDesktopBar:
             self._last_geometry = geo
             self.root.geometry(geo)
 
-    def _on_text_configure(self, event=None):
-        """工具条被拖边缩放 / 切换布局导致正文宽度变化时，重新折行（120ms 去抖）。"""
-        try:
-            w = event.width if event is not None else self.lbl_text.winfo_width()
-        except Exception:
+    def _on_text_configure(self, event):
+        if event.width == getattr(self, '_label_w_last', 0):
             return
-        if w <= 40:
-            return
-        if abs(w - getattr(self, '_label_w_last', 0)) < 6:
-            return
-        self._label_w_last = w
-        job = getattr(self, '_resize_job', None)
-        if job:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        self._resize_job = self.root.after(120, self._on_viewport_changed)
+        self._label_w_last = event.width
+        if getattr(self, '_resize_job', None) is None:
+            self._resize_job = self.root.after_idle(self._on_viewport_changed)
 
     def _on_viewport_changed(self):
         self._resize_job = None
-        if getattr(self, 'is_boss_key', False):
-            return
-        self._update_display()
+        if not self.is_boss_key:
+            self._update_reading_view()
 
     def _cmd(self, func, *args, **kwargs):
         def _handler():
@@ -1017,6 +1488,52 @@ class ThiefDesktopBar:
                     pass
             func(*args, **kwargs)
         return _handler
+
+    def _build_style_menu(self, parent, with_cycle=True):
+        """主题 = 伪装风格：按「开发 / 办公 / 影音 / 系统」分组列出 16 套皮肤。"""
+        menu = tk.Menu(
+            parent,
+            tearoff=0,
+            bg="#1e1e1e",
+            fg="#cccccc",
+            activebackground="#094771",
+            activeforeground="#ffffff",
+            font=self.font_main,
+            bd=1,
+            relief=tk.SOLID
+        )
+        cur_style_id = self._boss_style_id()
+        for group_id, group_label in BOSS_GROUPS:
+            members = [(sid, cfg) for sid, cfg in BOSS_STYLES.items() if cfg.get('group') == group_id]
+            if not members:
+                continue
+            group_menu = tk.Menu(
+                menu,
+                tearoff=0,
+                bg="#1e1e1e",
+                fg="#cccccc",
+                activebackground="#094771",
+                activeforeground="#ffffff",
+                font=self.font_main,
+                bd=1,
+                relief=tk.SOLID
+            )
+            for style_id, style_cfg in members:
+                mark = "✓ " if style_id == cur_style_id else "   "
+                group_menu.add_command(
+                    label=f"{mark}{style_cfg['label']}",
+                    command=self._cmd(lambda s=style_id: self.set_boss_style(s))
+                )
+            in_group = any(sid == cur_style_id for sid, _ in members)
+            menu.add_cascade(
+                label=f"{'✓ ' if in_group else '   '}{group_label} ({len(members)})",
+                menu=group_menu
+            )
+        if with_cycle:
+            menu.add_separator()
+            menu.add_command(label="下一个主题", accelerator="Alt+T",
+                             command=self._cmd(self.cycle_theme))
+        return menu
 
     def _setup_context_menu(self):
         self.context_menu = tk.Menu(
@@ -1034,7 +1551,6 @@ class ThiefDesktopBar:
         is_min = self.config.get('minimalMode', False)
         is_single = self.config.get('layoutMode', 'double') == 'single'
         is_privacy = self.config.get('privacyMode', False)
-        is_wrap = self.config.get('wrapMode', 'wrap') == 'wrap'
         show_user = self.config.get('showUserMessages', False)
 
         # 1. 核心模式切换 (简洁勾选标记，杜绝花俏图标)
@@ -1064,9 +1580,12 @@ class ThiefDesktopBar:
         # 2. 阅读与生成控制 (文字清爽简明，快捷键右对齐)
         self.context_menu.add_command(label="上一句", accelerator="←", command=self._cmd(self.action_prev))
         self.context_menu.add_command(label="下一句", accelerator="→", command=self._cmd(self.action_next))
-        self.context_menu.add_command(label="重新生成", accelerator="Alt+S", command=self._cmd(self.action_swipe))
+        label = "重试生成" if self._can_retry_generation else "重新生成"
+        self.context_menu.add_command(label=label, accelerator="Alt+S", command=self._cmd(self.action_swipe))
         if self.is_generating:
             self.context_menu.add_command(label="中止生成", accelerator="Alt+X", command=self._cmd(self.action_stop))
+        if self.reply_choices and not self.is_boss_key:
+            self.context_menu.add_command(label="查看回复选项", command=self._cmd(self.open_reply_choices))
 
         self.context_menu.add_separator()
 
@@ -1082,10 +1601,10 @@ class ThiefDesktopBar:
         self.context_menu.add_separator()
 
         # 4. 显示与外观设置
-        mark_wrap = "✓ " if is_wrap else "   "
+        mark_paged = "✓ " if self.config.get('pagedReading', True) else "   "
         self.context_menu.add_command(
-            label=f"{mark_wrap}自动折行全显",
-            command=self._cmd(self.toggle_wrap_mode)
+            label=f"{mark_paged}整段分屏阅读",
+            command=self._cmd(self.toggle_paged_reading)
         )
 
         # 窗口长度调整子菜单
@@ -1157,10 +1676,9 @@ class ThiefDesktopBar:
             command=self._cmd(self.toggle_show_user_messages)
         )
 
-        self.context_menu.add_command(
-            label="切换主题",
-            accelerator="Alt+T",
-            command=self._cmd(self.toggle_theme)
+        self.context_menu.add_cascade(
+            label=f"主题 · {BOSS_STYLES[self._boss_style_id()]['label']}",
+            menu=self._build_style_menu(self.context_menu)
         )
 
         if not is_min:
@@ -1175,17 +1693,62 @@ class ThiefDesktopBar:
         self.context_menu.add_separator()
 
         # 5. 系统控制与设置
-        boss_label = "退出伪装" if self.is_boss_key else "老板键 (伪装)"
-        self.context_menu.add_command(
-            label=boss_label,
+        cur_style_id = self._boss_style_id()
+        boss_menu = tk.Menu(
+            self.context_menu,
+            tearoff=0,
+            bg="#1e1e1e",
+            fg="#cccccc",
+            activebackground="#094771",
+            activeforeground="#ffffff",
+            font=self.font_main,
+            bd=1,
+            relief=tk.SOLID
+        )
+        boss_menu.add_command(
+            label="退出伪装" if self.is_boss_key else "进入伪装",
             accelerator="Esc",
             command=self._cmd(self.toggle_boss)
         )
-        mark_paged = "✓ " if self.config.get('pagedReading', True) else "   "
-        self.context_menu.add_command(
-            label=f"{mark_paged}整段分屏阅读",
-            command=self._cmd(self.toggle_paged_reading)
+        # 主题（= 伪装风格）已并入上一级「主题」菜单，这里不再重复一份
+        top_label = "老板键 · 退出伪装" if self.is_boss_key else "老板键 · 进入伪装"
+        self.context_menu.add_cascade(label=top_label, menu=boss_menu)
+        boss_sec = self._auto_boss_seconds()
+        idle_menu = tk.Menu(
+            self.context_menu,
+            tearoff=0,
+            bg="#1e1e1e",
+            fg="#cccccc",
+            activebackground="#094771",
+            activeforeground="#ffffff",
+            font=self.font_main,
+            bd=1,
+            relief=tk.SOLID
         )
+        self._auto_boss_var = tk.IntVar(value=boss_sec)
+        for sec, label in [(0, "关闭"), (30, "30 秒无操作"), (60, "1 分钟无操作"),
+                           (180, "3 分钟无操作"), (300, "5 分钟无操作")]:
+            idle_menu.add_radiobutton(
+                label=label,
+                variable=self._auto_boss_var,
+                value=sec,
+                command=self._cmd(lambda s=sec: self.set_auto_boss(s))
+            )
+        idle_menu.add_separator()
+        idle_menu.add_command(label="时间滑块...", command=self._cmd(self.open_auto_boss_dialog))
+        idle_menu.add_command(label="自动伪装诊断...", command=self._cmd(self.open_idle_diag_dialog))
+        if boss_sec:
+            boss_state = self._auto_boss_state()
+            tail = {
+                'due': "待触发",
+                'suspended': "已挂起(设置窗开着)",
+                'hovering': "鼠标在条上",
+                'disguised': "伪装中",
+            }.get(boss_state['phase'], f"还剩 {int(round(boss_state['remaining']))}s")
+            idle_label = f"无操作自动伪装 ({self._fmt_sec(boss_sec)} · {tail})"
+        else:
+            idle_label = "无操作自动伪装 (关)"
+        self.context_menu.add_cascade(label=idle_label, menu=idle_menu)
         mark_hide = "✓ " if self.config.get('autoHide', False) else "   "
         self.context_menu.add_command(
             label=f"{mark_hide}贴边自动隐藏",
@@ -1271,48 +1834,43 @@ class ThiefDesktopBar:
 
         self.root.bind("<MouseWheel>", self._on_mousewheel)
 
-        self.root.bind("<Right>", lambda e: self.action_next())
-        self.root.bind("<Left>", lambda e: self.action_prev())
-        self.root.bind("<k>", lambda e: self.action_next())
-        self.root.bind("<j>", lambda e: self.action_prev())
-        self.root.bind("<Escape>", lambda e: self.toggle_boss())
+        reading_keys = {
+            "<Right>": self.action_next,
+            "<Left>": self.action_prev,
+            "<k>": self.action_next,
+            "<K>": self.action_next,
+            "<j>": self.action_prev,
+            "<J>": self.action_prev,
+            "<Prior>": self.action_floor_prev,
+            "<Next>": self.action_floor_next,
+            "<Control-Right>": lambda: self.change_window_width(100),
+            "<Control-Left>": lambda: self.change_window_width(-100),
+            "<Control-Up>": self.auto_fit_text_length,
+        }
+        for sequence, action in reading_keys.items():
+            self.root.bind(sequence, lambda event, command=action: self._reading_shortcut(event, command))
+        self.root.bind("<Escape>", self._on_boss_shortcut)
 
         self.root.bind("<Alt-s>", lambda e: self.action_swipe())
         self.root.bind("<Alt-S>", lambda e: self.action_swipe())
         self.root.bind("<Alt-x>", lambda e: self.action_stop())
         self.root.bind("<Alt-X>", lambda e: self.action_stop())
-        self.root.bind("<Alt-t>", lambda e: self.toggle_theme())
-        self.root.bind("<Alt-T>", lambda e: self.toggle_theme())
-
-        self.root.bind("<Prior>", lambda e: self.action_floor_prev())
-        self.root.bind("<Next>", lambda e: self.action_floor_next())
-
-        # 键盘宽度调节快捷键 (Ctrl+Right 加长, Ctrl+Left 缩短, Ctrl+Up 自动适应)
-        def _on_ctrl_right(e):
-            if e.widget == getattr(self, 'entry_reply', None):
-                return
-            self.change_window_width(100)
-            return "break"
-
-        def _on_ctrl_left(e):
-            if e.widget == getattr(self, 'entry_reply', None):
-                return
-            self.change_window_width(-100)
-            return "break"
-
-        def _on_ctrl_up(e):
-            self.auto_fit_text_length()
-            return "break"
-
-        self.root.bind("<Control-Right>", _on_ctrl_right)
-        self.root.bind("<Control-Left>", _on_ctrl_left)
-        self.root.bind("<Control-Up>", _on_ctrl_up)
+        self.root.bind("<Alt-t>", lambda e: self.cycle_theme())
+        self.root.bind("<Alt-T>", lambda e: self.cycle_theme())
+        self.root.bind("<Alt-y>", lambda e: self.cycle_boss_style())
+        self.root.bind("<Alt-Y>", lambda e: self.cycle_boss_style())
 
         for n in range(1, 10):
             self.root.bind(f"<Alt-Key-{n}>", lambda e, val=n: self.set_opacity(val / 10.0))
 
         self.root.bind("<Enter>", self._on_window_enter)
         self.root.bind("<Leave>", self._on_window_leave)
+
+    def _reading_shortcut(self, event, command):
+        if event.widget is not self.entry_reply:
+            command()
+            return "break"
+        return None
 
     def _on_window_enter(self, event=None):
         self._hovering = True
@@ -1353,7 +1911,9 @@ class ThiefDesktopBar:
             getattr(self, 'lbl_right_info', None),
             getattr(self, 'btn_menu', None),
             getattr(self, 'lbl_char', None),
-            getattr(self, 'btn_send', None)
+            getattr(self, 'btn_send', None),
+            self.btn_generation,
+            self.btn_choices
         }
         if widget != getattr(self, 'entry_reply', None):
             widget.bind("<Motion>", self._on_mouse_motion)
@@ -1469,30 +2029,33 @@ class ThiefDesktopBar:
             self.root.geometry(f"+{new_x}+{new_y}")
 
     def _on_drag_release(self, event):
+        moved = self._is_resizing or self._has_dragged
         if getattr(self, '_is_resizing', False):
             self._is_resizing = False
             self._resize_mode = None
-            self._save_config()
-            self.server.broadcast({
-                'action': 'set_window_width',
-                'barWidth': self.width
-            })
+            self._save_window_width()
+        if moved:
+            self.root.after_idle(self._save_window_position)
+        self._has_dragged = False
         self._eval_dock()
 
     def _on_text_click_release(self, event):
-        if getattr(self, '_is_resizing', False):
+        if self._is_resizing or self._has_dragged:
             self._on_drag_release(event)
             return
-        if not getattr(self, '_has_dragged', False):
-            if not self.is_boss_key:
-                self.action_next()
-        else:
-            self._eval_dock()
-        self._has_dragged = False
+        if not self.is_boss_key:
+            self.lbl_text.focus_set()
+            self.action_next()
 
     def set_window_width(self, w):
-        self.width = max(360, min(3840, int(w)))
+        width = max(360, min(3840, int(w)))
+        if width == self.width:
+            return
+        self.width = width
         self._update_display()
+        self._save_window_width()
+
+    def _save_window_width(self):
         self._save_config()
         self.server.broadcast({
             'action': 'set_window_width',
@@ -1503,29 +2066,37 @@ class ThiefDesktopBar:
         self.set_window_width(self.width + delta)
 
     def auto_fit_text_length(self):
-        if not self.current_sentence:
+        if self.is_boss_key or self._hidden:
             return
-        text_w = self.font_main.measure(self.current_sentence)
-        is_min = self.config.get('minimalMode', False)
-        if is_min:
-            other_w = 40
-            min_limit = 380
-        else:
-            char_mode = self.config.get('charNameMode', 'compact')
-            char_w = 0 if char_mode == 'hidden' else 65
-            other_w = 320 + char_w
-            min_limit = 520
-
-        max_limit = 2560
-
-        # 理想单行容纳长度
-        ideal_w = text_w + other_w
-        if ideal_w <= max_limit:
-            target_w = max(min_limit, ideal_w)
-        else:
-            target_w = min(max_limit, max(860, (text_w // 2) + other_w))
-
-        self.set_window_width(target_w)
+        text = self.current_sentence.strip()
+        if self.config.get('pagedReading', True):
+            stream = self._stream()
+            start = self._page_start_offset()
+            breaks = self.STRONG_BREAKS | {'.', ';'}
+            end = next((i + 1 for i in range(start, len(stream)) if stream[i] in breaks), len(stream))
+            text = stream[start:end].strip() or text
+        if not text:
+            return
+        text_width = self.font_main.measure(text)
+        self.root.update_idletasks()
+        left, _, right, _ = self._monitor_rect()
+        max_width = min(3840, right - left)
+        if max_width < 360:
+            return
+        old_width, x = self.width, self.root.winfo_x()
+        # 跨过窄条阈值时，分支、角色名和进度会重新占位。
+        for _ in range(3):
+            occupied = self.root.winfo_width() - self.lbl_text.winfo_width()
+            target = min(max_width, max(360, text_width + occupied + 8))
+            self.width = target
+            self._apply_narrow_chrome()
+            self._update_geometry_and_wrap(override_x=max(left, min(x, right - target)))
+            self.root.update_idletasks()
+            if self.lbl_text.winfo_width() >= text_width or target == max_width:
+                break
+        if self.width != old_width:
+            self._save_window_width()
+        self._eval_dock()
 
     def open_custom_width_dialog(self):
         if self.is_boss_key:
@@ -1549,7 +2120,7 @@ class ThiefDesktopBar:
         lbl_title.pack(anchor="w", padx=14, pady=(12, 6))
 
         scale = tk.Scale(
-            win, from_=360, to=2560, orient=tk.HORIZONTAL,
+            win, from_=360, to=3840, orient=tk.HORIZONTAL,
             bg="#1e1e1e", fg="#cccccc", activebackground="#0e639c",
             highlightthickness=0, troughcolor="#2b2b2b", bd=0,
             command=lambda val: [
@@ -1650,7 +2221,9 @@ class ThiefDesktopBar:
         ).pack(side=tk.RIGHT)
 
     def _on_mousewheel(self, event):
-        if self.is_boss_key:
+        if self.is_boss_key or not event.delta or event.widget is self.entry_reply:
+            return
+        if self.root.winfo_containing(event.x_root, event.y_root) is self.entry_reply:
             return
         if event.state & 0x0004:  # Ctrl+滚轮：缩放正文字号
             self._zoom_font(1 if event.delta > 0 else -1)
@@ -1711,7 +2284,7 @@ class ThiefDesktopBar:
         except Exception:
             focused = None
         if not self._auto_read_paused(focused):
-            self.action_next()
+            self._turn_page(1, automatic=True)
         self._auto_read_job = self.root.after(sec * 1000, self._auto_read_tick)
 
     # ---------------- 贴边自动隐藏 ----------------
@@ -1738,7 +2311,7 @@ class ThiefDesktopBar:
             return (ml - w + strip, y)
         return (mr - strip, y)
 
-    def _monitor_rect(self):
+    def _monitor_rect(self, window_rect=None):
         """窗口所在显示器的工作区矩形（不含任务栏）；失败回退主屏。"""
         try:
             import ctypes
@@ -1748,10 +2321,21 @@ class ThiefDesktopBar:
             class MONITORINFO(ctypes.Structure):
                 _fields_ = [('cbSize', wintypes.DWORD), ('rcMonitor', wintypes.RECT),
                             ('rcWork', wintypes.RECT), ('dwFlags', wintypes.DWORD)]
-            hwnd = u32.GetParent(self.root.winfo_id())
-            hmon = u32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+            if window_rect is None:
+                u32.GetParent.argtypes = [wintypes.HWND]
+                u32.GetParent.restype = wintypes.HWND
+                u32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+                u32.MonitorFromWindow.restype = wintypes.HANDLE
+                child = self.root.winfo_id()
+                hmon = u32.MonitorFromWindow(u32.GetParent(child) or child, 2)
+            else:
+                u32.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
+                u32.MonitorFromRect.restype = wintypes.HANDLE
+                hmon = u32.MonitorFromRect(ctypes.byref(wintypes.RECT(*window_rect)), 2)  # MONITOR_DEFAULTTONEAREST
             mi = MONITORINFO()
             mi.cbSize = ctypes.sizeof(MONITORINFO)
+            u32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+            u32.GetMonitorInfoW.restype = wintypes.BOOL
             if hmon and u32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
                 r = mi.rcWork
                 return (r.left, r.top, r.right, r.bottom)
@@ -1837,51 +2421,432 @@ class ThiefDesktopBar:
             self._auto_hide_reveal()
             self.flash_hint("🧲 贴边自动隐藏: 已关闭")
 
-    def action_next(self):
-        if self.is_boss_key:
-            return
-        # 本条消息还没翻完：翻到下一屏
-        if self.config.get('pagedReading', True) and self._has_more_pages():
-            self._page_idx += 1
-            self._render_page()
-            return
-        # 看完了，向酒馆请求下一句（先给个进行中提示，避免看起来卡住）
+    # ---------------- 无操作自动伪装（老板键） ----------------
+    AUTO_BOSS_MIN_SEC = 5
+    AUTO_BOSS_MAX_SEC = 3600
+    AUTO_BOSS_TICK_MS = 1000
+
+    @classmethod
+    def _clamp_auto_boss(cls, value):
+        # 0 = 关闭；其余夹到 5s ~ 1h，避免误存 1 秒导致刚离开就伪装
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if value <= 0:
+            return 0
+        return max(cls.AUTO_BOSS_MIN_SEC, min(cls.AUTO_BOSS_MAX_SEC, int(value)))
+
+    @staticmethod
+    def _fmt_sec(sec):
+        if sec <= 0:
+            return "关闭"
+        if sec < 60:
+            return f"{sec} 秒"
+        if sec % 60 == 0:
+            return f"{sec // 60} 分钟"
+        return f"{sec // 60} 分 {sec % 60} 秒"
+
+    def _auto_boss_seconds(self):
+        sec = self.config.get('autoBossSec', 0)
+        if isinstance(sec, bool) or not isinstance(sec, int) or sec <= 0:
+            return 0
+        return sec
+
+    def _start_idle_watch(self):
+        """记录最后一次桌面交互，并按秒轮询是否该自动进入伪装。"""
+        for seq in ('<Motion>', '<ButtonPress>', '<ButtonRelease>', '<KeyPress>',
+                    '<KeyRelease>', '<MouseWheel>', '<FocusIn>', '<Enter>', '<Leave>'):
+            try:
+                self.root.bind_all(seq, self._note_activity, add='+')
+            except tk.TclError:
+                pass
+        self._note_activity()
+        self._idle_tick()
+
+    def _note_activity(self, event=None):
+        self._last_activity = time.monotonic()
+
+    @staticmethod
+    def _system_idle_seconds():
+        # 全系统最后输入时间：人离开桌面就算空闲，不要求鼠标正好停在摸鱼条上
+        if not sys.platform.startswith('win'):
+            return None
         try:
-            self.lbl_spin.configure(text="⟳")
+            import ctypes
+            from ctypes import wintypes
+
+            class _LastInputInfo(ctypes.Structure):
+                _fields_ = [('cbSize', wintypes.UINT), ('dwTime', wintypes.DWORD)]
+
+            info = _LastInputInfo()
+            info.cbSize = ctypes.sizeof(_LastInputInfo)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                return None
+            elapsed_ms = int(ctypes.windll.kernel32.GetTickCount()) - int(info.dwTime)
+            return max(0.0, elapsed_ms / 1000.0)
         except Exception:
-            pass
-        self.server.broadcast({'action': 'next'})
+            return None
+
+    def _idle_seconds(self):
+        local = max(0.0, time.monotonic() - self._last_activity)
+        system = self._system_idle_seconds()
+        if system is None:
+            return local
+        # 两条时钟取"更大"的那个：摸鱼条自身没交互 / 全系统没输入，任一成立就算离开。
+        # 取 min 会被"鼠标路过、防熄屏工具抖一下"永久清零，等于永不触发。
+        return max(local, system)
+
+    def _auto_boss_state(self):
+        """给倒计时显示、诊断窗口和 WS 查询共用的一份状态快照。"""
+        sec = self._auto_boss_seconds()
+        local = max(0.0, time.monotonic() - self._last_activity)
+        system = self._system_idle_seconds()
+        idle = local if system is None else max(local, system)
+        blocked = self._auto_boss_blocked()
+        hovering = bool(getattr(self, '_hovering', False))
+        if self.is_boss_key:
+            phase = 'disguised'
+        elif sec <= 0:
+            phase = 'off'
+        elif blocked:
+            phase = 'suspended'
+        elif hovering:
+            phase = 'hovering'
+        elif idle >= sec:
+            phase = 'due'
+        else:
+            phase = 'counting'
+        return {
+            'autoBossSec': sec,
+            'localIdle': round(local, 1),
+            'systemIdle': None if system is None else round(system, 1),
+            'idle': round(idle, 1),
+            'remaining': round(max(0.0, sec - idle), 1) if sec else 0.0,
+            'phase': phase,
+            'blocked': blocked,
+            'hovering': hovering,
+        }
+
+    def _idle_tick(self):
+        self._idle_job = None
+        try:
+            self._maybe_auto_disguise()
+            if self.is_boss_key:
+                self._refresh_live_disguise()
+        except Exception as err:
+            print(f"[Auto Boss] 空闲检查失败: {err}", flush=True)
+        try:
+            self._idle_job = self.root.after(self.AUTO_BOSS_TICK_MS, self._idle_tick)
+        except tk.TclError:
+            self._idle_job = None
+
+    def _auto_boss_blocked(self):
+        # 设置面板 / 回复候选窗开着时人还在，别抢着伪装
+        for attr in ('_settings_win', '_auto_boss_win', '_choices_window'):
+            win = getattr(self, attr, None)
+            try:
+                if win is not None and win.winfo_exists():
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _maybe_auto_disguise(self):
+        state = self._auto_boss_state()
+        if state['phase'] != 'due':
+            return
+        # 静默切换：这一刻屏幕上可能正好有人看，弹提示等于自曝
+        print(f"[Auto Boss] 无操作 {state['idle']}s（阈值 {state['autoBossSec']}s），自动进入伪装", flush=True)
+        self.toggle_boss(True)
+
+    def set_auto_boss(self, sec, announce=True):
+        clamped = self._clamp_auto_boss(sec)
+        if clamped is None:
+            return
+        self.config['autoBossSec'] = clamped
+        self._save_config()
+        self._note_activity()   # 改完立刻重新计时
+        if announce:
+            if clamped:
+                self.flash_hint(f"🙈 无操作自动伪装: {self._fmt_sec(clamped)}后切代码伪装")
+            else:
+                self.flash_hint("🙈 无操作自动伪装: 已关闭")
+
+    def open_idle_diag_dialog(self):
+        """把"到底为什么没伪装"直接摊在屏幕上：两条时钟、剩余秒数、当前阶段。"""
+        if getattr(self, '_idle_diag_win', None) and self._idle_diag_win.winfo_exists():
+            self._idle_diag_win.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("自动伪装诊断")
+        win.configure(bg="#1e1e1e")
+        win.wm_attributes("-topmost", True)
+        win.resizable(False, False)
+        self._idle_diag_win = win
+
+        tk.Label(win, text="自动伪装诊断", font=self.font_bold,
+                 bg="#1e1e1e", fg="#9cdcfe").pack(anchor="w", padx=14, pady=(12, 4))
+
+        grid = tk.Frame(win, bg="#1e1e1e")
+        grid.pack(fill=tk.X, padx=14)
+        rows = {}
+        for key, label in (('sec', '设置时长'), ('local', '条内空闲'), ('system', '系统空闲'),
+                           ('idle', '判定空闲'), ('remain', '距离触发'), ('phase', '当前状态')):
+            tk.Label(grid, text=f"{label}:", font=self.font_main, bg="#1e1e1e",
+                     fg="#888888", anchor="w", width=10).grid(row=len(rows), column=0, sticky="w")
+            val = tk.Label(grid, text="-", font=self.font_bold, bg="#1e1e1e", fg="#4ec9b0", anchor="w")
+            val.grid(row=len(rows), column=1, sticky="w")
+            rows[key] = val
+
+        tk.Label(
+            win,
+            text="判定：条内空闲 / 系统空闲 任一达到设置时长即触发（鼠标压在条上不触发）\n"
+                 "系统空闲 = Windows 最后一次键鼠输入，别的程序注入输入也会把它清零",
+            font=self.font_main, bg="#1e1e1e", fg="#7a7a7a", justify="left"
+        ).pack(anchor="w", padx=14, pady=(8, 2))
+
+        phase_text = {
+            'off': "关闭（0 秒）",
+            'counting': "正常倒计时",
+            'due': "已到时长，本 tick 即触发",
+            'suspended': "已挂起：设置 / 滑块窗口开着",
+            'hovering': "暂停：鼠标正压在条上",
+            'disguised': "已在伪装状态（Esc 退出）",
+        }
+
+        def refresh():
+            try:
+                if not win.winfo_exists():
+                    return
+                st = self._auto_boss_state()
+                rows['sec'].configure(text=self._fmt_sec(st['autoBossSec']))
+                rows['local'].configure(text=f"{st['localIdle']}s")
+                rows['system'].configure(text="不可用" if st['systemIdle'] is None else f"{st['systemIdle']}s")
+                rows['idle'].configure(text=f"{st['idle']}s")
+                rows['remain'].configure(text="-" if not st['autoBossSec'] else f"{st['remaining']}s")
+                rows['phase'].configure(text=phase_text.get(st['phase'], st['phase']))
+                self._idle_diag_job = win.after(500, refresh)
+            except tk.TclError:
+                self._idle_diag_job = None
+
+        refresh()
+        tk.Button(win, text="关闭", bg="#333333", fg="#cccccc", bd=0, padx=14, pady=3,
+                  cursor="hand2", command=win.destroy).pack(anchor="e", padx=14, pady=(6, 12))
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    # ---------------- 伪装风格 ----------------
+    def _boss_style_id(self):
+        style = self.config.get('bossStyle')
+        return style if style in BOSS_STYLES else DEFAULT_BOSS_STYLE
+
+    def _boss_style(self):
+        return BOSS_STYLES[self._boss_style_id()]
+
+    def set_boss_style(self, style, announce=True):
+        if style not in BOSS_STYLES:
+            return
+        self.config['bossStyle'] = style
+        self._save_config()
+        if BOSS_STYLES[style].get('live'):
+            # 提前喂一次采样：CPU / 网速都要前后差值，选主题时就打好基线，
+            # 免得刚按 Esc 的第一秒显示 "CPU --"
+            try:
+                self._sys_sampler().read()
+            except Exception:
+                pass
+        if self.is_boss_key:
+            self._update_display()
+        if announce:
+            self.flash_hint(f"🎨 主题: {BOSS_STYLES[style]['label']}")
+
+    def cycle_boss_style(self, step=1):
+        ids = list(BOSS_STYLES)
+        try:
+            idx = ids.index(self._boss_style_id())
+        except ValueError:
+            idx = 0
+        self.set_boss_style(ids[(idx + step) % len(ids)])
+
+    def _sys_sampler(self):
+        """惰性创建：不用性能监控主题的人，一秒一次的系统调用都不该有。"""
+        sampler = getattr(self, '_sampler_inst', None)
+        if sampler is None:
+            sampler = self._sampler_inst = SysSampler()
+        return sampler
+
+    def _live_disguise_parts(self, kind):
+        """live 风格（系统监控 / 时钟）的实时部件；取不到就返回 None 走静态兜底。"""
+        if not kind:
+            return None
+        try:
+            if kind == 'clock':
+                now = time.localtime()
+                weekday = '一二三四五六日'[now.tm_wday]
+                return {
+                    'branch': f"{now.tm_hour:02d}:{now.tm_min:02d}",
+                    'text': f"周{weekday} {now.tm_mon:02d}/{now.tm_mday:02d}   {CLOCK_WEATHER}",
+                    'right': None,      # 城市沿用风格里写死的值
+                }
+            if kind == 'sysmon':
+                data = self._sys_sampler().read()
+                cpu = '--' if data.get('cpu') is None else f"{data['cpu']:.0f}%"
+                mem = '--' if data.get('mem') is None else f"{data['mem']:.0f}%"
+                bits = [f"内存 {mem}"]
+                if data.get('gpu') is not None:
+                    bits.append(f"GPU {data['gpu']:.0f}%")
+                elif data.get('disk') is not None:
+                    bits.append(f"磁盘 {data['disk']:.0f}%")
+                if data.get('proc'):
+                    bits.append(f"进程 {data['proc']}")
+                return {
+                    'branch': f"CPU {cpu}",
+                    'text': '  '.join(bits),   # 两空格省宽度：454px 窄条也放得下 进程数
+                    'right': f"↓ {_fmt_rate(data.get('net_down', 0))} ↑ {_fmt_rate(data.get('net_up', 0))}",
+                }
+        except Exception as err:
+            print(f"[Disguise] 采样失败，回退静态文案: {err}", flush=True)
+        return None
+
+    def _refresh_live_disguise(self):
+        """伪装中每秒调一次：只动三个标签，不重排几何，避免闪烁。"""
+        disguise = self._boss_style()
+        parts = self._live_disguise_parts(disguise.get('live'))
+        if not parts:
+            return
+        for widget, value in ((self.lbl_branch, parts.get('branch')),
+                              (self.lbl_text, parts.get('text')),
+                              (self.lbl_right_info, parts.get('right'))):
+            if value and widget.cget('text') != value:
+                widget.configure(text=value)
+
+    def open_auto_boss_dialog(self):
+        if hasattr(self, '_auto_boss_win') and self._auto_boss_win and self._auto_boss_win.winfo_exists():
+            self._auto_boss_win.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("无操作自动伪装")
+        win.configure(bg="#1e1e1e")
+        win.wm_attributes("-topmost", True)
+        win.resizable(False, False)
+        self._auto_boss_win = win
+
+        tk.Label(win, text="无操作自动伪装（老板键）", font=self.font_bold,
+                 bg="#1e1e1e", fg="#9cdcfe").pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(win, text="多久没有键盘/鼠标操作，就自动切到纯代码伪装", font=self.font_main,
+                 bg="#1e1e1e", fg="#888888").pack(anchor="w", padx=14)
+
+        var = tk.IntVar(value=self._auto_boss_seconds())
+        head = tk.Frame(win, bg="#1e1e1e")
+        head.pack(fill=tk.X, padx=14, pady=(10, 0))
+        lbl_val = tk.Label(head, text="", font=self.font_bold, bg="#1e1e1e", fg="#4ec9b0", width=8, anchor="e")
+        lbl_val.pack(side=tk.RIGHT, padx=(8, 0))
+
+        scale = tk.Scale(
+            head, from_=0, to=600, resolution=5, orient=tk.HORIZONTAL,
+            variable=var, showvalue=False, bg="#1e1e1e", fg="#cccccc",
+            troughcolor="#141414", highlightthickness=0, bd=0, length=380,
+            activebackground="#0e639c"
+        )
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def refresh_label(*_):
+            lbl_val.configure(text=self._fmt_sec(int(var.get())))
+
+        scale.configure(command=refresh_label)
+        refresh_label()
+
+        ticks = tk.Frame(win, bg="#1e1e1e")
+        ticks.pack(fill=tk.X, padx=16)
+        for text in ("0 (关闭)", "5 分", "10 分"):
+            tk.Label(ticks, text=text, font=self.font_main, bg="#1e1e1e", fg="#666666").pack(side=tk.LEFT, expand=True)
+
+        btns = tk.Frame(win, bg="#1e1e1e")
+        btns.pack(fill=tk.X, padx=14, pady=(8, 12))
+        tk.Button(btns, text="取消", bg="#333333", fg="#cccccc", bd=0, padx=12, pady=3,
+                  cursor="hand2", command=win.destroy).pack(side=tk.RIGHT)
+
+        def apply_and_close():
+            self.set_auto_boss(int(var.get()))
+            win.destroy()
+
+        tk.Button(btns, text="应用", bg="#0e639c", fg="#ffffff", bd=0, padx=16, pady=3,
+                  cursor="hand2", command=apply_and_close).pack(side=tk.RIGHT, padx=6)
+
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def action_next(self):
+        self._turn_page(1)
 
     def action_prev(self):
+        self._turn_page(-1)
+
+    def _turn_page(self, delta, automatic=False):
         if self.is_boss_key:
             return
-        # 还在消息中间：翻回上一屏
-        if self.config.get('pagedReading', True) and self._has_prev_pages():
-            self._page_idx -= 1
-            self._render_page()
+        if self._pending_floor_step is not None:
+            if not automatic:
+                self._queued_navigation = (self._turn_page, delta)
             return
-        try:
-            self.lbl_spin.configure(text="⟳")
-        except Exception:
-            pass
-        self.server.broadcast({'action': 'prev'})
+        if self.config.get('pagedReading', True):
+            has_page = self._has_more_pages() if delta > 0 else self._has_prev_pages()
+            if has_page:
+                self._clear_pending_resume()
+                self._page_idx += delta
+                self._reading_offset = self._page_start_offset()
+                self._update_reading_view()
+                self._schedule_position_save()
+                return
+            if self._has_full_text:
+                self._step_floor(delta, automatic=automatic)
+                return
+        if self.server.broadcast({'action': 'next' if delta > 0 else 'prev'}):
+            self._clear_pending_resume()
 
     def action_floor_prev(self):
-        if self.is_boss_key:
-            return
-        self.server.broadcast({'action': 'change_floor', 'delta': -1})
+        self._step_floor(-1)
 
     def action_floor_next(self):
+        self._step_floor(1)
+
+    def _step_floor(self, delta, automatic=False):
         if self.is_boss_key:
             return
-        self.server.broadcast({'action': 'change_floor', 'delta': 1})
+        if self._pending_floor_step is not None:
+            if not automatic:
+                self._queued_navigation = (self._step_floor, delta)
+            return
+        self._floor_request_id += 1
+        request_id = self._floor_request_id
+        request = {'action': 'change_floor', 'delta': delta,
+                   'floorRequest': request_id, 'quiet': automatic}
+        if self._synced_once:
+            request['fromFloor'] = self.floor
+        queued = self.server.broadcast(request)
+        if queued:
+            self._clear_pending_resume()
+            self._pending_floor_step = (request_id, delta)
+            self._pending_floor_job = self.root.after(1800, self._clear_floor_step)
+        elif not automatic:
+            self.flash_hint("酒馆桥接未连接")
+
+    def _clear_floor_step(self):
+        if self._pending_floor_job is not None:
+            self.root.after_cancel(self._pending_floor_job)
+        self._pending_floor_job = None
+        self._pending_floor_step = None
+        self._queued_navigation = None
 
     def action_floor_jump(self, floor):
         if self.is_boss_key:
             return
         try:
             val = int(floor)
-            self.server.broadcast({'action': 'jump_floor', 'floor': val})
+            self._clear_floor_step()
+            if self.server.broadcast({'action': 'jump_floor', 'floor': val}):
+                self._clear_pending_resume()
+            else:
+                self.flash_hint("酒馆桥接未连接")
         except ValueError:
             pass
 
@@ -1898,15 +2863,6 @@ class ThiefDesktopBar:
         self.config['charNameMode'] = nxt
         self._save_config()
         self.server.broadcast({'action': 'toggle_char_mode'})
-        self._update_display()
-
-    def toggle_wrap_mode(self):
-        if self.is_boss_key:
-            return
-        cur = self.config.get('wrapMode', 'wrap')
-        self.config['wrapMode'] = 'single' if cur == 'wrap' else 'wrap'
-        self._save_config()
-        self.server.broadcast({'action': 'toggle_wrap_mode'})
         self._update_display()
 
     def toggle_show_user_messages(self):
@@ -1958,7 +2914,7 @@ class ThiefDesktopBar:
             win.destroy()
 
         def step_and_close(delta):
-            self.server.broadcast({'action': 'change_floor', 'delta': delta})
+            self._step_floor(delta)
             win.destroy()
 
         tk.Button(
@@ -2005,29 +2961,229 @@ class ThiefDesktopBar:
         ).pack(side=tk.LEFT)
 
     def action_swipe(self):
-        self.server.broadcast({'action': 'swipe'})
+        if self.is_generating:
+            return
+        action = 'retry_generation' if self._can_retry_generation else 'swipe'
+        if not self.server.broadcast({'action': action}):
+            self.flash_hint("酒馆桥接未连接")
 
     def action_stop(self):
         self.server.broadcast({'action': 'stop'})
 
     def toggle_boss(self, forced_state=None):
         self.is_boss_key = not self.is_boss_key if forced_state is None else forced_state
+        if not self.is_boss_key:
+            # 退出伪装就从现在重新计空闲，否则刚按 Esc 又会被立刻判定成"没人"
+            self._note_activity()
         self.server.broadcast({'action': 'boss'})
         self._update_display()
 
+    def _watch_reply_ime(self):
+        if sys.platform != 'win32':
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        # 观察候选字合成，实际字符仍交给 Tk 和 Windows 输入法处理。
+        subclass = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM, ctypes.c_size_t, ctypes.c_size_t)
+        controls = ctypes.windll.comctl32
+        install = controls.SetWindowSubclass
+        install.argtypes = [wintypes.HWND, subclass, ctypes.c_size_t, ctypes.c_size_t]
+        install.restype = wintypes.BOOL
+        remove = controls.RemoveWindowSubclass
+        remove.argtypes = [wintypes.HWND, subclass, ctypes.c_size_t]
+        remove.restype = wintypes.BOOL
+        forward = controls.DefSubclassProc
+        forward.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        forward.restype = ctypes.c_ssize_t
+
+        @subclass
+        def observe(hwnd, message, wparam, lparam, identifier, _data):
+            if message == 0x010D:  # WM_IME_STARTCOMPOSITION
+                self._ime_composing = True
+            elif message == 0x010E and self._ime_composing:  # WM_IME_ENDCOMPOSITION
+                self._ime_composing = False
+                self._ime_confirm_until = time.monotonic() + 0.12
+            elif message == 0x0008:  # WM_KILLFOCUS
+                self._ime_composing = False
+            elif message == 0x0082:  # WM_NCDESTROY
+                remove(hwnd, observe, identifier)
+            return forward(hwnd, message, wparam, lparam)
+
+        if install(self.entry_reply.winfo_id(), observe, 1, 0):
+            self._reply_ime_callback = observe
+
+    def _reply_ime_active(self):
+        return self._ime_composing or time.monotonic() < self._ime_confirm_until
+
+    def _on_reply_return(self, event):
+        if self._reply_ime_active():
+            return "break"
+        return self._submit_reply()
+
+    def _on_boss_shortcut(self, event):
+        if event.widget is self.entry_reply and self._reply_ime_active():
+            return "break"
+        self.toggle_boss()
+        return "break"
+
+    def _insert_reply_punctuation(self, mark):
+        if self.entry_reply.selection_present():
+            self.entry_reply.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        self.entry_reply.insert(tk.INSERT, mark)
+
+    def _on_reply_key(self, event):
+        marks = {',': '，', '.': '。', '!': '！', '?': '？', ';': '；', ':': '：',
+                 '(': '（', ')': '）', '[': '【', ']': '】', '{': '｛', '}': '｝'}
+        mark = marks.get(event.char)
+        if mark and not event.state & 0x0004 and self._chinese_punctuation.get() and not self._ime_composing:
+            self._insert_reply_punctuation(mark)
+            return "break"
+        return None
+
+    def _save_punctuation_mode(self):
+        self.config['chinesePunctuation'] = self._chinese_punctuation.get()
+        self._save_config()
+
+    def _popup_reply_menu(self, event):
+        menu = tk.Menu(self.entry_reply, tearoff=False)
+        for label, virtual_event in (("剪切", "<<Cut>>"), ("复制", "<<Copy>>"), ("粘贴", "<<Paste>>")):
+            menu.add_command(label=label, command=lambda name=virtual_event: self.entry_reply.event_generate(name))
+        symbols = tk.Menu(menu, tearoff=False)
+        symbols.add_checkbutton(label="键入时转换常用标点", variable=self._chinese_punctuation,
+                                command=self._save_punctuation_mode)
+        symbols.add_separator()
+        for mark in "，。！？；：、…—“”‘’（）《》【】｛｝":
+            symbols.add_command(label=mark, command=lambda char=mark: self._insert_reply_punctuation(char))
+        menu.add_cascade(label="中文标点", menu=symbols)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _apply_generation_status(self, data):
+        self.is_generating = bool(data.get('isGenerating', False))
+        phase = data.get('generationStatus')
+        if phase not in ('idle', 'running', 'complete', 'failed', 'stopped'):
+            previous = self._generation_status[2]
+            phase = 'running' if self.is_generating else 'complete' if previous == 'running' else previous
+        self._can_retry_generation = data.get('canRetryGeneration') is True
+        key = (self._chat_id, data.get('generationId'), phase)
+        if key == self._generation_status:
+            return
+        self._generation_status = key
+        if self._generation_hint_job is not None:
+            self.root.after_cancel(self._generation_hint_job)
+            self._generation_hint_job = None
+        self._generation_hint = phase if phase != 'idle' else ''
+        if phase in ('complete', 'failed', 'stopped'):
+            self._generation_hint_job = self.root.after(5200 if phase == 'failed' else 2400,
+                                                        self._expire_generation_hint)
+
+    def _expire_generation_hint(self):
+        self._generation_hint_job = None
+        self._generation_hint = ''
+        self._update_reply_indicators()
+
+    def _on_generation_click(self, event):
+        if self._generation_hint == 'failed' and self._can_retry_generation and not self.is_boss_key:
+            self.action_swipe()
+        return "break"
+
+    def _update_reply_indicators(self):
+        labels = {
+            'running': ("生成中…", "#dcdcaa"),
+            'complete': ("生成完成", "#4ec9b0"),
+            'failed': ("生成失败 · 重试" if self._can_retry_generation else "生成失败", "#f48771"),
+            'stopped': ("已停止", self.theme['fg']),
+        }
+        if self._generation_hint:
+            text, color = labels[self._generation_hint]
+            retryable = self._generation_hint == 'failed' and self._can_retry_generation
+            self.btn_generation.configure(text=text, fg=color, cursor="hand2" if retryable else "")
+        for widget, visible in ((self.btn_generation, self._generation_hint), (self.btn_choices, self.reply_choices)):
+            if visible and not self.is_boss_key:
+                if not widget.winfo_manager():
+                    widget.pack(side=tk.RIGHT, before=self.center_frame, padx=(0, 4))
+            elif widget.winfo_manager():
+                widget.pack_forget()
+
+    def _close_reply_choices(self):
+        if self._choices_window is not None:
+            self._choices_window.destroy()
+            self._choices_window = None
+
+    def open_reply_choices(self):
+        if self.is_boss_key or not self.reply_choices:
+            return
+        if self._choices_window is not None:
+            self._choices_window.lift()
+            return
+        win = self._choices_window = tk.Toplevel(self.root)
+        win.title("回复选项")
+        win.transient(self.root)
+        win.wm_attributes("-topmost", True)
+        win.configure(bg=self.theme['bg'])
+        win.protocol("WM_DELETE_WINDOW", self._close_reply_choices)
+        win.bind("<Escape>", lambda event: self._close_reply_choices())
+        left, top, right, bottom = self._monitor_rect()
+        width = min(max(300, self.width), 520, right - left)
+        height = min(max(125, len(self.reply_choices) * 44 + 36), 340, bottom - top)
+        x = max(left, min(self.root.winfo_x(), right - width))
+        bar_y = self.root.winfo_y()
+        y = bar_y - height - 4 if bar_y - height - 4 >= top else min(bar_y + self.height + 4, bottom - height)
+        win.geometry(f"{width}x{height}+{x}+{max(top, y)}")
+        help_text = "选择后填入回复框" if self.config.get('layoutMode') != 'single' else "选择后复制到剪贴板"
+        tk.Label(win, text=help_text, bg=self.theme['bg'], fg=self.theme['fg']).pack(anchor="w", padx=10, pady=5)
+
+        canvas = tk.Canvas(win, bg=self.theme['bg'], highlightthickness=0)
+        scroll = tk.Scrollbar(win, command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        items = tk.Frame(canvas, bg=self.theme['bg'])
+        canvas.create_window(0, 0, anchor="nw", window=items)
+        items.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        win.bind("<MouseWheel>", lambda event: canvas.yview_scroll(-int(event.delta / 120), "units"))
+        for choice in self.reply_choices:
+            tk.Button(items, text=choice, command=lambda value=choice: self._use_reply_choice(value),
+                      font=self.font_main, bg=self.theme['row2_bg'], fg=self.theme['fg'],
+                      wraplength=width - 54, anchor="w", justify=tk.LEFT, padx=8, pady=5,
+                      bd=0, cursor="hand2").pack(fill=tk.X, padx=8, pady=3)
+        win.focus_set()
+
+    def _use_reply_choice(self, choice):
+        self._close_reply_choices()
+        if self.config.get('layoutMode') == 'single':
+            self.root.clipboard_clear()
+            self.root.clipboard_append(choice)
+            self.flash_hint("已复制选项")
+            return
+        draft = self.entry_reply.get()
+        caret = self.entry_reply.index(tk.INSERT)
+        before = " " if caret > 0 and not draft[caret - 1].isspace() else ""
+        after = " " if caret < len(draft) and not draft[caret].isspace() else ""
+        self.entry_reply.insert(tk.INSERT, before + choice + after)
+        self.entry_reply.focus_set()
+
     def _submit_reply(self, event=None):
+        if self.is_generating:
+            return "break"
         text = self.entry_reply.get().strip()
-        if self.is_boss_key and text == BOSS_REPLY_TEXT:
+        if self.is_boss_key and text in BOSS_PLACEHOLDERS:
             return
         if text:
-            self.server.broadcast({'action': 'reply', 'text': text})
-            self.entry_reply.delete(0, tk.END)
+            if self.server.broadcast({'action': 'reply', 'text': text}):
+                self.entry_reply.delete(0, tk.END)
+            else:
+                self.flash_hint("酒馆桥接未连接，草稿已保留")
+        return "break"
 
-    def toggle_theme(self):
-        self.theme_name = 'vscode-blue' if self.theme_name == 'vscode-dark' else 'vscode-dark'
-        self.theme = self.THEMES[self.theme_name]
-        self._apply_theme()
-        self._save_config()
+    def cycle_theme(self):
+        """主题即伪装风格：Alt+T 在 16 套之间循环，伪装中按了立刻换皮。"""
+        self.cycle_boss_style()
 
     def copy_bridge_token(self):
         try:
@@ -2135,18 +3291,19 @@ class ThiefDesktopBar:
         self.right_frame.configure(bg=self.theme['bg'])
         self.center_frame.configure(bg=self.theme['bg'])
         self.lbl_branch.configure(bg=self.theme['bg'], fg=self.theme['fg'])
-        self.lbl_spin.configure(bg=self.theme['bg'])
+        self.btn_generation.configure(bg=self.theme['bg'])
+        self.btn_choices.configure(bg=self.theme['bg'], fg=self.theme['accent'])
         if hasattr(self, 'lbl_right_info'):
-            badge_bg = "#252526" if self.theme_name == 'vscode-dark' else "#005a94"
-            self.lbl_right_info.configure(bg=badge_bg, fg='#9cdcfe' if self.theme_name == 'vscode-dark' else '#ffffff')
+            self.lbl_right_info.configure(bg="#252526", fg='#9cdcfe')
         if hasattr(self, 'btn_menu'):
             self.btn_menu.configure(bg=self.theme['bg'], fg=self.theme['fg'])
         if hasattr(self, 'floor_frame'):
-            f_bg = "#252526" if self.theme_name == 'vscode-dark' else "#005a94"
+            f_bg = "#252526"
             self.floor_frame.configure(bg=f_bg)
-            self.btn_floor_prev.configure(bg=f_bg, fg=self.theme['fg'])
-            self.lbl_floor.configure(bg=f_bg, fg=self.theme['char'] if self.theme_name == 'vscode-blue' else '#9cdcfe')
-            self.btn_floor_next.configure(bg=f_bg, fg=self.theme['fg'])
+            self.lbl_floor.configure(bg=f_bg, fg='#9cdcfe')
+            for button in (self.btn_floor_prev, self.btn_floor_next):
+                button.configure(bg=f_bg, fg=self.theme['fg'], activebackground=self.theme['bg'],
+                                 activeforeground=self.theme['fg'])
         self.lbl_char.configure(fg=self.theme['char'])
         self.lbl_text.configure(bg=self.theme['bg'], fg=self.theme['fg'])
         self.lbl_prefix.configure(bg=self.theme['row2_bg'])
@@ -2162,7 +3319,7 @@ class ThiefDesktopBar:
 
         win = tk.Toplevel(self.root)
         win.title("ST-Thief-Book 摸鱼白名单与黑名单设置")
-        win.geometry("560x630")
+        win.geometry("560x800")
         win.configure(bg="#1e1e1e")
         win.wm_attributes("-topmost", True)
         self._settings_win = win
@@ -2207,6 +3364,22 @@ class ThiefDesktopBar:
             activebackground="#1c1e22", activeforeground="#ffffff"
         ).pack(side=tk.LEFT)
 
+        # 伪装风格（老板键按下去时条上显示什么）
+        style_row = tk.Frame(mode_group, bg="#1c1e22")
+        style_row.pack(anchor="w", padx=8, pady=(0, 6))
+        tk.Label(style_row, text="主题（伪装风格）:", font=self.font_main,
+                 bg="#1c1e22", fg="#cccccc").pack(side=tk.LEFT, padx=(0, 6))
+        style_labels = [cfg['label'] for cfg in BOSS_STYLES.values()]
+        style_label_to_id = {cfg['label']: sid for sid, cfg in BOSS_STYLES.items()}
+        var_boss_style = tk.StringVar(value=BOSS_STYLES[self._boss_style_id()]['label'])
+        opt_style = tk.OptionMenu(style_row, var_boss_style, *style_labels)
+        opt_style.configure(bg="#252526", fg="#4ec9b0", bd=0, highlightthickness=0,
+                            activebackground="#094771", activeforeground="#ffffff",
+                            font=self.font_main)
+        opt_style["menu"].configure(bg="#1e1e1e", fg="#cccccc", font=self.font_main,
+                                    activebackground="#094771", activeforeground="#ffffff")
+        opt_style.pack(side=tk.LEFT)
+
         # ------------------ 0.1 角色名显示设置 ------------------
         char_group = tk.Frame(win, bg="#1c1e22", bd=1, relief=tk.SOLID)
         char_group.pack(fill=tk.X, padx=14, pady=(2, 6))
@@ -2241,32 +3414,67 @@ class ThiefDesktopBar:
             activebackground="#1c1e22", activeforeground="#ffffff"
         ).pack(side=tk.LEFT)
 
-        # ------------------ 0.5 换行展示设置 ------------------
+        # ------------------ 0.5 阅读模式 ------------------
         wrap_group = tk.Frame(win, bg="#1c1e22", bd=1, relief=tk.SOLID)
         wrap_group.pack(fill=tk.X, padx=14, pady=(2, 6))
 
         tk.Label(
-            wrap_group, text="换行展示模式:",
+            wrap_group, text="阅读模式",
             font=self.font_bold, bg="#1c1e22", fg="#9cdcfe"
         ).pack(anchor="w", padx=8, pady=(6, 2))
 
-        var_wrap_mode = tk.StringVar(value=self.config.get('wrapMode', 'wrap'))
+        var_paged_reading = tk.BooleanVar(value=self.config.get('pagedReading', True))
         wrap_radio_frame = tk.Frame(wrap_group, bg="#1c1e22")
         wrap_radio_frame.pack(anchor="w", padx=8, pady=(2, 6))
 
         tk.Radiobutton(
-            wrap_radio_frame, text="自动折行全显 (完整展示长句)",
-            variable=var_wrap_mode, value="wrap",
+            wrap_radio_frame, text="整段分屏",
+            variable=var_paged_reading, value=True,
             font=self.font_main, bg="#1c1e22", fg="#cccccc", selectcolor="#141414",
             activebackground="#1c1e22", activeforeground="#ffffff"
         ).pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Radiobutton(
-            wrap_radio_frame, text="强制单行模式 (超长截断)",
-            variable=var_wrap_mode, value="single",
+            wrap_radio_frame, text="逐句截断（超宽显示省略号）",
+            variable=var_paged_reading, value=False,
             font=self.font_main, bg="#1c1e22", fg="#cccccc", selectcolor="#141414",
             activebackground="#1c1e22", activeforeground="#ffffff"
         ).pack(side=tk.LEFT)
+
+        # ------------------ 0.6 无操作自动伪装（时间滑块） ------------------
+        idle_group = tk.Frame(win, bg="#1c1e22", bd=1, relief=tk.SOLID)
+        idle_group.pack(fill=tk.X, padx=14, pady=(2, 6))
+
+        tk.Label(
+            idle_group, text="无操作自动伪装（老板键）:",
+            font=self.font_bold, bg="#1c1e22", fg="#9cdcfe"
+        ).pack(anchor="w", padx=8, pady=(6, 0))
+
+        var_auto_boss = tk.IntVar(value=self._auto_boss_seconds())
+        idle_head = tk.Frame(idle_group, bg="#1c1e22")
+        idle_head.pack(fill=tk.X, padx=8, pady=0)
+        lbl_auto_boss = tk.Label(idle_head, text="", font=self.font_bold,
+                                 bg="#1c1e22", fg="#4ec9b0", width=8, anchor="e")
+        lbl_auto_boss.pack(side=tk.RIGHT, padx=(6, 0))
+
+        scale_auto_boss = tk.Scale(
+            idle_head, from_=0, to=600, resolution=5, orient=tk.HORIZONTAL,
+            variable=var_auto_boss, showvalue=False, bg="#1c1e22", fg="#cccccc",
+            troughcolor="#141414", highlightthickness=0, bd=0, length=400,
+            activebackground="#0e639c"
+        )
+        scale_auto_boss.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def refresh_auto_boss_label(*_):
+            lbl_auto_boss.configure(text=self._fmt_sec(int(var_auto_boss.get())))
+
+        scale_auto_boss.configure(command=refresh_auto_boss_label)
+        refresh_auto_boss_label()
+
+        tk.Label(
+            idle_group, text="0 = 关闭；无键盘/鼠标操作达到该时长后自动切纯代码伪装（Esc 退出）",
+            font=self.font_main, bg="#1c1e22", fg="#7a7a7a"
+        ).pack(anchor="w", padx=8, pady=(0, 6))
 
         # ------------------ 1. 白名单区域 ------------------
         wl_group = tk.Frame(win, bg="#1c1e22", bd=1, relief=tk.SOLID)
@@ -2292,18 +3500,20 @@ class ThiefDesktopBar:
         wl_chips_frame.pack(anchor="w", padx=8, pady=(2, 6))
         tk.Label(wl_chips_frame, text="白名单快选:", font=self.font_main, bg="#1c1e22", fg="#888888").pack(side=tk.LEFT, padx=(0, 4))
 
-        def add_wl_tag(tag):
-            cur = txt_whitelist.get("1.0", tk.END).strip()
-            tags = [t.strip().strip('<>[]') for t in cur.replace('\n', ',').replace('，', ',').split(',') if t.strip()]
-            if tag not in tags:
+        def read_tags(widget):
+            return self._clean_tag_list(re.split(r'[,，\n]', widget.get("1.0", tk.END)))
+
+        def add_tag(widget, tag):
+            tags = read_tags(widget)
+            if tag not in tags and len(tags) < 100:
                 tags.append(tag)
-                txt_whitelist.delete("1.0", tk.END)
-                txt_whitelist.insert("1.0", ", ".join(tags))
+                widget.delete("1.0", tk.END)
+                widget.insert("1.0", ", ".join(tags))
 
         for chip_tag in ['content', 'output', 'response', 'dialogue', 'story', 'reply', 'text', '正文']:
             lbl = tk.Label(wl_chips_frame, text=f"+{chip_tag}", font=self.font_main, bg="#252526", fg="#4ec9b0", padx=4, pady=1, cursor="hand2")
             lbl.pack(side=tk.LEFT, padx=2)
-            lbl.bind("<Button-1>", lambda e, t=chip_tag: add_wl_tag(t))
+            lbl.bind("<Button-1>", lambda e, t=chip_tag: add_tag(txt_whitelist, t))
 
         # ------------------ 2. 黑名单区域 ------------------
         bl_group = tk.Frame(win, bg="#1c1c1c", bd=1, relief=tk.SOLID)
@@ -2325,18 +3535,10 @@ class ThiefDesktopBar:
         bl_chips_frame.pack(anchor="w", padx=8, pady=(2, 6))
         tk.Label(bl_chips_frame, text="黑名单快选:", font=self.font_main, bg="#1c1c1c", fg="#888888").pack(side=tk.LEFT, padx=(0, 4))
 
-        def add_bl_tag(tag):
-            cur = txt_blacklist.get("1.0", tk.END).strip()
-            tags = [t.strip().strip('<>[]') for t in cur.replace('\n', ',').replace('，', ',').split(',') if t.strip()]
-            if tag not in tags:
-                tags.append(tag)
-                txt_blacklist.delete("1.0", tk.END)
-                txt_blacklist.insert("1.0", ", ".join(tags))
-
         for chip_tag in ['think', 'thought', 'cot', 'status', 'bbi_image', 'fox_hugou', 'fox_selc', 'fox_tip', 'details']:
             lbl = tk.Label(bl_chips_frame, text=f"+{chip_tag}", font=self.font_main, bg="#252526", fg="#f48771", padx=4, pady=1, cursor="hand2")
             lbl.pack(side=tk.LEFT, padx=2)
-            lbl.bind("<Button-1>", lambda e, t=chip_tag: add_bl_tag(t))
+            lbl.bind("<Button-1>", lambda e, t=chip_tag: add_tag(txt_blacklist, t))
 
         # ------------------ 3. 其他选项 ------------------
         opt_frame = tk.Frame(win, bg="#1e1e1e")
@@ -2362,7 +3564,7 @@ class ThiefDesktopBar:
             var_min_mode.set(False)
             var_layout_mode.set("double")
             var_char_mode.set("compact")
-            var_wrap_mode.set("wrap")
+            var_paged_reading.set(True)
             var_enable_wl.set(True)
             txt_whitelist.delete("1.0", tk.END)
             txt_whitelist.insert("1.0", ", ".join([
@@ -2377,26 +3579,29 @@ class ThiefDesktopBar:
             var_act.set(False)
             var_user.set(False)
             var_privacy.set(False)
+            var_auto_boss.set(0)
+            refresh_auto_boss_label()
+            var_boss_style.set(BOSS_STYLES[DEFAULT_BOSS_STYLE]['label'])
 
         btn_reset = tk.Button(btn_frame, text="恢复默认预设", command=reset_defaults, bg="#333333", fg="#cccccc", bd=0, padx=8, pady=4, cursor="hand2")
         btn_reset.pack(side=tk.LEFT)
 
         def save_settings():
-            raw_wl = txt_whitelist.get("1.0", tk.END).strip()
-            wl_tags = [t.strip().strip('<>[]') for t in raw_wl.replace('\n', ',').replace('，', ',').split(',') if t.strip()]
-            raw_bl = txt_blacklist.get("1.0", tk.END).strip()
-            bl_tags = [t.strip().strip('<>[]') for t in raw_bl.replace('\n', ',').replace('，', ',').split(',') if t.strip()]
-
             self.config['minimalMode'] = var_min_mode.get()
             self.config['layoutMode'] = var_layout_mode.get()
             self.config['charNameMode'] = var_char_mode.get()
-            self.config['wrapMode'] = var_wrap_mode.get()
+            self.config['pagedReading'] = var_paged_reading.get()
             self.config['enableWhitelist'] = var_enable_wl.get()
-            self.config['tagWhitelist'] = wl_tags
-            self.config['tagBlacklist'] = bl_tags
+            self.config['tagWhitelist'] = read_tags(txt_whitelist)
+            self.config['tagBlacklist'] = read_tags(txt_blacklist)
             self.config['filterActions'] = var_act.get()
             self.config['showUserMessages'] = var_user.get()
             self.config['privacyMode'] = var_privacy.get()
+            self.config['autoBossSec'] = self._clamp_auto_boss(int(var_auto_boss.get())) or 0
+            picked_style = style_label_to_id.get(var_boss_style.get())
+            if picked_style in BOSS_STYLES:
+                self.config['bossStyle'] = picked_style
+            self._note_activity()   # 滑块刚调完，从此刻重新计空闲
             if not self.config['privacyMode']:
                 self.root.wm_attributes("-alpha", self.alpha)
             else:
@@ -2424,6 +3629,19 @@ class ThiefDesktopBar:
         'filterMode': {'pure', 'regex'}
     }
 
+    @staticmethod
+    def _clean_tag_list(tags):
+        cleaned = []
+        for tag in tags[:100]:
+            if not isinstance(tag, str) or len(tag) > 1024:
+                continue
+            while (decoded := unescape(tag)) != tag:
+                tag = decoded
+            tag = re.sub(r'^[<\[]+\s*/?|/?\s*[>\]]+$', '', tag.strip()).strip().lower()
+            if 0 < len(tag) <= 64 and tag not in cleaned:
+                cleaned.append(tag)
+        return cleaned
+
     def _merge_sync_config(self, incoming):
         for k, v in incoming.items():
             if k in self._BOOL_CONFIG_KEYS and isinstance(v, bool):
@@ -2431,10 +3649,13 @@ class ThiefDesktopBar:
             elif k in self._ENUM_CONFIG_KEYS and isinstance(v, str) and v in self._ENUM_CONFIG_KEYS[k]:
                 self.config[k] = v
             elif k in ('tagWhitelist', 'tagBlacklist') and isinstance(v, list):
-                cleaned = [t.strip() for t in v[:100] if isinstance(t, str) and t.strip() and len(t) <= 64]
-                self.config[k] = cleaned
+                self.config[k] = self._clean_tag_list(v)
 
     def _on_ws_message(self, text):
+        # 导航、同步与翻屏都在 GUI 线程更新同一份阅读状态。
+        self.root.after(0, self._apply_ws_message, text)
+
+    def _apply_ws_message(self, text):
         try:
             data = json.loads(text)
             action = data.get('action')
@@ -2444,8 +3665,8 @@ class ThiefDesktopBar:
                 else:
                     self.config['minimalMode'] = not self.config.get('minimalMode', False)
                 self._save_config()
-                self.root.after(0, self._apply_layout_and_mode)
-                self.root.after(0, self._update_display)
+                self._apply_layout_and_mode()
+                self._update_display()
                 return
             elif action == 'toggle_privacy_mode':
                 if 'privacyMode' in data:
@@ -2465,61 +3686,88 @@ class ThiefDesktopBar:
                     cur = self.config.get('layoutMode', 'double')
                     self.config['layoutMode'] = 'single' if cur == 'double' else 'double'
                 self._save_config()
-                self.root.after(0, self._apply_layout_and_mode)
-                self.root.after(0, self._update_display)
+                self._apply_layout_and_mode()
+                self._update_display()
                 return
             elif action == 'set_window_width':
-                if 'barWidth' in data and isinstance(data['barWidth'], (int, float)):
-                    self.root.after(0, lambda: self.set_window_width(data['barWidth']))
+                width = data.get('barWidth')
+                if not self._is_resizing and type(width) is int and 360 <= width <= 3840:
+                    self.set_window_width(width)
+                return
+            elif action == 'toggle_boss':
+                # 托盘助手的全局老板键走这条：不带 bossKey 就翻转，带了就按指定状态（幂等）
+                forced = data.get('bossKey')
+                self.toggle_boss(forced if isinstance(forced, bool) else None)
+                return
+            elif action == 'set_auto_boss':
+                self.set_auto_boss(data.get('sec'), announce=False)
+                self.server.broadcast({'action': 'auto_boss_state', **self._auto_boss_state()})
+                return
+            elif action == 'query_auto_boss':
+                self.server.broadcast({'action': 'auto_boss_state', **self._auto_boss_state()})
+                return
+            elif action == 'set_boss_style':
+                self.set_boss_style(data.get('style'), announce=False)
+                self.server.broadcast({'action': 'boss_style', 'style': self._boss_style_id()})
+                return
+            elif action == 'query_boss_style':
+                self.server.broadcast({'action': 'boss_style', 'style': self._boss_style_id()})
                 return
 
             if data.get('type') == 'sync':
                 new_sentence = data.get('currentSentence', '')
                 new_floor = data.get('floor', 0)
                 new_cur = data.get('curIdx', 1)
-                # 仅真正的导航（换句/换楼/句序变化）才跳屏；配置、老板键、
-                # 生成状态等无关同步不得把读者拽回当前句所在屏
-                nav_changed = (new_sentence != self.current_sentence
-                               or new_floor != self.floor or new_cur != self.cur_idx)
-                # 换楼层 = 换了一条消息：累计文本、分屏、页码全部从头开始
-                if new_floor != self.floor or (new_cur <= 1 and new_sentence != self.current_sentence):
-                    self._stream_parts = None
-                    self._pfx_key = None
-                    self._pages_ready = False
-                    self._pages = []
-                    self._page_idx = 0
-                    self.stream_text = ''
-                    self._pending_sentence_offset = 0
+                chat_id = data.get('chatId', self._chat_id)
+                chat_changed = chat_id != self._chat_id
+                self._chat_id = chat_id
+                if chat_changed:
+                    self._clear_floor_step()
+                floor_changed = new_floor != self.floor
+                nav_changed = chat_changed or floor_changed or new_cur != self.cur_idx
+                page_edge = data.get('pageEdge')
+                queued_navigation = None
+                if self._pending_floor_step is not None:
+                    request_id, direction = self._pending_floor_step
+                    reply_id = data.get('floorRequest')
+                    # 旧版桥接没有请求标识，按楼层变动方向识别这次响应。
+                    legacy_reply = ('floorRequest' not in data and floor_changed
+                                    and (new_floor - self.floor) * direction > 0)
+                    if reply_id == request_id or legacy_reply:
+                        if legacy_reply and page_edge is None:
+                            page_edge = 'last' if direction < 0 else 'first'
+                        queued_navigation = self._queued_navigation
+                        self._clear_floor_step()
                 full_text = data.get('fullText')
-                if isinstance(full_text, str) and full_text.strip():
-                    # 新版插件：整条消息一起来，直接用它做整段
+                self._has_full_text = isinstance(full_text, str)
+                if self._has_full_text:
                     self._stream_parts = None
-                    if full_text != getattr(self, 'stream_text', None):
-                        self.stream_text = full_text
-                        if nav_changed:
-                            self._pending_sentence_offset = 0
+                    self.stream_text = full_text
+                    if floor_changed and page_edge == 'last':
+                        self._reading_offset = max(0, len(full_text) - 1)
+                    elif page_edge == 'first':
+                        self._reading_offset = 0
+                    elif nav_changed:
+                        offset = data.get('sentenceOffset')
+                        self._reading_offset = offset if type(offset) is int and offset >= 0 else 0
                 else:
-                    # 旧版插件只发单句：自己把读过的句子拼成一段，效果一样是连续的一整段
-                    prev_floor = getattr(self, '_stream_floor', None)
+                    # 旧版桥接只同步单句，继续累计已收到的句子。
                     parts = getattr(self, '_stream_parts', None) or []
                     cur_i = new_cur if isinstance(new_cur, int) else 1
+                    prev_floor = self.floor if not chat_changed else None
                     parts, offset = self._accumulate_stream(parts, prev_floor, new_floor, cur_i, new_sentence)
-                    self._stream_floor = new_floor
                     self._stream_parts = parts
-                    joined = ''.join(seg for _, seg in parts)
-                    if joined != getattr(self, 'stream_text', None):
-                        self.stream_text = joined
+                    self.stream_text = ''.join(seg for _, seg in parts)
                     if nav_changed:
-                        self._pending_sentence_offset = offset
-                sent_off = data.get('sentenceOffset')
-                if nav_changed and isinstance(sent_off, (int, float)) and sent_off >= 0 and self.config.get('pagedReading', True):
-                    self._pending_sentence_offset = int(sent_off)
-                # 重启恢复：用保存的屏偏移覆盖句首偏移（仅一次，楼层须匹配）
-                if getattr(self, '_resume_offset', None) is not None:
-                    if new_floor == self._resume_floor:
-                        self._pending_sentence_offset = self._resume_offset
-                    self._resume_floor = None
-                    self._resume_offset = None
+                        self._reading_offset = offset
+                resume_floor = data.get('resumeFloor', new_floor)
+                if self._resume_offset is not None:
+                    same_chat = self._resume_chat_id is None or self._resume_chat_id == chat_id
+                    if (same_chat and new_floor == self._resume_floor and page_edge != 'last'
+                            and (resume_floor == self._resume_floor or nav_changed or page_edge == 'first')):
+                        self._reading_offset = self._resume_offset
+                    if resume_floor == self._resume_floor:
+                        self._clear_pending_resume()
                 self.char_name = data.get('charName', 'AI')
                 self.user_name = data.get('userName', 'User')
                 self.floor = new_floor
@@ -2527,24 +3775,33 @@ class ThiefDesktopBar:
                 self.total_sentences = data.get('totalSentences', 1)
                 self.current_sentence = new_sentence
                 self.is_boss_key = data.get('isBossKey', False)
-                self.is_generating = data.get('isGenerating', False)
-                if 'barWidth' in data and isinstance(data['barWidth'], (int, float)):
-                    w = int(data['barWidth'])
-                    if 360 <= w <= 2560 and w != self.width:
-                        self.width = w
-                if 'config' in data and isinstance(data['config'], dict):
+                self._apply_generation_status(data)
+                choices = data.get('replyChoices')
+                choices = tuple(s for s in choices[:12] if isinstance(s, str) and 0 < len(s) <= 2000) if isinstance(choices, list) else ()
+                if chat_changed or floor_changed or choices != self.reply_choices:
+                    self._close_reply_choices()
+                    self.reply_choices = choices
+                config = data.get('config')
+                if isinstance(config, dict):
                     old_min = self.config.get('minimalMode')
                     old_layout = self.config.get('layoutMode')
-                    self._merge_sync_config(data['config'])
-                    if 'barWidth' in data['config'] and isinstance(data['config']['barWidth'], (int, float)):
-                        w = int(data['config']['barWidth'])
-                        if 360 <= w <= 2560 and w != self.width:
-                            self.width = w
+                    self._merge_sync_config(config)
                     if (old_min != self.config.get('minimalMode') or
                         old_layout != self.config.get('layoutMode')):
-                        self.root.after(0, self._apply_layout_and_mode)
+                        self._apply_layout_and_mode()
+                # 旧版用快照同步宽度。记录上次收到的值，普通阅读同步不覆盖本地调整。
+                width = config.get('barWidth', data.get('barWidth')) if isinstance(config, dict) else data.get('barWidth')
+                if type(width) in (int, float) and 360 <= width <= 3840:
+                    previous_width = self._legacy_width
+                    self._legacy_width = int(width)
+                    if not self._is_resizing and previous_width not in (None, self._legacy_width):
+                        self.width = self._legacy_width
+                        self._save_config()
                 self._synced_once = True
-                self.root.after(0, self._update_display)
+                self._update_display()
+                if queued_navigation is not None:
+                    command, delta = queued_navigation
+                    command(delta)
         except Exception as e:
             print(f"[UI Sync Error]: {e}")
 
@@ -2555,8 +3812,8 @@ class ThiefDesktopBar:
             if self.is_boss_key:
                 self._boss_reply_draft = self.entry_reply.get()
             else:
-                # 伪装文本未被改动才恢复草稿，否则保留用户在老板键期间新输入的内容
-                if self.entry_reply.get() == BOSS_REPLY_TEXT:
+                # 占位文案被改动过就保留用户新输入的内容，只有还是占位原文才恢复草稿
+                if self.entry_reply.get() in BOSS_PLACEHOLDERS:
                     self.entry_reply.delete(0, tk.END)
                     draft = getattr(self, '_boss_reply_draft', '')
                     if draft:
@@ -2564,89 +3821,75 @@ class ThiefDesktopBar:
                 self._boss_reply_draft = ''
             self._displayed_boss_key = self.is_boss_key
         if self.is_boss_key:
-            self.lbl_branch.configure(text="⎇ main*  ✓ 0 ⨉ 0")
+            self._close_reply_choices()
+            self._update_reply_indicators()
+            disguise = self._boss_style()
+            self._ensure_boss_chrome()
+            live = self._live_disguise_parts(disguise.get('live'))
+            branch = (live or {}).get('branch') or disguise['branch']
+            text = (live or {}).get('text') or disguise['text']
+            right = (live or {}).get('right') or disguise['right']
+            self.lbl_branch.configure(text=branch)
             if hasattr(self, 'lbl_floor'):
                 self.lbl_floor.configure(text="")
-            self.lbl_spin.configure(text="")
             self.lbl_char.configure(text="", bg=self.theme['bg'])
-            self.lbl_text.configure(text="TypeScript 5.4.5  UTF-8  LF  Ln 142, Col 8  Ready", wraplength=0)
-            self.lbl_right_info.configure(text="Ln 142, Col 8")
-            self.lbl_prefix.configure(text=" [webpack]")
-            # 仅进入时（或输入框被发送清空后）重写伪装文本，避免同步刷新冲掉用户正在输入的内容
-            if not was_boss or not self.entry_reply.get():
-                self.entry_reply.delete(0, tk.END)
-                self.entry_reply.insert(0, BOSS_REPLY_TEXT)
+            self.lbl_text.configure(text=text, wraplength=0)
+            self.lbl_right_info.configure(text=right)
+            self.lbl_prefix.configure(text=disguise['prefix'])
+            # 仅在进入时、输入框空时、或仍是某个占位文案时才重写，避免冲掉用户正在输入的草稿
+            current = self.entry_reply.get()
+            if not was_boss or not current or current in BOSS_PLACEHOLDERS:
+                if current != disguise['reply']:
+                    self.entry_reply.delete(0, tk.END)
+                    self.entry_reply.insert(0, disguise['reply'])
             self._update_geometry_and_wrap()
             return
+
+        # 退出伪装：把被强制放出来的左右两翼/前缀交还给极简模式自己决定
+        if getattr(self, '_boss_chrome_forced', False):
+            self._boss_chrome_forced = False
+            self._apply_layout_and_mode()
 
         self.lbl_branch.configure(text="⎇ main*")
         floor_str = f"#{self.floor} ▾" if self.floor >= 0 else "#-- ▾"
         if hasattr(self, 'lbl_floor'):
             self.lbl_floor.configure(text=floor_str)
 
-        if self.is_generating:
-            self.lbl_spin.configure(text="⟳ Building...")
-        else:
-            self.lbl_spin.configure(text="")
+        self._update_reply_indicators()
 
-        is_min = self.config.get('minimalMode', False)
-        if not is_min:
+        if not self.config.get('minimalMode', False):
             mode = self.config.get('charNameMode', 'compact')
-            if mode == 'hidden':
-                self.lbl_char.configure(text="[👤]", fg="#888888", bg="#252526")
-            elif mode == 'compact':
-                display_name = self.char_name
-                if len(display_name) > 6:
-                    display_name = display_name[:5] + "…"
-                self.lbl_char.configure(
-                    text=f"[{display_name}]:",
-                    fg=self.theme['char'],
-                    bg="#1e2e28" if self.theme_name == 'vscode-dark' else "#005a94"
-                )
-            else:
-                self.lbl_char.configure(
-                    text=f"[{self.char_name}]:",
-                    fg=self.theme['char'],
-                    bg="#1e2e28" if self.theme_name == 'vscode-dark' else "#005a94"
-                )
+            name = self.char_name
+            if mode == 'compact' and len(name) > 6:
+                name = name[:5] + "…"
+            self.lbl_char.configure(
+                text=f"[{name}]:",
+                fg=self.theme['char'],
+                bg="#1e2e28"
+            )
 
-        # 1. 正文一行可用宽度（像素）：跟着工具条当前宽度走
         self._apply_narrow_chrome()
-        avail_w = self._text_width_px()
-
-        # 2. 一行显示：按条宽分屏；整句优先成屏，超宽才硬切
-        stream = self._stream()
-        pages_dirty = (stream, avail_w) != getattr(self, '_pfx_key', None)
-        if pages_dirty:
-            keep_offset = self._page_start_offset()
-            self._pfx_key = (stream, avail_w)
-            self._pages = self._compute_pages(stream, avail_w)
-            self._page_idx = self._page_index_for_offset(keep_offset) if getattr(self, '_pages_ready', False) else 0
-            self._pages_ready = True
-        # 换句/翻页：跳到这一句所在的屏
-        pending = getattr(self, '_pending_sentence_offset', None)
-        if pending is not None:
-            self._pending_sentence_offset = None
-            if not self.is_generating:
-                self._page_idx = self._page_index_for_offset(int(pending))
-        # 生成结束回到第一屏，方便从头读
-        if getattr(self, '_was_generating', False) and not self.is_generating:
-            self._page_idx = 0
-        self._was_generating = self.is_generating
-        # 生成中：始终显示最新那一屏
-        if self.is_generating and self._pages:
-            self._page_idx = len(self._pages) - 1
-
-        if self.config.get('pagedReading', True):
-            self._render_page()
-        else:
-            self.lbl_text.configure(text=self._truncate_to_width(stream, avail_w), wraplength=0, justify=tk.LEFT)
-
-        self.lbl_right_info.configure(text=self._progress_text())
-
         self.lbl_prefix.configure(text=" >")
         self._update_geometry_and_wrap()
+        self._update_reading_view()
         self._schedule_position_save()
+
+    def _update_reading_view(self):
+        width = self.lbl_text.winfo_width()
+        if width <= 1:
+            return  # 初次布局由正文视口的 Configure 事件触发。
+        if self.config.get('pagedReading', True):
+            stream = self._stream()
+            key = (stream, width, self.config.get('fontSize', 9))
+            if key != getattr(self, '_pfx_key', None):
+                self._pages = self._compute_pages(stream, width)
+                self._pfx_key = key
+            self._page_idx = self._page_index_for_offset(self._reading_offset)
+            self._render_page()
+        else:
+            text = self._truncate_to_width(self.current_sentence.strip(), width)
+            self.lbl_text.configure(text=text, wraplength=0, justify=tk.LEFT)
+        self.lbl_right_info.configure(text=self._progress_text())
 
     def _pid_file_path(self):
         return os.path.join(os.path.dirname(self.config_file), PID_FILENAME)
@@ -2661,10 +3904,19 @@ class ThiefDesktopBar:
         try:
             self.root.mainloop()
         finally:
+            if getattr(self, '_idle_job', None):
+                try:
+                    self.root.after_cancel(self._idle_job)
+                except Exception:
+                    pass
+                self._idle_job = None
+            self._save_window_position()
+            self._save_position_now()
             try:
                 with open(pid_path, 'r', encoding='utf-8') as f:
-                    if f.read().strip() == str(os.getpid()):
-                        os.remove(pid_path)
+                    owner_pid = f.read().strip()
+                if owner_pid == str(os.getpid()):
+                    os.remove(pid_path)
             except Exception:
                 pass
 
@@ -2712,13 +3964,15 @@ if __name__ == '__main__':
  请在酒馆助手（Tavern Helper）中导入并启用 st-thief-book.json
  快捷操作说明:
    - 鼠标右键点击任意处 : 呼出极简模式/切换楼层/微调透明度等全功能菜单
-   - 鼠标左键点击正文   : 整段分屏翻到下一屏（读完整条再进下一句）
+   - 鼠标左键点击正文   : 整段分屏翻到下一屏（读完整条进入下一楼）
    - 鼠标左键按住拖动   : 随意拖拽移动摸鱼条位置
    - 方向键 ← / →       : 上一屏 / 下一屏 (或 J / K / 滚轮)
    - Ctrl + 滚轮        : 缩放正文字号 (8 ~ 12pt)
    - PageUp / PageDown  : 上一楼 / 下一楼
    - Enter (双行模式)   : 就地输入回复并回车发送
    - Esc                : 一键老板键（秒切纯代码伪装）
+   - Alt + T / Y        : 循环切换主题（= 伪装风格，开发 7 / 办公 2 / 影音 2 / 系统 5）
+   - 无操作自动伪装     : 设置/右键菜单拖时间滑块，空闲到点自动切伪装
    - Alt + 1 ~ 9        : 快速切换透明度 (15% ~ 100%)
 ===================================================
 """, flush=True)

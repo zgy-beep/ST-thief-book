@@ -6,7 +6,8 @@
 被拖到副屏 / 屏幕外，或者隐私模式把 alpha 压到 0.01 之后，就再也"找不到"了。
 
 本助手常驻后台，提供：
-  · 系统托盘图标     左键单击 = 显示/隐藏   右键 = 菜单（召回归位 / 显示隐身 / 重启摸鱼条 / 退出）
+  · 系统托盘图标     左键单击 = 显示/隐藏   右键 = 菜单（老板键 / 召回归位 / 显示隐身 / 重启摸鱼条 / 退出）
+  · 全局热键 Ctrl+Alt+B  老板键：不管焦点在浏览器还是别处，都直接切/退摸鱼条的纯代码伪装
   · 全局热键 Ctrl+B  召回：不在主屏就挪回主屏底部居中；隐身态自动恢复；进程没了会自动拉起
   · 全局热键 Ctrl+H  显示 / 隐身切换（alpha 1 <-> 你配置里的透明度）
 
@@ -15,13 +16,17 @@
   python bar_hotkey_helper.py --status          # 打印真实位置 / alpha / topmost
   python bar_hotkey_helper.py --recall          # 一次性归位（加 --force 强制挪）
   python bar_hotkey_helper.py --stealth on|off|toggle
+  python bar_hotkey_helper.py --boss            # 一次性切/退老板键伪装
 """
 
+import base64
 import ctypes
 import json
 import os
 import socket
+import struct
 import sys
+import threading
 import time
 from ctypes import wintypes
 
@@ -34,9 +39,13 @@ CLASS_HINT = "TkTopLevel"
 WS_PORT = 18899          # 与 thief_desktop_bar.py 的 WS_PORT 保持一致
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ---------------- 热键定义（想改成别的键就改这两行） ----------------
+# ---------------- 热键定义（想改成别的键就改这三行） ----------------
+HOTKEY_BOSS = (ord("B"), "Ctrl+Alt+B")
 HOTKEY_RECALL = (ord("B"), "Ctrl+B")
 HOTKEY_STEALTH = (ord("H"), "Ctrl+H")
+
+TOKEN_FILENAME = "thief_bar_bridge.token"   # 摸鱼条写在同目录的桥接密钥（也可能在用户家目录）
+WS_MAX_FRAME = 1 << 20                     # 与 thief_desktop_bar.WS_MAX_PAYLOAD 一致
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -47,6 +56,7 @@ WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
 WM_COMMAND = 0x0111
 WM_DESTROY = 0x0002
+WM_CLOSE = 0x0010
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONDBLCLK = 0x0203
@@ -71,6 +81,7 @@ MF_STRING, MF_SEPARATOR = 0x0000, 0x0800
 TPM_RIGHTBUTTON, TPM_RETURNCMD = 0x0002, 0x0100
 IDI_APPLICATION = 32512
 
+MENU_BOSS = 105
 MENU_RECALL = 101
 MENU_STEALTH = 102
 MENU_RESTART = 103
@@ -163,6 +174,8 @@ user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
@@ -472,6 +485,149 @@ def stealth(mode="toggle", verbose=True):
     return 0
 
 
+def _bridge_token():
+    # 摸鱼条把密钥写在 config 同目录；配置写不下时会退回用户家目录，两处都找
+    for base in (APP_DIR, os.path.expanduser("~")):
+        try:
+            with open(os.path.join(base, TOKEN_FILENAME), "r", encoding="utf-8") as f:
+                token = f.read().strip()
+            if token:
+                return token
+        except Exception:
+            continue
+    return ""
+
+
+def _ws_frame(payload, opcode=0x1):
+    """客户端帧必须加掩码（RFC 6455 §5.3），服务端不解掩码会读出乱码。"""
+    data = payload if isinstance(payload, bytes) else payload.encode("utf-8")
+    length = len(data)
+    if length <= 125:
+        header = struct.pack(">BB", 0x80 | opcode, 0x80 | length)
+    elif length <= 0xFFFF:
+        header = struct.pack(">BBH", 0x80 | opcode, 0x80 | 126, length)
+    else:
+        header = struct.pack(">BBQ", 0x80 | opcode, 0x80 | 127, length)
+    mask = os.urandom(4)
+    return header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+
+def _read_ws_frame(sock, deadline):
+    """在 deadline 前读一帧，返回 (opcode, payload)；超时/断连返回 None。"""
+    def recv_exact(n):
+        buf = b""
+        while len(buf) < n:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                sock.settimeout(left)
+                chunk = sock.recv(n - len(buf))
+            except (socket.timeout, OSError):
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    head = recv_exact(2)
+    if not head:
+        return None
+    opcode, b2 = head[0] & 0x0F, head[1]
+    length = b2 & 0x7F
+    if length == 126:
+        ext = recv_exact(2)
+        if not ext:
+            return None
+        length = struct.unpack(">H", ext)[0]
+    elif length == 127:
+        ext = recv_exact(8)
+        if not ext:
+            return None
+        length = struct.unpack(">Q", ext)[0]
+    if length > WS_MAX_FRAME:
+        return None
+    mask = recv_exact(4) if (b2 & 0x80) else None
+    if (b2 & 0x80) and mask is None:
+        return None
+    payload = recv_exact(length) if length else b""
+    if payload is None:
+        return None
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+
+def send_boss(verbose=True):
+    """通过摸鱼条自带的 WS 通道切/退老板键伪装（不用管当前焦点在哪个窗口）。"""
+    token = _bridge_token()
+    if not token:
+        log("[boss] 找不到桥接密钥（thief_bar_bridge.token），指挥不动摸鱼条")
+        return 1
+    deadline = time.monotonic() + 2.0
+    sock = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", WS_PORT), timeout=1.0)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        # 不带 Origin 头：本地直连，服务端 _origin_allowed(None) 放行，密钥才是真正的门禁
+        sock.sendall((
+            "GET / HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{WS_PORT}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii"))
+
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("握手超时")
+            sock.settimeout(left)
+            chunk = sock.recv(512)
+            if not chunk:
+                raise ConnectionError("握手期间连接被关闭")
+            buf += chunk
+            if len(buf) > 8192:
+                raise ConnectionError("握手响应异常")
+        if b" 101 " not in buf.split(b"\r\n", 1)[0]:
+            raise ConnectionError("握手被拒绝")
+
+        sock.sendall(_ws_frame(json.dumps({"action": "hello", "token": token})))
+        frame = _read_ws_frame(sock, deadline)
+        if not frame or b"hello_ok" not in frame[1]:
+            raise ConnectionError("hello 认证失败（密钥不匹配？）")
+
+        sock.sendall(_ws_frame(json.dumps({"action": "toggle_boss"})))
+        # 摸鱼条切完会广播 {"action":"boss"}，收到这条才算真的换了
+        acked = False
+        while True:
+            frame = _read_ws_frame(sock, deadline)
+            if frame is None:
+                break
+            if b'"boss"' in frame[1]:
+                acked = True
+                break
+        if verbose:
+            log("[boss] 已切换伪装" if acked else "[boss] 指令已发出（未等到回执）")
+        return 0
+    except Exception as err:
+        log(f"[boss] 发送失败: {err}")
+        return 1
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def send_boss_async(verbose=False):
+    """热键回调里不能阻塞消息循环（等回执最长 2s），丢给后台线程。"""
+    threading.Thread(target=send_boss, kwargs={'verbose': verbose}, daemon=True).start()
+
+
 def status():
     hit = find_bar_window()
     if not hit:
@@ -494,11 +650,12 @@ class Tray:
 
     CLASS_NAME = "STThiefBarTrayWnd"
 
-    def __init__(self, on_recall, on_stealth, on_restart, on_quit):
+    def __init__(self, on_recall, on_stealth, on_restart, on_quit, on_boss=None):
         self.on_recall = on_recall
         self.on_stealth = on_stealth
         self.on_restart = on_restart
         self.on_quit = on_quit
+        self.on_boss = on_boss
         self._proc = WNDPROC(self._wndproc)   # 必须持有引用，否则会被 GC
         self.hinstance = kernel32.GetModuleHandleW(None)
         wc = WNDCLASSW()
@@ -551,7 +708,7 @@ class Tray:
             state = "已隐身"
         else:
             state = "显示中"
-        return f"摸鱼条 · {state}   {HOTKEY_RECALL[1]}=召回  {HOTKEY_STEALTH[1]}=隐身"
+        return f"摸鱼条 · {state}   {HOTKEY_BOSS[1]}=老板键  {HOTKEY_RECALL[1]}=召回  {HOTKEY_STEALTH[1]}=隐身"
 
     def update_tip(self):
         text = self._tip_text()
@@ -566,6 +723,7 @@ class Tray:
 
     def _menu(self):
         hmenu = user32.CreatePopupMenu()
+        user32.AppendMenuW(hmenu, MF_STRING, MENU_BOSS, f"老板键（伪装 / 恢复）\t{HOTKEY_BOSS[1]}")
         user32.AppendMenuW(hmenu, MF_STRING, MENU_RECALL, f"召回 / 归位\t{HOTKEY_RECALL[1]}")
         a = self._bar_alpha()
         label = "显示（当前已隐身）" if (a is not None and a < 40) else "隐身"
@@ -602,7 +760,9 @@ class Tray:
                 self.update_tip()
             elif ev == WM_RBUTTONUP:
                 cmd = self._menu()
-                if cmd == MENU_RECALL:
+                if cmd == MENU_BOSS:
+                    self.on_boss and self.on_boss()
+                elif cmd == MENU_RECALL:
                     self.on_recall()
                 elif cmd == MENU_STEALTH:
                     self.on_stealth()
@@ -645,6 +805,8 @@ def listen():
         return 0
     ok_r = user32.RegisterHotKey(None, 1, MOD_CONTROL | MOD_NOREPEAT, HOTKEY_RECALL[0])
     ok_s = user32.RegisterHotKey(None, 2, MOD_CONTROL | MOD_NOREPEAT, HOTKEY_STEALTH[0])
+    ok_b = user32.RegisterHotKey(None, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, HOTKEY_BOSS[0])
+    log(f"[hotkey] {HOTKEY_BOSS[1]} 老板键: {'ok' if ok_b else 'FAILED(被别的程序占用)'}")
     log(f"[hotkey] {HOTKEY_RECALL[1]} 召回: {'ok' if ok_r else 'FAILED(被别的程序占用)'}")
     log(f"[hotkey] {HOTKEY_STEALTH[1]} 隐身: {'ok' if ok_s else 'FAILED(被别的程序占用)'}")
 
@@ -653,7 +815,15 @@ def listen():
         pid = 0
         hit = find_bar_window()
         if hit:
-            pid = _pid_from_hwnd(hit[0])
+            hwnd = hit[0]
+            pid = _pid_from_hwnd(hwnd)
+            if user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+                deadline = time.monotonic() + 1.5
+                while user32.IsWindow(hwnd) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if not user32.IsWindow(hwnd):
+                    launch_bar()
+                    return
         if not pid:
             pid = _pid_of_bar()
         if pid:
@@ -670,6 +840,7 @@ def listen():
         tray = Tray(on_recall=recall,
                     on_stealth=lambda: stealth("toggle", verbose=False),
                     on_restart=_restart,
+                    on_boss=lambda: send_boss_async(),
                     on_quit=lambda: (tray and tray.remove(), user32.PostQuitMessage(0)))
         log("[tray] 托盘图标已添加（左键=显示/隐藏，右键=菜单）")
     except Exception as err:
@@ -688,6 +859,8 @@ def listen():
                 recall()
             elif msg.wParam == 2:
                 stealth("toggle", verbose=False)
+            elif msg.wParam == 3:
+                send_boss_async()
             if tray:
                 tray.update_tip()
         else:
@@ -732,6 +905,8 @@ def main(argv):
     if "--stealth" in argv:
         i = argv.index("--stealth")
         return stealth(argv[i + 1] if i + 1 < len(argv) else "toggle")
+    if "--boss" in argv:
+        return send_boss()
     return recall(force_move=("--force" in argv))
 
 

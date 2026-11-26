@@ -1,9 +1,9 @@
 {
-  "barWidth": 431,
+  "barWidth": 484,
   "alpha": 0.5,
   "theme": "vscode-dark",
   "minimalMode": true,
-  "layoutMode": "single",
+  "layoutMode": "double",
   "charNameMode": "compact",
   "wrapMode": "wrap",
   "showUserMessages": false,
@@ -42,12 +42,22 @@
     "think_fox~",
     "so_seq",
     "details",
-    "system"
+    "system",
+    "comment",
+    "summary",
+    "options",
+    "think_nya"
   ],
   "filterActions": false,
   "filterMode": "pure",
   "allowedOrigins": [
     "https://st.sobysong.cn:8443"
   ],
-  "pagedReading": true
+  "pagedReading": true,
+  "fontSize": 9,
+  "chinesePunctuation": false,
+  "autoReadSec": 0,
+  "autoHide": false,
+  "autoBossSec": 300,
+  "bossStyle": "vscode-ts"
 }

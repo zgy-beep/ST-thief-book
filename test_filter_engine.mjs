@@ -8,7 +8,12 @@ import assert from 'node:assert';
 const src = readFileSync(new URL('./st-thief-book.js', import.meta.url), 'utf8');
 const idx = src.lastIndexOf('})();');
 assert.ok(idx > 0, 'IIFE 收尾未找到');
-const hook = '  window.__tbTest = { CONFIG, sanitizeTagList, getFilterRegexes, processWhitelistAndBlacklist, filterThinkingAndTags, cleanHtmlAndStyles, splitIntoSentences };\n';
+const hook = `window.__tbTest = {
+  CONFIG, STATE, sanitizeTagList, getFilterRegexes, processWhitelistAndBlacklist,
+  filterThinkingAndTags, cleanHtmlAndStyles, splitIntoSentences, changeMessageFloor,
+  refreshLatestMessage, initTavernEvents, syncToDesktop, initDesktopBridge, stopDesktopBridge,
+  extractReplyChoices, submitReply, retryGeneration, restoreDesktopPosition
+};\n`;
 const patched = src.slice(0, idx) + hook + src.slice(idx);
 
 const storage = new Map();
@@ -43,10 +48,14 @@ function resetConfig() {
 }
 
 let passed = 0;
+const tests = [];
 function test(name, fn) {
+  tests.push([name, fn]);
+}
+async function runTest(name, fn) {
   resetConfig();
   try {
-    fn();
+    await fn();
     passed++;
     console.log(`[PASS] ${name}`);
   } catch (e) {
@@ -55,7 +64,7 @@ function test(name, fn) {
   }
 }
 
-const P = (s, force) => T.processWhitelistAndBlacklist(s, force);
+const P = T.processWhitelistAndBlacklist;
 
 test('闭合黑名单标签连同内容剥离', () => {
   assert.strictEqual(P('<think>秘密推理</think>正文你好'), '正文你好');
@@ -65,9 +74,58 @@ test('HTML 实体编码的黑名单标签无法绕过', () => {
   assert.strictEqual(P('&lt;think&gt;秘密&lt;/think&gt;正文'), '正文');
 });
 
+test('名单识别粘贴的实体标签、多层转义和数字实体', () => {
+  T.CONFIG.enableWhitelist = true;
+  T.CONFIG.tagWhitelist = ['&amp;lt;game&amp;gt;'];
+  T.CONFIG.tagBlacklist = ['&#x3c;hidden&#x3e;'];
+  const msg = '外围&amp;lt;game&amp;gt;正文&#60;hidden&#62;杂项&#x3c;/hidden&#x3e;&amp;lt;/game&amp;gt;尾部';
+  assert.strictEqual(T.filterThinkingAndTags(msg, 0), '正文');
+  T.CONFIG.tagBlacklist = ['&lt;game&gt;'];
+  assert.strictEqual(T.filterThinkingAndTags('&lt;game&gt;不显示&lt;/game&gt;正文', 0), '正文');
+});
+
+test('黑名单外层不会被内层白名单带回，空白名单保留过滤结果', () => {
+  T.CONFIG.enableWhitelist = true;
+  T.CONFIG.tagBlacklist = ['game', 'think'];
+  assert.strictEqual(T.filterThinkingAndTags(
+    '&lt;game&gt;&lt;content&gt;杂项&lt;/content&gt;&lt;/game&gt;<content>正文</content>', 0), '正文');
+  assert.strictEqual(T.filterThinkingAndTags('外围<content><think>杂项</think></content>', 0), '');
+});
+
+test('酒馆正则使用过滤后的文本，渲染副本无法带回名单外内容', () => {
+  T.CONFIG.filterMode = 'regex';
+  T.CONFIG.enableWhitelist = true;
+  T.CONFIG.tagWhitelist = ['game'];
+  sandbox.retrieveDisplayedMessage = () => ({ length: 1, clone: () => ({
+    find: () => ({ remove() {} }),
+    html: () => '<p>外围和正文及杂项</p>'
+  }) });
+  const formatted = [];
+  sandbox.formatAsDisplayedMessage = text => {
+    formatted.push(text);
+    return '<p>处理后的' + text + '</p>';
+  };
+  try {
+    assert.strictEqual(T.filterThinkingAndTags(
+      '外围&amp;lt;game&amp;gt;正文&lt;think&gt;杂项&lt;/think&gt;&amp;lt;/game&amp;gt;', 0), '处理后的正文');
+    assert.deepStrictEqual(formatted, ['正文']);
+  } finally {
+    delete sandbox.retrieveDisplayedMessage;
+    delete sandbox.formatAsDisplayedMessage;
+  }
+});
+
 test('流式未闭合标签删除至文末', () => {
   assert.strictEqual(P('正文开始<think>秘密推理还在继续'), '正文开始');
   assert.strictEqual(P('正文开始[think]秘密推理还在继续'), '正文开始');
+});
+
+test('未闭合的黑名单只截断已选正文，自闭合标签只删除标签', () => {
+  T.CONFIG.enableWhitelist = true;
+  T.CONFIG.tagBlacklist = ['game'];
+  assert.strictEqual(P('外围<content>正文&lt;game&gt;杂项</content>'), '正文');
+  assert.strictEqual(P('正文&lt;game&gt;<content>隐藏正文</content>'), '正文');
+  assert.strictEqual(P('前&lt;game /&gt;后'), '前后');
 });
 
 test('中括号黑名单标签剥离', () => {
@@ -100,7 +158,7 @@ test('白名单未命中时回退全文不丢字', () => {
 
 test('XML 与中括号白名单混用按文档序提取', () => {
   T.CONFIG.enableWhitelist = true;
-  assert.strictEqual(P('<content>甲</content>[content]乙[/content]'), '甲\n乙');
+  assert.strictEqual(P('[content]甲[/content]<content>乙</content>'), '甲\n乙');
 });
 
 test('长标签优先匹配（thinking 不被 think 词干抢截）', () => {
@@ -171,4 +229,235 @@ test('splitIntoSentences 基本断句', () => {
   assert.ok(parts.join('').includes('你好'));
 });
 
+test('正文断句保留空格、完整 Unicode 字符和稳定句序', () => {
+  const text = 'A'.repeat(41) + '😀 stays together。 Next sentence!\n下一段。';
+  const parts = Array.from(T.splitIntoSentences(text));
+  assert.strictEqual(parts.join(''), text.replace('\n', ' '));
+  assert.ok(parts[0].endsWith('😀'));
+  sandbox.window.innerWidth = 360;
+  T.CONFIG.barWidth = 360;
+  assert.deepStrictEqual(Array.from(T.splitIntoSentences(text)), parts);
+});
+
+test('桥接跨楼跳过用户楼层，区分首末屏并忽略重复翻页', () => {
+  const messages = [
+    { role: 'assistant', message: '😀 第一条回复。 结尾仍有内容。' },
+    { role: 'user', message: '用户消息' },
+    { role: 'assistant', message: '第二条回复。' }
+  ];
+  const sent = [];
+  sandbox.getChatMessages = id => messages[id] ? [messages[id]] : [];
+  sandbox.getLastMessageId = () => messages.length - 1;
+  sandbox.WebSocket = { OPEN: 1 };
+  T.CONFIG.enableDesktopSync = true;
+  T.CONFIG.showUserMessages = false;
+  T.STATE.wsAuthenticated = true;
+  T.STATE.wsClient = { readyState: 1, send: payload => sent.push(JSON.parse(payload)) };
+  T.STATE.currentMsgId = 0;
+
+  T.changeMessageFloor(1, 0, 1);
+  assert.strictEqual(sent.at(-1).floor, 2);
+  assert.strictEqual(sent.at(-1).pageEdge, 'first');
+  assert.strictEqual(sent.at(-1).floorRequest, 1);
+  T.changeMessageFloor(1, 0, 2);
+  assert.strictEqual(sent.at(-1).floorRequest, 2);
+  assert.strictEqual(sent.at(-1).floor, 2);
+  assert.strictEqual(sent.at(-1).pageEdge, undefined);
+  T.changeMessageFloor(1, 2, 3, true);
+  assert.strictEqual(sent.at(-1).floorRequest, 3);
+  assert.strictEqual(sent.at(-1).floor, 2);
+  T.changeMessageFloor(-1, 2, 4);
+  assert.strictEqual(sent.at(-1).floor, 0);
+  assert.strictEqual(sent.at(-1).pageEdge, 'last');
+  assert.strictEqual(sent.at(-1).fullText, messages[0].message);
+  assert.strictEqual(sent.at(-1).sentenceOffset, Array.from('😀 第一条回复。').length);
+  T.refreshLatestMessage(true);
+  assert.strictEqual(sent.at(-1).floor, 0);
+  assert.strictEqual(sent.at(-1).pageEdge, undefined);
+  assert.strictEqual(sent.at(-1).floorRequest, null);
+  T.CONFIG.showUserMessages = true;
+  T.changeMessageFloor(1, 0);
+  assert.strictEqual(sent.at(-1).floor, 1);
+});
+
+test('后台渲染和流式更新保留历史楼层，切会话时从首屏开始', () => {
+  let chat = 'a';
+  let messages = [
+    { role: 'assistant', message: '上一楼已经读到末尾。' },
+    { role: 'user', message: '用户消息' },
+    { role: 'assistant', message: '稍后的回复。' }
+  ];
+  const sent = [];
+  const handlers = new Map();
+  const timers = [];
+  sandbox.SillyTavern = { getCurrentChatId: () => chat, characterId: '7', name2: 'AI' };
+  sandbox.getChatMessages = id => messages[id] ? [messages[id]] : [];
+  sandbox.getLastMessageId = () => messages.length - 1;
+  sandbox.tavern_events = Object.fromEntries([
+    'CHAT_CHANGED', 'CHARACTER_MESSAGE_RENDERED', 'USER_MESSAGE_RENDERED', 'GENERATION_STARTED',
+    'GENERATION_ENDED', 'MESSAGE_RECEIVED', 'MESSAGE_UPDATED', 'MESSAGE_DELETED', 'STREAM_TOKEN_RECEIVED'
+  ].map(name => [name, name]));
+  sandbox.eventOn = (event, callback) => handlers.set(event, callback);
+  sandbox.setTimeout = callback => timers.push(callback);
+  T.CONFIG.showUserMessages = false;
+  T.STATE.wsClient = { readyState: 1, send: payload => sent.push(JSON.parse(payload)) };
+  T.initTavernEvents();
+  T.refreshLatestMessage();
+  handlers.get('GENERATION_STARTED')();
+  handlers.get('STREAM_TOKEN_RECEIVED')();
+  T.changeMessageFloor(-1, 2, 10);
+  timers.shift()(); // 已安排的 token 更新也不能把读者拉回最新楼。
+  handlers.get('CHARACTER_MESSAGE_RENDERED')(2);
+  handlers.get('CHARACTER_MESSAGE_RENDERED')(0);
+  assert.strictEqual(sent.at(-1).floor, 0);
+  assert.strictEqual(sent.at(-1).followGenerating, false);
+  handlers.get('GENERATION_ENDED')();
+  timers.shift()();
+  assert.strictEqual(sent.at(-1).floor, 0);
+  T.changeMessageFloor(1, 0, 11);
+  assert.strictEqual(sent.at(-1).pageEdge, 'first');
+  assert.strictEqual(sent.at(-1).floor, 2);
+
+  handlers.get('GENERATION_STARTED')();
+  messages.push({ role: 'user', message: '新提示' }, {
+    role: 'assistant', message: '这是新回复的第一句话。 新回复的第二句也已经出现了。'
+  });
+  handlers.get('STREAM_TOKEN_RECEIVED')();
+  timers.shift()();
+  assert.strictEqual(sent.at(-1).floor, 4);
+  assert.strictEqual(sent.at(-1).pageEdge, 'first');
+  assert.strictEqual(sent.at(-1).followGenerating, false);
+  sandbox.window.STThiefBook.next();
+  messages[4].message += '继续生成的第三句话。';
+  handlers.get('STREAM_TOKEN_RECEIVED')();
+  timers.shift()();
+  assert.strictEqual(sent.at(-1).curIdx, 2);
+  assert.strictEqual(sent.at(-1).pageEdge, undefined);
+  handlers.get('GENERATION_ENDED')();
+  timers.shift()();
+  assert.strictEqual(sent.at(-1).curIdx, 2);
+
+  chat = 'b';
+  messages[4] = { role: 'assistant', message: '另一个会话的同号楼层。' };
+  handlers.get('CHAT_CHANGED')();
+  assert.strictEqual(sent.at(-1).chatId, 'character:7/b');
+  assert.strictEqual(sent.at(-1).floor, 4);
+  assert.strictEqual(sent.at(-1).pageEdge, 'first');
+  messages = [];
+  handlers.get('MESSAGE_DELETED')();
+  assert.strictEqual(sent.at(-1).floor, -1);
+  assert.match(sent.at(-1).fullText, /暂无消息/);
+
+  chat = null;
+  handlers.get('CHAT_CHANGED')();
+  T.restoreDesktopPosition({ floor: 0, curIdx: 1, chatId: 'character:7/a' });
+  assert.strictEqual(T.STATE.pendingResume.floor, 0);
+  chat = 'a';
+  messages = [
+    { role: 'assistant', message: '上次正在阅读的楼层。' },
+    { role: 'assistant', message: '最新回复。' }
+  ];
+  handlers.get('CHAT_CHANGED')();
+  assert.strictEqual(sent.at(-1).floor, 0);
+  assert.strictEqual(sent.at(-1).resumeFloor, 0);
+  handlers.get('CHAT_CHANGED')();
+  assert.strictEqual(sent.at(-1).floor, 0);
+  assert.strictEqual(sent.at(-1).pageEdge, undefined);
+});
+
+test('仅主动修改宽度时向桌面发送尺寸', () => {
+  const sent = [];
+  T.STATE.wsClient = { readyState: 1, send: payload => sent.push(JSON.parse(payload)) };
+  T.CONFIG.barWidth = 3200;
+  T.CONFIG.barWidthPending = true;
+  T.syncToDesktop();
+  assert.deepStrictEqual(sent[0], { action: 'set_window_width', barWidth: 3200 });
+  assert.strictEqual(sent[1].barWidth, undefined);
+  assert.strictEqual(sent[1].config.barWidth, undefined);
+  assert.strictEqual(JSON.parse(storage.get('ST_THIEF_CONFIG_V3')).barWidthPending, false);
+  T.syncToDesktop();
+  assert.deepStrictEqual(sent.map(frame => frame.action || frame.type), ['set_window_width', 'sync', 'sync']);
+});
+
+test('连接建立前可以取消桌面同步，重复启动只创建一个连接', () => {
+  const connections = [];
+  sandbox.WebSocket = class {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    constructor() {
+      this.readyState = 0;
+      connections.push(this);
+    }
+    close() { this.closed = true; }
+  };
+  T.STATE.wsClient = null;
+  T.initDesktopBridge();
+  T.initDesktopBridge();
+  assert.strictEqual(connections.length, 1);
+  T.stopDesktopBridge();
+  assert.strictEqual(connections[0].closed, true);
+  assert.strictEqual(connections[0].onopen, null);
+  assert.strictEqual(T.STATE.wsClient, null);
+});
+
+test('回复选项可在正文白名单外单独展示，并遵守黑名单', () => {
+  T.CONFIG.enableWhitelist = true;
+  const raw = '<content>剧情正文。</content><think><options><option>隐藏行</option></options></think>'
+    + '&lt;choices&gt;<choice>往树林走</choice><choice>留在原地</choice>&lt;/choices&gt;';
+  assert.strictEqual(T.filterThinkingAndTags(raw, 0), '剧情正文。');
+  assert.deepStrictEqual(Array.from(T.extractReplyChoices(raw)), ['往树林走', '留在原地']);
+  assert.deepStrictEqual(Array.from(T.extractReplyChoices('正文\n**行动选项：**\nA. 先询问\nB. 返回营地\n\n其他说明')),
+    ['A. 先询问', 'B. 返回营地']);
+  assert.deepStrictEqual(Array.from(T.extractReplyChoices('普通说明\n1. 甲\n2. 乙')), []);
+});
+
+test('正文黑名单里的 options 和 option 仍可在独立选项面板中打开', () => {
+  T.CONFIG.tagBlacklist = [...T.CONFIG.tagBlacklist, 'options', 'option'];
+  const raw = '剧情正文。<options><option>先找路<think>隐藏内容</think></option>'
+    + '<option>原地等候</option></options><think><options><option>隐藏选项</option></options></think>';
+  assert.strictEqual(T.filterThinkingAndTags(raw, 0), '剧情正文。');
+  assert.deepStrictEqual(Array.from(T.extractReplyChoices(raw)), ['先找路', '原地等候']);
+  assert.strictEqual(T.filterThinkingAndTags(raw, 0), '剧情正文。');
+});
+
+test('生成失败后重试沿用已发送消息，恢复成功后清除重试状态', async () => {
+  const chat = [{ role: 'assistant', message: '对话开始。' }];
+  const commands = [];
+  const frames = [];
+  let userSends = 0;
+  sandbox.SillyTavern = { getCurrentChatId: () => 'retry-test', characterId: '7' };
+  sandbox.getLastMessageId = () => chat.length - 1;
+  sandbox.getChatMessages = id => chat[id] ? [chat[id]] : [];
+  sandbox.WebSocket = { OPEN: 1 };
+  T.CONFIG.enableDesktopSync = true;
+  T.STATE.wsAuthenticated = true;
+  T.STATE.wsClient = { readyState: 1, send: payload => frames.push(JSON.parse(payload)) };
+  T.refreshLatestMessage(false, true);
+  sandbox.createChatMessages = async messages => {
+    userSends++;
+    chat.push(...messages);
+  };
+  sandbox.triggerSlash = async command => {
+    commands.push(command);
+    if (commands.length === 1) {
+      chat.push({ role: 'assistant', message: '...' });
+      throw new Error('test provider failure');
+    }
+    chat.at(-1).message = '成功生成的新回复。';
+  };
+
+  await T.submitReply('中文标点，保留！');
+  assert.strictEqual(frames.at(-1).generationStatus, 'failed');
+  assert.strictEqual(frames.at(-1).canRetryGeneration, true);
+  await T.retryGeneration();
+  assert.deepStrictEqual(commands, ['/trigger await=true', '/regenerate await=true']);
+  assert.strictEqual(userSends, 1);
+  assert.strictEqual(chat[1].message, '中文标点，保留！');
+  assert.strictEqual(frames.at(-1).generationStatus, 'complete');
+  assert.strictEqual(frames.at(-1).canRetryGeneration, false);
+});
+
+for (const [name, fn] of tests) {
+  await runTest(name, fn);
+}
 console.log(`\n${passed} 项通过${process.exitCode ? '，存在失败项' : '，全部通过'}`);

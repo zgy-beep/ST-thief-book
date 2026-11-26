@@ -55,6 +55,7 @@
     privacyMode: false,
     // 尺寸配置
     barWidth: 840,
+    barWidthPending: false,
     // 透明度 (0.2 ~ 1.0)
     opacity: 0.95,
     // 是否过滤动作描写括号 *xxx*
@@ -77,9 +78,17 @@
     currentMsgId: -1,
     currentSentenceIndex: 0,
     sentences: [],
+    chatId: null,
+    pendingResume: null,
+    followLatest: true,
+    replyChoices: [],
     characterName: 'AI',
     userName: 'User',
     isGenerating: false,
+    generationId: 0,
+    generation: null,
+    generationStatus: 'idle',
+    generationRetry: null,
     isBossKey: false,
     isSettingsOpen: false,
     wsClient: null,
@@ -88,20 +97,6 @@
     wsAuthenticated: false,
     streamRenderTimer: null
   };
-
-  // 获取当前屏幕实际可用宽度 (移动端自适应，绝不截断溢出)
-  function getEffectiveBarWidth() {
-    let w = CONFIG.barWidth || 840;
-    try {
-      const topWin = window.top || window;
-      const vp = topWin.visualViewport;
-      const curW = (vp ? vp.width : topWin.innerWidth) || (topWin.screen ? topWin.screen.width : 0);
-      if (curW > 0 && curW < w) {
-        w = Math.max(260, Math.floor(curW));
-      }
-    } catch (e) {}
-    return w;
-  }
 
   // 配置枚举合法值与标签列表清洗（本地加载与 WS update_config 共用同一防线）
   const CONFIG_ENUMS = {
@@ -114,9 +109,14 @@
   function sanitizeTagList(arr) {
     if (!Array.isArray(arr)) return null;
     const cleaned = arr.slice(0, 100)
-      .map(t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, ''))
+      .filter(t => typeof t === 'string')
+      .map(t => preDecodeEntities(t).trim().replace(/^[<\[]+\s*\/?|\/?\s*[>\]]+$/g, '').trim().toLowerCase())
       .filter(t => t && t.length <= 64);
     return Array.from(new Set(cleaned));
+  }
+
+  function isBarWidth(value) {
+    return Number.isInteger(value) && value >= 360 && value <= 3840;
   }
 
   // 读取持久化配置
@@ -170,8 +170,9 @@
         if (typeof saved.privacyMode === 'boolean') {
           CONFIG.privacyMode = saved.privacyMode;
         }
-        if (typeof saved.barWidth === 'number' && saved.barWidth >= 360) {
+        if (isBarWidth(saved.barWidth)) {
           CONFIG.barWidth = saved.barWidth;
+          CONFIG.barWidthPending = saved.barWidthPending === true;
         }
       }
     } catch (e) {
@@ -197,7 +198,8 @@
         privacyMode: CONFIG.privacyMode,
         opacity: CONFIG.opacity,
         layoutMode: CONFIG.layoutMode,
-        barWidth: CONFIG.barWidth
+        barWidth: CONFIG.barWidth,
+        barWidthPending: CONFIG.barWidthPending
       };
       localStorage.setItem('ST_THIEF_CONFIG_V3', JSON.stringify(data));
 
@@ -212,15 +214,22 @@
   // ------------------------------------------------------------------------------------
   // 白名单提取与黑名单剥离引擎 (在白名单内剔除黑名单)
   // ------------------------------------------------------------------------------------
+  const TAG_ENTITIES = {
+    lt: '<', gt: '>', quot: '"', apos: "'", amp: '&',
+    lsqb: '[', lbrack: '[', rsqb: ']', rbrack: ']'
+  };
+  const TAG_ENTITY_RE = /&(?:(?:amp|#0*38|#x0*26);)*(lt|gt|quot|apos|amp|lsqb|lbrack|rsqb|rbrack|#0*\d{1,7}|#x0*[\da-f]{1,6});/gi;
+
   function preDecodeEntities(str) {
     if (!str || typeof str !== 'string') return '';
-    return str
-      .replace(/&lt;/gi, '<')
-      .replace(/&gt;/gi, '>')
-      .replace(/&quot;/gi, '"')
-      .replace(/&#39;/gi, "'")
-      .replace(/&apos;/gi, "'")
-      .replace(/&amp;/gi, '&');
+    return str.replace(TAG_ENTITY_RE, (entity, name) => {
+      name = name.toLowerCase();
+      if (name[0] !== '#') return TAG_ENTITIES[name];
+      const hex = name[1] === 'x';
+      const code = Number.parseInt(name.slice(hex ? 2 : 1), hex ? 16 : 10);
+      if (code === 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) return entity;
+      return String.fromCodePoint(code);
+    });
   }
 
   function cleanHtmlAndStyles(html) {
@@ -243,10 +252,7 @@
           try { doc.querySelectorAll(validSelectors).forEach(el => el.remove()); } catch (e) {}
         }
 
-        const domText = doc.body.innerText || doc.body.textContent || '';
-        if (domText && domText.trim()) {
-          text = domText;
-        }
+        text = doc.body.innerText || doc.body.textContent || '';
       } catch (e) {
         // DOMParser 降级
       }
@@ -268,13 +274,16 @@
   const HTML_JUNK_RE = /<style[\s\S]{0,100000}?<\/style>|<script[\s\S]{0,100000}?<\/script>|<svg[\s\S]{0,100000}?<\/svg>|<!--[\s\S]{0,100000}?-->/gi;
 
   // 过滤正则缓存：标签列表不变时直接复用；所有标签合并为 alternation，10 遍扫描替代 标签数×10 遍
-  let _filterCache = { key: null };
-  function getFilterRegexes() {
-    const cleanTag = t => String(t).trim().replace(/^[<\[]+|[>\]]+$/g, '');
-    const wl = (CONFIG.tagWhitelist || []).map(cleanTag).filter(Boolean);
-    const bl = (CONFIG.tagBlacklist || []).map(cleanTag).filter(Boolean);
+  const CHOICE_TAGS = new Set(['options', 'choices', '选项', '可选行动', 'option', 'choice']);
+  const _filterCache = {};
+  function getFilterRegexes(forChoices = false) {
+    const wl = sanitizeTagList(CONFIG.tagWhitelist) || [];
+    const blacklist = sanitizeTagList(CONFIG.tagBlacklist) || [];
+    // 独立选项面板可读取被正文隐藏的选项，其他黑名单规则仍适用。
+    const bl = forChoices ? blacklist.filter(tag => !CHOICE_TAGS.has(tag)) : blacklist;
+    const mode = forChoices ? 'choices' : 'body';
     const key = wl.join(',') + '|' + bl.join(',');
-    if (_filterCache.key === key) return _filterCache;
+    if (_filterCache[mode]?.key === key) return _filterCache[mode];
 
     const esc = t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     // 长标签优先，避免 think 词干抢先匹配 thinking
@@ -282,7 +291,7 @@
     const wlAlt = alt(wl);
     const blAlt = alt(bl);
     const B = '{0,100000}?';
-    const cache = { key, wlXml: null, wlBracket: null, bl: [], selector: '' };
+    const cache = { key, wlXml: null, wlBracket: null, bl: [], blOpen: null, selector: '' };
     if (wlAlt) {
       cache.wlXml = new RegExp('<\\s*(' + wlAlt + ')(?:[\\s:][^>]*)?>([\\s\\S]' + B + ')<\\/\\s*\\1\\s*>', 'gi');
       cache.wlBracket = new RegExp('\\[\\s*(' + wlAlt + ')(?:[\\s:][^\\]]*)?\\]([\\s\\S]' + B + ')\\[\\/\\s*\\1\\s*\\]', 'gi');
@@ -297,42 +306,27 @@
         new RegExp('<\\s*(?:' + blAlt + ')\\s*[:：][^>]*>', 'gi'),
         new RegExp('\\(\\s*(?:' + blAlt + ')\\s*[:：][^\\)]*\\)', 'gi'),
         new RegExp('\\{\\s*(?:' + blAlt + ')\\s*[:：][^\\}]*\\}', 'gi'),
-        // 流式未闭合标签：删除自 opening tag 至文末
-        new RegExp('<\\s*(?:' + blAlt + ')(?:[\\s:][^>]*)?>[\\s\\S]*$', 'gi'),
-        new RegExp('\\[\\s*(?:' + blAlt + ')(?:[\\s:][^\\]]*)?\\][\\s\\S]*$', 'gi'),
-        // 游离闭合或单标签
-        new RegExp('<\\/?\\s*(?:' + blAlt + ')(?:[\\s:][^>]*)?>', 'gi'),
-        new RegExp('\\[\\/?\\s*(?:' + blAlt + ')(?:[\\s:][^\\]]*)?\\]', 'gi')
+        // 自闭合标签与游离闭合标签
+        new RegExp('<\\s*(?:' + blAlt + ')(?:[\\s:][^>]*)?/\\s*>', 'gi'),
+        new RegExp('<\\/\\s*(?:' + blAlt + ')(?:[\\s:][^>]*)?>', 'gi'),
+        new RegExp('\\[\\/\\s*(?:' + blAlt + ')(?:[\\s:][^\\]]*)?\\]', 'gi')
       ];
+      cache.blOpen = new RegExp('<\\s*(?:' + blAlt + ')(?:[\\s:][^>]*)?>'
+        + '|\\[\\s*(?:' + blAlt + ')(?:[\\s:][^\\]]*)?\\]', 'i');
     }
     cache.selector = bl.filter(t => /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(t)).join(',');
-    _filterCache = cache;
+    _filterCache[mode] = cache;
     return cache;
   }
 
-  function processWhitelistAndBlacklist(content, forceDisableWhitelist = false) {
-    if (!content || typeof content !== 'string') return '';
+  function filterBlacklisted(content, forChoices = false) {
     // 关键：预先解码 HTML 实体，避免 &lt;tag&gt; 绕过黑名单！
     let text = preDecodeEntities(content);
     text = text.replace(HTML_JUNK_RE, '');
 
-    const rx = getFilterRegexes();
+    const rx = getFilterRegexes(forChoices);
 
-    // 白名单容器正文提取：未匹配任何白名单时回退为全文，绝不丢弃正文
-    if (!forceDisableWhitelist && CONFIG.enableWhitelist && rx.wlXml) {
-      const extracted = [];
-      for (const m of text.matchAll(rx.wlXml)) {
-        if (m[2] && m[2].trim()) extracted.push(m[2].trim());
-      }
-      for (const m of text.matchAll(rx.wlBracket)) {
-        if (m[2] && m[2].trim()) extracted.push(m[2].trim());
-      }
-      if (extracted.length > 0) {
-        text = extracted.join('\n');
-      }
-    }
-
-    // 黑名单及其内部思考过程彻底剥离
+    // 先删除黑名单内容，避免其中嵌套的白名单容器被提取出来。
     for (const re of rx.bl) {
       text = text.replace(re, '');
     }
@@ -340,7 +334,51 @@
     // 剥离 Markdown 思考代码块 ```thought ... ```
     text = text.replace(/```(?:thought|thinking|think|cot|reasoning)[\s\S]*?```/gi, '');
 
-    return text;
+    const open = rx.blOpen?.exec(text);
+    return { text, end: open?.index ?? text.length, rx };
+  }
+
+  function processWhitelistAndBlacklist(content) {
+    const { text, end, rx } = filterBlacklisted(content);
+    if (CONFIG.enableWhitelist && rx.wlXml) {
+      const matches = [...text.matchAll(rx.wlXml), ...text.matchAll(rx.wlBracket)];
+      const visible = matches.filter(match => match.index < end);
+      if (visible.length > 0) {
+        visible.sort((a, b) => a.index - b.index);
+        return visible.map(match => {
+          const body = match[2];
+          const hidden = end < text.length && rx.blOpen.exec(body);
+          return body.slice(0, hidden?.index ?? body.length).trim();
+        }).filter(Boolean).join('\n');
+      }
+    }
+    return text.slice(0, end);
+  }
+
+  function extractReplyChoices(rawText) {
+    const { text, end } = filterBlacklisted(rawText, true);
+    const visible = text.slice(0, end);
+    const sections = visible.matchAll(/<(options|choices|选项|可选行动)(?:\s[^>]*)?>([\s\S]{0,16000}?)<\/\1\s*>|\[(options|choices|选项|可选行动)\]([\s\S]{0,16000}?)\[\/\3\]/gi);
+    const lines = [];
+    for (const section of sections) {
+      const body = section[2] ?? section[4];
+      const items = [...body.matchAll(/<(option|choice|li)(?:\s[^>]*)?>([\s\S]{0,4000}?)<\/\1\s*>/gi)];
+      lines.push(...(items.length ? items.map(item => item[2]) : body.split(/\r?\n/)));
+    }
+    if (!lines.length) {
+      const rawLines = visible.split(/\r?\n/);
+      const heading = rawLines.findIndex(line => /^(?:#{1,6}\s*)?(?:【\s*)?(?:剧情选项|行动选项|可选行动|选项|choices?|options?)\s*(?:】|[:：])?$/i
+        .test(line.replace(/[*_]/g, '').trim()));
+      if (heading !== -1) {
+        for (const line of rawLines.slice(heading + 1)) {
+          if (!line.trim() && !lines.length) continue;
+          if (!/^\s*(?:\*\*)?(?:[-*+]\s+|[A-ZＡ-Ｚ\d０-９]{1,2}[.．、)）:：])/i.test(line)) break;
+          lines.push(line);
+        }
+      }
+    }
+    return [...new Set(lines.map(line => cleanHtmlAndStyles(line.replace(/^\s*[-*+]\s+/, '').replace(/\*\*/g, '')))
+      .filter(choice => choice && choice.length <= 2000))].slice(0, 12);
   }
 
   function filterThinkingAndTags(rawText, messageId) {
@@ -354,13 +392,12 @@
       text = text.replace(/\*[^*]+\*/g, '').trim();
     }
 
-    // 3. 模式 A：纯净小说模式
-    let result = '';
-    if (CONFIG.filterMode === 'pure') {
-      result = cleanHtmlAndStyles(text);
-    } else {
-      // 模式 B：酒馆正则模式
-      if (typeof retrieveDisplayedMessage === 'function' && typeof messageId === 'number' && messageId >= 0) {
+    if (!text.trim()) return '';
+
+    if (CONFIG.filterMode !== 'pure') {
+      // 原文有内容被过滤时，格式化过滤后的文本，避免渲染副本带回已排除的内容。
+      const hasFloor = typeof messageId === 'number' && messageId >= 0;
+      if (text === rawText && hasFloor && typeof retrieveDisplayedMessage === 'function') {
         try {
           const $mes = retrieveDisplayedMessage(messageId);
           if ($mes && $mes.length > 0) {
@@ -371,43 +408,30 @@
               try { $clone.find(validSelectors).remove(); } catch (e) {}
             }
             const rendered = $clone.html();
-            if (rendered && rendered.trim()) {
-              result = cleanHtmlAndStyles(processWhitelistAndBlacklist(rendered));
+            if (typeof rendered === 'string') {
+              return cleanHtmlAndStyles(processWhitelistAndBlacklist(rendered));
             }
           }
         } catch (e) {}
       }
 
-      if (!result && typeof formatAsDisplayedMessage === 'function' && typeof messageId === 'number' && messageId >= 0) {
+      if (hasFloor && typeof formatAsDisplayedMessage === 'function') {
         try {
           const formatted = formatAsDisplayedMessage(text, { message_id: messageId });
-          result = cleanHtmlAndStyles(processWhitelistAndBlacklist(formatted));
+          if (typeof formatted === 'string') return cleanHtmlAndStyles(processWhitelistAndBlacklist(formatted));
         } catch (e) {}
       }
 
-      if (!result && typeof formatAsTavernRegexedString === 'function') {
+      if (typeof formatAsTavernRegexedString === 'function') {
         try {
           const formatted = formatAsTavernRegexedString(text, 'ai_output', 'display', { depth: 0 });
-          result = cleanHtmlAndStyles(processWhitelistAndBlacklist(formatted));
+          if (typeof formatted === 'string') return cleanHtmlAndStyles(processWhitelistAndBlacklist(formatted));
         } catch (e) {}
       }
 
-      if (!result) {
-        result = cleanHtmlAndStyles(text);
-      }
     }
 
-    // 4. 终极安全保底：若过滤后变为空白，但原始消息本来有字，执行宽容保底
-    // 注意：保底也必须严格遵守黑名单，绝不能无视黑名单复活被剔除的黑名单文本！
-    if (!result && rawText.trim()) {
-      let safeFallback = processWhitelistAndBlacklist(rawText, true);
-      safeFallback = cleanHtmlAndStyles(safeFallback);
-      if (safeFallback) {
-        return safeFallback;
-      }
-    }
-
-    return result;
+    return cleanHtmlAndStyles(text);
   }
 
   // ------------------------------------------------------------------------------------
@@ -416,12 +440,11 @@
   function splitIntoSentences(text) {
     if (!text || typeof text !== 'string') return ['(暂无消息)'];
 
-    let content = text.trim();
+    const content = text.trim();
     if (!content) return ['(无对白内容)'];
 
-    // 根据当前窗口/视口实际宽度动态评估单行最大字数容纳量 (适配手机端与小屏)
-    const effectiveBarW = getEffectiveBarWidth();
-    const lineCapChars = Math.max(12, Math.min(60, Math.floor((effectiveBarW - 140) / 16)));
+    // 保持句序与浏览器视口无关，桌面端按实际宽度分页或截断。
+    const lineCapChars = CONFIG.maxSentenceLen;
 
     // 句子切分：支持在强句末标点（。！？!?；…\n）切分；
     // 当单句较长遇到逗号、顿号、破折号时，自然切分成单行小短句，超长文字顺延在下一行显示，绝不向下撑高窗口
@@ -429,8 +452,25 @@
     const result = [];
     let currentSentence = '';
 
-    for (let i = 0; i < rawSegments.length; i++) {
-      const seg = rawSegments[i];
+    function appendSentence() {
+      const chars = Array.from(currentSentence.replace(/\r?\n+/g, ' '));
+      for (let start = 0; start < chars.length;) {
+        let end = Math.min(start + lineCapChars, chars.length);
+        if (end < chars.length) {
+          for (let p = end; p > end - 8; p--) {
+            if (/[，,、 ；;。！？!?—~～…]/.test(chars[p - 1])) {
+              end = p;
+              break;
+            }
+          }
+        }
+        result.push(chars.slice(start, end).join(''));
+        start = end;
+      }
+      currentSentence = '';
+    }
+
+    for (const seg of rawSegments) {
       if (!seg) continue;
 
       currentSentence += seg;
@@ -443,39 +483,9 @@
       const shouldBreakSoft = isSoftPunct && curLen >= Math.max(16, lineCapChars - 10);
       const isOverMax = curLen >= lineCapChars;
 
-      if (shouldBreakHard || shouldBreakSoft || isOverMax || i === rawSegments.length - 1) {
-        let clean = currentSentence.replace(/\r?\n+/g, ' ').trim();
-        if (clean) {
-          // 若单句依然超长，进一步切成单行顺延显示，绝不裁剪丢字
-          while (clean.length > lineCapChars) {
-            let splitPos = lineCapChars;
-            const lookback = Math.max(10, splitPos - 8);
-            for (let p = splitPos; p >= lookback; p--) {
-              if (/[，,、 ；;。！？!?—~～…]/.test(clean[p - 1])) {
-                splitPos = p;
-                break;
-              }
-            }
-            const chunk = clean.slice(0, splitPos).trim();
-            if (chunk) result.push(chunk);
-            clean = clean.slice(splitPos).trim();
-          }
-          if (clean) {
-            result.push(clean);
-          }
-        }
-        currentSentence = '';
-      }
+      if (shouldBreakHard || shouldBreakSoft || isOverMax) appendSentence();
     }
-
-    if (currentSentence.trim()) {
-      let clean = currentSentence.replace(/\r?\n+/g, ' ').trim();
-      while (clean.length > lineCapChars) {
-        result.push(clean.slice(0, lineCapChars).trim());
-        clean = clean.slice(lineCapChars).trim();
-      }
-      if (clean) result.push(clean);
-    }
+    appendSentence();
 
     return result.length > 0 ? result : [content];
   }
@@ -483,105 +493,138 @@
   // ------------------------------------------------------------------------------------
   // 数据同步与楼层读取
   // ------------------------------------------------------------------------------------
-  function refreshLatestMessage(forceJumpToEnd = false) {
+  function getActiveChatId() {
+    if (typeof SillyTavern === 'undefined') return null;
+    const id = SillyTavern.getCurrentChatId?.() || SillyTavern.chatId;
+    if (typeof id !== 'string' || !id) return null;
+    const owner = SillyTavern.groupId ? `group:${SillyTavern.groupId}` : `character:${SillyTavern.characterId ?? ''}`;
+    return `${owner}/${id}`;
+  }
+
+  function readableMessage(id) {
+    const [msg] = getChatMessages(id, { include_swipes: true }) || [];
+    return msg && (CONFIG.showUserMessages || (!msg.is_user && msg.role !== 'user')) ? msg : null;
+  }
+
+  function latestReadableMessage(lastId) {
+    for (let id = lastId; id >= 0; id--) {
+      const msg = readableMessage(id);
+      if (msg) return { id, msg };
+    }
+    const [msg] = getChatMessages(lastId, { include_swipes: true }) || [];
+    return msg ? { id: lastId, msg } : null;
+  }
+
+  function refreshLatestMessage(keepFloor = false, reset = false) {
     try {
+      const chatId = getActiveChatId();
+      if (reset || (chatId !== null && chatId !== STATE.chatId)) {
+        STATE.chatId = chatId;
+        reset = true;
+      }
+      if (reset) {
+        clearTimeout(STATE.streamRenderTimer);
+        STATE.streamRenderTimer = null;
+        STATE.followLatest = true;
+        STATE.isGenerating = false;
+        STATE.generation = null;
+        STATE.generationStatus = 'idle';
+        STATE.generationRetry = null;
+      }
       const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : -1;
-      if (lastId < 0) return;
-
-      let targetId = lastId;
-      if (!CONFIG.showUserMessages) {
-        // 从最新一条消息向前寻找最近一条非用户消息 (AI/小说楼层)
-        while (targetId >= 0) {
-          const msgs = getChatMessages(targetId, { include_swipes: true });
-          if (msgs && msgs[0] && !msgs[0].is_user && msgs[0].role !== 'user') {
-            break;
-          }
-          targetId--;
-        }
-        // 如果未找到任何 AI 消息（例如纯新会话只有用户第一句输入），安全回退到 lastId
-        if (targetId < 0) targetId = lastId;
-      }
-
-      const messages = getChatMessages(targetId, { include_swipes: true });
-      if (!messages || messages.length === 0) return;
-
-      const latest = messages[0];
-      const isNewFloor = STATE.currentMsgId !== targetId;
-      STATE.currentMsgId = targetId;
-
-      STATE.characterName = latest.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
-      STATE.userName = typeof SillyTavern !== 'undefined' ? SillyTavern.name1 : 'User';
-
-      let rawText = latest.message || '';
-      if (latest.swipes && latest.swipes.length > 0 && typeof latest.swipe_id === 'number') {
-        rawText = latest.swipes[latest.swipe_id] || rawText;
-      }
-
-      const cleanText = filterThinkingAndTags(rawText, targetId);
-      const newSentences = splitIntoSentences(cleanText);
-      STATE.sentences = newSentences;
-
-      if (forceJumpToEnd) {
-        STATE.currentSentenceIndex = Math.max(0, newSentences.length - 1);
-      } else if (isNewFloor) {
+      const previousFloor = STATE.currentMsgId;
+      const previousIndex = STATE.currentSentenceIndex;
+      const current = !reset && keepFloor && previousFloor >= 0 && previousFloor <= lastId
+        ? readableMessage(previousFloor) : null;
+      const target = current ? { id: previousFloor, msg: current }
+        : lastId >= 0 ? latestReadableMessage(lastId) : null;
+      if (!target) {
+        STATE.currentMsgId = -1;
         STATE.currentSentenceIndex = 0;
-      } else if (STATE.currentSentenceIndex >= newSentences.length) {
-        STATE.currentSentenceIndex = 0;
+        STATE.sentences = ['（当前会话暂无消息）'];
+        STATE.replyChoices = [];
+        STATE.characterName = typeof SillyTavern !== 'undefined' ? SillyTavern.name2 || 'AI' : 'AI';
+        STATE.followLatest = true;
+        if (!tryRestoreDesktopPosition(lastId, 'first')) syncToDesktop('first');
+        return;
+      }
+      if (!current) STATE.followLatest = true;
+      loadMessageFloor(target.msg, target.id);
+      if (!reset && previousFloor === target.id) {
+        STATE.currentSentenceIndex = Math.min(previousIndex, STATE.sentences.length - 1);
       }
 
-      syncToDesktop();
+      const pageEdge = reset || target.id !== previousFloor ? 'first' : undefined;
+      if (!tryRestoreDesktopPosition(lastId, pageEdge)) syncToDesktop(pageEdge);
     } catch (err) {
       console.warn('[ST-Thief-Book] 读取最新消息异常:', err);
     }
   }
 
-  function changeMessageFloor(delta) {
+  function refreshFollowingMessage() {
+    refreshLatestMessage(!STATE.followLatest);
+  }
+
+  function changeMessageFloor(delta, fromFloor, floorRequest, quiet = false) {
     try {
-      const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : 0;
-      let targetId = STATE.currentMsgId + delta;
-      if (targetId < 0) targetId = 0;
-      if (targetId > lastId) targetId = lastId;
-
-      if (!CONFIG.showUserMessages) {
-        while (targetId >= 0 && targetId <= lastId) {
-          const checkMsgs = getChatMessages(targetId, { include_swipes: true });
-          if (checkMsgs && checkMsgs[0] && !checkMsgs[0].is_user && checkMsgs[0].role !== 'user') {
-            break;
-          }
-          targetId += (delta >= 0 ? 1 : -1);
-        }
-        if (targetId < 0 || targetId > lastId) {
-          flashStatusHint(delta > 0 ? '已是最新 AI 回复' : '已是最前 AI 回复');
-          return;
-        }
+      if (fromFloor !== undefined && fromFloor !== STATE.currentMsgId) {
+        if (floorRequest !== undefined) syncToDesktop(undefined, floorRequest);
+        return;
       }
-
-      if (targetId === STATE.currentMsgId) return;
-
-      const msgs = getChatMessages(targetId, { include_swipes: true });
-      if (!msgs || msgs.length === 0) return;
-
-      const msg = msgs[0];
-      STATE.currentMsgId = targetId;
-      STATE.characterName = msg.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
-
-      let rawText = msg.message || '';
-      if (msg.swipes && msg.swipes.length > 0 && typeof msg.swipe_id === 'number') {
-        rawText = msg.swipes[msg.swipe_id] || rawText;
+      STATE.pendingResume = null;
+      const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : -1;
+      const step = Math.sign(delta);
+      if (!step) return;
+      for (let targetId = STATE.currentMsgId + step; targetId >= 0 && targetId <= lastId; targetId += step) {
+        const msg = readableMessage(targetId);
+        if (!msg) continue;
+        loadMessageFloor(msg, targetId);
+        STATE.followLatest = targetId === latestReadableMessage(lastId)?.id;
+        if (step < 0) {
+          STATE.currentSentenceIndex = STATE.sentences.length - 1;
+        }
+        syncToDesktop(step < 0 ? 'last' : 'first', floorRequest);
+        return;
       }
-
-      const cleanText = filterThinkingAndTags(rawText, targetId);
-      STATE.sentences = splitIntoSentences(cleanText);
-      STATE.currentSentenceIndex = delta < 0 ? Math.max(0, STATE.sentences.length - 1) : 0;
-
-      syncToDesktop();
+      if (floorRequest !== undefined) syncToDesktop(undefined, floorRequest);
+      if (!quiet) flashStatusHint(step > 0 ? '已到最后一楼' : '已到第一楼');
     } catch (e) {
       console.error('[ST-Thief-Book] 切换楼层失败:', e);
     }
   }
 
-  function jumpToMessageFloor(targetFloor, sentenceIdx) {
+  function loadMessageFloor(msg, targetId) {
+    const rawText = msg.swipes?.[msg.swipe_id] || msg.message || '';
+    STATE.sentences = splitIntoSentences(filterThinkingAndTags(rawText, targetId));
+    STATE.replyChoices = msg.role === 'user' || msg.is_user ? [] : extractReplyChoices(rawText);
+    STATE.currentMsgId = targetId;
+    STATE.currentSentenceIndex = 0;
+    STATE.characterName = msg.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
+    STATE.userName = typeof SillyTavern !== 'undefined' ? SillyTavern.name1 : 'User';
+  }
+
+  function tryRestoreDesktopPosition(lastId, pageEdge) {
+    const saved = STATE.pendingResume;
+    if (!saved || (typeof saved.chatId === 'string' && STATE.chatId === null)) return false;
+    if (typeof saved.chatId === 'string' && saved.chatId !== STATE.chatId) {
+      STATE.pendingResume = null;
+      syncToDesktop(pageEdge, null, saved.floor);
+      return true;
+    }
+    if (lastId < 0) return false;
+    STATE.pendingResume = null;
+    jumpToMessageFloor(saved.floor, saved.curIdx, saved.floor);
+    return true;
+  }
+
+  function restoreDesktopPosition(data) {
+    STATE.pendingResume = data;
+    refreshLatestMessage(true);
+  }
+
+  function jumpToMessageFloor(targetFloor, sentenceIdx, resumeFloor = null) {
     try {
+      if (resumeFloor === null) STATE.pendingResume = null;
       const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : 0;
       let targetId = parseInt(targetFloor, 10);
       if (isNaN(targetId)) return;
@@ -590,27 +633,19 @@
 
       const msgs = getChatMessages(targetId, { include_swipes: true });
       if (!msgs || msgs.length === 0) {
-        flashStatusHint(`未找到第 #${targetId} 楼`);
+        if (resumeFloor === null) flashStatusHint(`未找到第 #${targetId} 楼`);
+        else syncToDesktop(undefined, null, resumeFloor);
         return;
       }
 
-      const msg = msgs[0];
-      STATE.currentMsgId = targetId;
-      STATE.characterName = msg.name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
-
-      let rawText = msg.message || '';
-      if (msg.swipes && msg.swipes.length > 0 && typeof msg.swipe_id === 'number') {
-        rawText = msg.swipes[msg.swipe_id] || rawText;
-      }
-
-      const cleanText = filterThinkingAndTags(rawText, targetId);
-      STATE.sentences = splitIntoSentences(cleanText);
+      loadMessageFloor(msgs[0], targetId);
+      STATE.followLatest = targetId === latestReadableMessage(lastId)?.id;
       // 可选句序（1 起）：桌面端重启恢复阅读位置时传入；缺省回第一句
       const idx = parseInt(sentenceIdx, 10);
       STATE.currentSentenceIndex = isNaN(idx) ? 0 : Math.max(0, Math.min(STATE.sentences.length - 1, idx - 1));
 
-      syncToDesktop();
-      flashStatusHint(`已跳转至第 #${targetId} 楼`);
+      syncToDesktop(isNaN(idx) ? 'first' : undefined, null, resumeFloor);
+      if (resumeFloor === null) flashStatusHint(`已跳转至第 #${targetId} 楼`);
     } catch (e) {
       console.error('[ST-Thief-Book] 跳转楼层失败:', e);
     }
@@ -656,8 +691,7 @@
     CONFIG.showUserMessages = !CONFIG.showUserMessages;
     saveCurrentConfig();
     flashStatusHint(CONFIG.showUserMessages ? '已开启显示用户消息' : '已隐藏用户消息 (仅阅读AI与小说)');
-    refreshLatestMessage(false);
-    syncToDesktop();
+    refreshLatestMessage(true);
   }
 
   // ------------------------------------------------------------------------------------
@@ -667,6 +701,7 @@
     if (STATE.isBossKey) {
       return;
     }
+    STATE.pendingResume = null;
 
     if (STATE.currentSentenceIndex < STATE.sentences.length - 1) {
       STATE.currentSentenceIndex++;
@@ -685,6 +720,7 @@
     if (STATE.isBossKey) {
       return;
     }
+    STATE.pendingResume = null;
 
     if (STATE.currentSentenceIndex > 0) {
       STATE.currentSentenceIndex--;
@@ -709,51 +745,96 @@
   // ------------------------------------------------------------------------------------
   // 回复发送与 AI 生成控制
   // ------------------------------------------------------------------------------------
-  async function submitReply(userInput) {
-    const text = (userInput || '').trim();
-    if (!text) return;
+  function lastGenerationMessage() {
+    const id = typeof getLastMessageId === 'function' ? getLastMessageId() : -1;
+    const msg = id >= 0 && typeof getChatMessages === 'function' ? getChatMessages(id)?.[0] : null;
+    const user = msg?.is_user || msg?.role === 'user';
+    const live = typeof SillyTavern !== 'undefined' ? SillyTavern.chat?.[id] : null;
+    return { id, user, assistant: Boolean(msg && !user && msg.role !== 'system'),
+      text: (msg?.message || '').trim(), stamp: live?.gen_finished ?? live?.send_date };
+  }
 
+  function activeStreamingProcessor() {
+    return typeof SillyTavern !== 'undefined' ? SillyTavern.streamingProcessor : null;
+  }
+
+  function beginGeneration(command, managed) {
+    const attempt = { command, managed, chatId: getActiveChatId(), before: lastGenerationMessage(),
+      previousStream: activeStreamingProcessor() };
+    STATE.generation = attempt;
+    STATE.generationId++;
     STATE.isGenerating = true;
+    STATE.generationStatus = 'running';
+    STATE.generationRetry = null;
     syncToDesktop();
+    return attempt;
+  }
 
+  function generationStreamFailed(attempt) {
+    const stream = activeStreamingProcessor();
+    return Boolean(stream !== attempt.previousStream && stream?.isStopped && !stream.isFinished);
+  }
+
+  function finishGeneration(attempt, status, unsent = '') {
+    if (STATE.generation !== attempt) return;
+    const last = lastGenerationMessage();
+    const changedReply = last.assistant && !['', '...', '…'].includes(last.text)
+      && (last.id !== attempt.before.id || last.text !== attempt.before.text || last.stamp !== attempt.before.stamp);
+    const outcome = status || (changedReply && !attempt.streamFailed && !generationStreamFailed(attempt) ? 'complete' : 'failed');
+    if (outcome === 'failed') {
+      const command = unsent || (attempt.command === '/trigger' && !(last.assistant && last.id > attempt.before.id))
+        ? '/trigger' : '/regenerate';
+      STATE.generationRetry = { chatId: attempt.chatId, floor: last.id, text: last.text, command, unsent };
+    }
+    STATE.generation = null;
+    STATE.isGenerating = false;
+    STATE.generationStatus = outcome;
+    refreshFollowingMessage();
+  }
+
+  async function runGeneration(command, draft = '') {
+    if (STATE.isGenerating) return;
+    STATE.followLatest = true;
+    const attempt = beginGeneration(command, true);
+    let unsent = draft;
     try {
-      if (typeof createChatMessages === 'function') {
-        await createChatMessages([{ role: 'user', message: text }]);
+      if (draft) {
+        if (typeof createChatMessages !== 'function') throw new Error('酒馆助手未提供发送接口');
+        await createChatMessages([{ role: 'user', message: draft }]);
+        unsent = '';
       }
-
-      if (typeof triggerSlash === 'function') {
-        await triggerSlash('/trigger');
-      }
-    } catch (err) {
-      console.error('[ST-Thief-Book] 发送消息失败:', err);
-      flashStatusHint('发送失败: ' + (err.message || '未知错误'));
-    } finally {
-      STATE.isGenerating = false;
-      refreshLatestMessage(false);
-      setTimeout(() => refreshLatestMessage(false), 300);
-      setTimeout(() => refreshLatestMessage(false), 800);
-      setTimeout(() => refreshLatestMessage(false), 1500);
+      if (STATE.generation !== attempt || getActiveChatId() !== attempt.chatId) return;
+      attempt.before = lastGenerationMessage();
+      if (typeof triggerSlash !== 'function') throw new Error('酒馆助手未提供生成接口');
+      await triggerSlash(command + ' await=true');
+      finishGeneration(attempt);
+    } catch (e) {
+      const last = lastGenerationMessage();
+      if (unsent && last.id > attempt.before.id && last.user && last.text === unsent) unsent = '';
+      console.warn('[ST-Thief-Book] 生成请求失败:', e);
+      finishGeneration(attempt, 'failed', unsent);
     }
   }
 
-  async function swipeMessage() {
-    if (STATE.isGenerating) return;
-    try {
-      flashStatusHint('正在重新生成 (Swipe)...');
-      STATE.isGenerating = true;
+  function submitReply(userInput) {
+    const text = typeof userInput === 'string' ? userInput.trim() : '';
+    if (text) return runGeneration('/trigger', text);
+  }
+
+  function swipeMessage() {
+    return runGeneration('/swipe');
+  }
+
+  function retryGeneration() {
+    const retry = STATE.generationRetry;
+    if (!retry || STATE.isGenerating) return;
+    const last = lastGenerationMessage();
+    if (getActiveChatId() !== retry.chatId || last.id !== retry.floor || last.text !== retry.text) {
+      STATE.generationRetry = null;
       syncToDesktop();
-      if (typeof triggerSlash === 'function') {
-        await triggerSlash('/swipe');
-      }
-    } catch (e) {
-      console.error('[ST-Thief-Book] Swipe 失败:', e);
-    } finally {
-      STATE.isGenerating = false;
-      refreshLatestMessage(false);
-      setTimeout(() => refreshLatestMessage(false), 300);
-      setTimeout(() => refreshLatestMessage(false), 800);
-      setTimeout(() => refreshLatestMessage(false), 1500);
+      return;
     }
+    return runGeneration(retry.command, retry.unsent);
   }
 
   function stopGeneration() {
@@ -763,9 +844,7 @@
       } else if (typeof triggerSlash === 'function') {
         triggerSlash('/stop');
       }
-      STATE.isGenerating = false;
-      flashStatusHint('已中止生成');
-      syncToDesktop();
+      if (STATE.generation) finishGeneration(STATE.generation, 'stopped');
     } catch (e) {
       console.warn('[ST-Thief-Book] 中止生成失败:', e);
     }
@@ -789,7 +868,7 @@
     CONFIG.filterMode = CONFIG.filterMode === 'pure' ? 'regex' : 'pure';
     saveCurrentConfig();
     flashStatusHint(`模式: ${CONFIG.filterMode === 'pure' ? '🧹 纯净小说(去HTML美化)' : '🎨 酒馆正则清洗'}`);
-    refreshLatestMessage(false);
+    refreshLatestMessage(true);
   }
 
   function escapeHtml(str) {
@@ -1158,9 +1237,6 @@
     const charModeHidden = CONFIG.charNameMode === 'hidden' ? 'selected' : '';
     const charModeFull = CONFIG.charNameMode === 'full' ? 'selected' : '';
 
-    const wrapModeWrap = CONFIG.wrapMode === 'wrap' ? 'selected' : '';
-    const wrapModeSingle = CONFIG.wrapMode === 'single' ? 'selected' : '';
-
     let deskStatusText = '未开启';
     let deskBtnStyle = 'background:#252526; color:#888888; border:1px solid #3c3c3c;';
     if (CONFIG.enableDesktopSync) {
@@ -1236,7 +1312,7 @@
           <div class="st-thief-section">
             <div class="st-thief-form-grid">
               <div class="st-thief-form-item">
-                <label for="setting-filtermode">阅读模式</label>
+                <label for="setting-filtermode">正文过滤</label>
                 <select id="setting-filtermode">
                   <option value="pure" ${filterModePure}>纯净小说模式 (过滤多余标签，短小精炼)</option>
                   <option value="regex" ${filterModeRegex}>酒馆正则清洗模式 (执行正则后清洗)</option>
@@ -1251,16 +1327,9 @@
                 </select>
               </div>
               <div class="st-thief-form-item">
-                <label for="setting-wrapmode">换行展示</label>
-                <select id="setting-wrapmode">
-                  <option value="wrap" ${wrapModeWrap}>自动折行全显 (完整展示长句)</option>
-                  <option value="single" ${wrapModeSingle}>单行截断</option>
-                </select>
-              </div>
-              <div class="st-thief-form-item">
                 <label for="setting-barwidth">摸鱼条长度</label>
                 <div style="display:flex; align-items:center; gap:6px; flex:1;">
-                  <input type="number" id="setting-barwidth" value="${barWidthVal}" min="360" max="2560" step="20" />
+                  <input type="number" id="setting-barwidth" value="${barWidthVal}" min="360" max="3840" step="1" />
                   <span style="font-size:11px; color:#888;">px</span>
                 </div>
               </div>
@@ -1336,7 +1405,7 @@
       e.stopPropagation();
     });
 
-    const parseTags = val => val.split(/[,，\n]/).map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, '')).filter(Boolean);
+    const parseTags = val => sanitizeTagList(val.split(/[,，\n]/));
 
     // 当前标签 chips 与 textarea 同步：点 × 移除，输入/快选/清空/重置后自动刷新
     function syncCurrentChips() {
@@ -1425,8 +1494,6 @@
       if (wlEnable) wlEnable.checked = true;
       const charMode = modal.querySelector('#setting-charmode');
       if (charMode) charMode.value = 'compact';
-      const wrapMode = modal.querySelector('#setting-wrapmode');
-      if (wrapMode) wrapMode.value = 'wrap';
       const minMode = modal.querySelector('#setting-minimal-mode');
       if (minMode) minMode.checked = false;
       const userMsg = modal.querySelector('#setting-show-user-messages');
@@ -1460,7 +1527,6 @@
       const blArea = modal.querySelector('#setting-blacklist');
       const wlEnable = modal.querySelector('#setting-enable-whitelist');
       const charMode = modal.querySelector('#setting-charmode');
-      const wrapMode = modal.querySelector('#setting-wrapmode');
       const minMode = modal.querySelector('#setting-minimal-mode');
       const userMsg = modal.querySelector('#setting-show-user-messages');
       const actions = modal.querySelector('#setting-filter-actions');
@@ -1471,30 +1537,21 @@
 
       if (wlEnable) CONFIG.enableWhitelist = wlEnable.checked;
       if (charMode) CONFIG.charNameMode = charMode.value;
-      if (wrapMode) CONFIG.wrapMode = wrapMode.value;
       if (minMode) CONFIG.minimalMode = minMode.checked;
       if (privacy) CONFIG.privacyMode = privacy.checked;
       if (userMsg) CONFIG.showUserMessages = userMsg.checked;
-      if (barW) {
-        const w = parseInt(barW.value, 10);
-        if (!isNaN(w) && w >= 360 && w <= 2560) {
-          CONFIG.barWidth = w;
-        }
+      if (barW && barW.value !== barW.defaultValue && isBarWidth(barW.valueAsNumber)) {
+        CONFIG.barWidth = barW.valueAsNumber;
+        CONFIG.barWidthPending = true;
       }
 
       if (wlArea) {
-        const list = wlArea.value
-          .split(/[,，\n]/)
-          .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-          .filter(Boolean);
+        const list = parseTags(wlArea.value);
         CONFIG.tagWhitelist = list.length > 0 ? list : [...DEFAULT_TAG_WHITELIST];
       }
 
       if (blArea) {
-        const list = blArea.value
-          .split(/[,，\n]/)
-          .map(s => s.trim().replace(/^[<\[]+|[>\]]+$/g, ''))
-          .filter(Boolean);
+        const list = parseTags(blArea.value);
         CONFIG.tagBlacklist = list.length > 0 ? list : [...DEFAULT_TAG_BLACKLIST];
       }
 
@@ -1521,8 +1578,7 @@
       saveCurrentConfig();
       closeSettingsModal();
       flashStatusHint('设置已保存并生效');
-      refreshLatestMessage(false);
-      syncToDesktop();
+      refreshLatestMessage(true);
     });
   }
 
@@ -1680,10 +1736,10 @@
     try {
       const wsUrl = `ws://127.0.0.1:${CONFIG.wsPort}`;
       const ws = new WebSocket(wsUrl);
+      STATE.wsClient = ws;
 
       ws.onopen = () => {
         STATE.wsConnecting = false;
-        STATE.wsClient = ws;
         STATE.wsAuthenticated = false;
         console.log('[ST-Thief-Book] 已连接桌面端，发送 hello 认证...');
         try {
@@ -1711,20 +1767,23 @@
           else if (data.action === 'prev') prevSentence();
           else if (data.action === 'boss') toggleBossKey();
           else if (data.action === 'swipe') swipeMessage();
+          else if (data.action === 'retry_generation') retryGeneration();
           else if (data.action === 'stop') stopGeneration();
           else if (data.action === 'reply') submitReply(data.text);
           else if (data.action === 'open_settings') openSettingsModal();
           else if (data.action === 'jump_floor') jumpToMessageFloor(data.floor);
-          else if (data.action === 'resume') jumpToMessageFloor(data.floor, data.curIdx);
-          else if (data.action === 'change_floor') changeMessageFloor(data.delta || 1);
+          else if (data.action === 'resume') restoreDesktopPosition(data);
+          else if (data.action === 'change_floor') changeMessageFloor(data.delta, data.fromFloor, data.floorRequest, data.quiet);
           else if (data.action === 'toggle_user_messages') toggleShowUserMessages();
           else if (data.action === 'toggle_char_mode') toggleCharNameMode();
           else if (data.action === 'toggle_wrap_mode') toggleWrapMode();
           else if (data.action === 'toggle_minimal_mode') toggleMinimalMode(data.minimalMode);
           else if (data.action === 'toggle_layout_mode') toggleLayoutMode();
-          else if (data.action === 'set_window_width' && typeof data.barWidth === 'number') {
-            CONFIG.barWidth = data.barWidth;
-            saveCurrentConfig();
+          else if (data.action === 'set_window_width' && isBarWidth(data.barWidth)) {
+            if (!CONFIG.barWidthPending && CONFIG.barWidth !== data.barWidth) {
+              CONFIG.barWidth = data.barWidth;
+              saveCurrentConfig();
+            }
           }
           else if (data.action === 'update_config' && data.config) {
             if (typeof data.config.showUserMessages === 'boolean') CONFIG.showUserMessages = data.config.showUserMessages;
@@ -1741,9 +1800,8 @@
             if (typeof data.config.privacyMode === 'boolean') CONFIG.privacyMode = data.config.privacyMode;
             if (CONFIG_ENUMS.layoutMode.includes(data.config.layoutMode)) CONFIG.layoutMode = data.config.layoutMode;
             if (typeof data.config.opacity === 'number') CONFIG.opacity = Math.max(0.15, Math.min(1, data.config.opacity));
-            if (typeof data.config.barWidth === 'number') CONFIG.barWidth = Math.max(360, Math.min(2560, data.config.barWidth));
             saveCurrentConfig();
-            refreshLatestMessage(false);
+            refreshLatestMessage(true);
           }
         } catch (err) {
           console.warn('[ST-Thief-Book] 处理桌面端消息错误:', err);
@@ -1751,6 +1809,7 @@
       };
 
       ws.onclose = () => {
+        if (STATE.wsClient !== ws) return;
         STATE.wsClient = null;
         STATE.wsConnecting = false;
         STATE.wsAuthenticated = false;
@@ -1767,8 +1826,7 @@
       };
 
       ws.onerror = () => {
-        STATE.wsClient = null;
-        STATE.wsConnecting = false;
+        if (STATE.wsClient !== ws) return;
         STATE.wsAuthenticated = false;
         if (isManual) {
           flashStatusHint('⚠️ 桌面端未开启，请先运行 start_desktop.bat');
@@ -1781,10 +1839,15 @@
     }
   }
 
-  function syncToDesktop() {
+  function syncToDesktop(pageEdge, floorRequest = null, resumeFloor = null) {
     if (!CONFIG.enableDesktopSync || !STATE.wsAuthenticated || !STATE.wsClient || STATE.wsClient.readyState !== WebSocket.OPEN) return;
 
     try {
+      if (CONFIG.barWidthPending) {
+        STATE.wsClient.send(JSON.stringify({ action: 'set_window_width', barWidth: CONFIG.barWidth }));
+        CONFIG.barWidthPending = false;
+        saveCurrentConfig();
+      }
       const payload = {
         type: 'sync',
         charName: STATE.characterName,
@@ -1796,10 +1859,19 @@
         // 整条消息连成一段：桌面端据此整段分屏（不再按标点一句一翻）
         fullText: STATE.sentences.join(''),
         // 当前句在整段里的字符偏移，供桌面端"跳句"定位
-        sentenceOffset: STATE.sentences.slice(0, STATE.currentSentenceIndex).join('').length,
+        sentenceOffset: Array.from(STATE.sentences.slice(0, STATE.currentSentenceIndex).join('')).length,
+        pageEdge,
+        floorRequest,
+        resumeFloor,
+        chatId: STATE.chatId,
         isBossKey: STATE.isBossKey,
         isGenerating: STATE.isGenerating,
-        barWidth: CONFIG.barWidth,
+        generationId: STATE.generationId,
+        generationStatus: STATE.generationStatus,
+        canRetryGeneration: STATE.generationRetry !== null,
+        replyChoices: STATE.replyChoices,
+        // 兼容仍用此字段控制末屏跟随的桌面版本。
+        followGenerating: false,
         config: {
           showUserMessages: CONFIG.showUserMessages,
           enableWhitelist: CONFIG.enableWhitelist,
@@ -1812,8 +1884,7 @@
           minimalMode: CONFIG.minimalMode,
           privacyMode: CONFIG.privacyMode,
           layoutMode: CONFIG.layoutMode,
-          opacity: CONFIG.opacity,
-          barWidth: CONFIG.barWidth
+          opacity: CONFIG.opacity
         }
       };
       STATE.wsClient.send(JSON.stringify(payload));
@@ -1830,70 +1901,85 @@
     }
 
     if (typeof tavern_events !== 'undefined' && typeof eventOn === 'function') {
-      eventOn(tavern_events.MESSAGE_RECEIVED, () => {
-        STATE.isGenerating = false;
-        refreshLatestMessage(false);
-      });
+      eventOn(tavern_events.MESSAGE_RECEIVED, refreshFollowingMessage);
 
-      eventOn(tavern_events.MESSAGE_UPDATED, () => {
-        refreshLatestMessage(false);
+      eventOn(tavern_events.MESSAGE_UPDATED, messageId => {
+        if (messageId === undefined || messageId === STATE.currentMsgId) refreshLatestMessage(true);
       });
 
       eventOn(tavern_events.CHAT_CHANGED, () => {
-        STATE.currentSentenceIndex = 0;
-        refreshLatestMessage(false);
+        const chatId = getActiveChatId();
+        if (chatId !== null && chatId === STATE.chatId) {
+          // 重载同一会话时，酒馆可能先清空楼层再填回，等数据回来再同步。
+          if (typeof getLastMessageId !== 'function' || getLastMessageId() >= 0) refreshFollowingMessage();
+        } else {
+          refreshLatestMessage(false, true);
+        }
       });
 
-      eventOn(tavern_events.GENERATION_STARTED, () => {
-        STATE.isGenerating = true;
-        syncToDesktop();
+      if (tavern_events.MESSAGE_DELETED) {
+        eventOn(tavern_events.MESSAGE_DELETED, refreshFollowingMessage);
+      }
+
+      eventOn(tavern_events.GENERATION_STARTED, (type, _options, dryRun) => {
+        if (dryRun || type === 'quiet' || type === 'impersonate') return;
+        if (!STATE.generation) beginGeneration(type === 'regenerate' || type === 'swipe' || type === 'continue'
+          ? '/regenerate' : '/trigger', false);
       });
 
       eventOn(tavern_events.GENERATION_ENDED, () => {
-        STATE.isGenerating = false;
-        refreshLatestMessage(false);
+        const attempt = STATE.generation;
+        if (!attempt) return;
+        attempt.streamFailed ||= generationStreamFailed(attempt);
+        if (!attempt.managed) setTimeout(() => finishGeneration(attempt), 0);
       });
 
+      if (tavern_events.GENERATION_STOPPED) {
+        eventOn(tavern_events.GENERATION_STOPPED, () => {
+          if (STATE.generation) finishGeneration(STATE.generation, 'stopped');
+        });
+      }
+
       if (tavern_events.CHARACTER_MESSAGE_RENDERED) {
-        eventOn(tavern_events.CHARACTER_MESSAGE_RENDERED, () => {
-          STATE.isGenerating = false;
-          refreshLatestMessage(false);
+        eventOn(tavern_events.CHARACTER_MESSAGE_RENDERED, messageId => {
+          if (STATE.followLatest || messageId === STATE.currentMsgId) refreshFollowingMessage();
         });
       }
 
       if (tavern_events.USER_MESSAGE_RENDERED) {
         eventOn(tavern_events.USER_MESSAGE_RENDERED, () => {
-          refreshLatestMessage(false);
+          if (STATE.followLatest) refreshFollowingMessage();
         });
       }
 
       if (tavern_events.MESSAGE_SWIPED) {
-        eventOn(tavern_events.MESSAGE_SWIPED, () => {
-          refreshLatestMessage(false);
+        eventOn(tavern_events.MESSAGE_SWIPED, messageId => {
+          if (messageId === undefined || messageId === STATE.currentMsgId) refreshLatestMessage(true);
         });
       }
 
       if (tavern_events.STREAM_TOKEN_RECEIVED) {
         //  trailing-edge 节流：token 高频到达时最多每 150ms 全量刷新一次，GENERATION_ENDED 会兜底最终态
         eventOn(tavern_events.STREAM_TOKEN_RECEIVED, () => {
-          if (STATE.streamRenderTimer) return;
+          if (STATE.streamRenderTimer || !STATE.isGenerating || !STATE.followLatest) return;
           STATE.streamRenderTimer = setTimeout(() => {
             STATE.streamRenderTimer = null;
+            if (!STATE.isGenerating || !STATE.followLatest) return;
             try {
               const lastId = typeof getLastMessageId === 'function' ? getLastMessageId() : -1;
               if (lastId >= 0) {
                 const msgs = getChatMessages(lastId);
-                if (msgs && msgs[0]) {
+                if (msgs?.[0] && msgs[0].role !== 'user' && !msgs[0].is_user) {
+                  const firstPage = STATE.currentMsgId !== lastId;
+                  STATE.replyChoices = [];
                   STATE.currentMsgId = lastId;
+                  STATE.characterName = msgs[0].name || (typeof SillyTavern !== 'undefined' ? SillyTavern.name2 : 'AI');
                   const raw = msgs[0].message || '';
                   const clean = filterThinkingAndTags(raw, lastId);
-                  if (!clean) {
-                    STATE.sentences = ['(AI 正在思考中，思考完成后将自动切入小说正文...)'];
-                    STATE.currentSentenceIndex = 0;
-                  } else {
-                    STATE.sentences = splitIntoSentences(clean);
-                  }
-                  syncToDesktop();
+                  STATE.sentences = clean ? splitIntoSentences(clean) : ['(AI 正在思考中，思考完成后将自动切入小说正文...)'];
+                  STATE.currentSentenceIndex = firstPage ? 0
+                    : Math.min(STATE.currentSentenceIndex, STATE.sentences.length - 1);
+                  syncToDesktop(firstPage ? 'first' : undefined);
                 }
               }
             } catch (e) {}

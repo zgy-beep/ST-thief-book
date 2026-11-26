@@ -7,6 +7,7 @@ import os
 import socket
 import struct
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -15,10 +16,19 @@ from thief_desktop_bar import SimpleWebSocketServer
 PORT = 18999
 TOKEN = 'test-token-abc123'
 received = []
+SERVER = None
+BOSS = {'on': False}
 
 
 def on_message(text):
     received.append(text)
+    try:
+        if json.loads(text).get('action') == 'toggle_boss':
+            # 模拟摸鱼条 _apply_ws_message 的行为：翻转后广播 boss，托盘客户端靠这条回执确认
+            BOSS['on'] = not BOSS['on']
+            SERVER and SERVER.broadcast({'action': 'boss'})
+    except Exception:
+        pass
 
 
 def ws_connect(origin=None, path='/'):
@@ -82,7 +92,9 @@ def closed(s):
 
 
 def main():
+    global SERVER
     server = SimpleWebSocketServer('127.0.0.1', PORT, on_message, token=TOKEN)
+    SERVER = server
     server.start()
     time.sleep(0.3)
     passed = 0
@@ -96,7 +108,7 @@ def main():
     # 2. 未认证：broadcast 不送达；非 hello 首消息视为协议违规 → hello_fail 断开
     s, ok = ws_connect(origin='http://localhost:8000')
     assert ok, "本地 Origin 应放行"
-    server.broadcast({'action': 'next'})
+    assert not server.broadcast({'action': 'next'})
     s.settimeout(0.5)
     try:
         leaked = s.recv(1)
@@ -128,7 +140,7 @@ def main():
     ws_send_text(s, json.dumps({'type': 'sync', 'currentSentence': '正文'}))
     time.sleep(0.3)
     assert received and json.loads(received[-1])['currentSentence'] == '正文'
-    server.broadcast({'action': 'next'})
+    assert server.broadcast({'action': 'next'})
     assert json.loads(ws_recv_text(s)).get('action') == 'next'
     s.close(); passed += 1
     print("[PASS] 正确 token 认证 + sync 回调 + 认证后广播")
@@ -149,6 +161,31 @@ def main():
     assert closed(s), "超长握手应断开"
     s.close(); passed += 1
     print("[PASS] 超长握手断开")
+
+    # 7. 全局老板键通道：托盘助手的 WS 客户端（掩码帧 + hello + toggle_boss + 等回执）
+    import bar_hotkey_helper as bh
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'thief_bar_bridge.token'), 'w', encoding='utf-8') as f:
+            f.write(TOKEN)
+        old_port, old_dir = bh.WS_PORT, bh.APP_DIR
+        bh.WS_PORT, bh.APP_DIR = PORT, td
+        try:
+            assert bh.send_boss(verbose=False) == 0, "老板键指令应发送成功"
+            assert BOSS['on'] is True, "服务端应收到 toggle_boss"
+            assert any('toggle_boss' in t for t in received)
+            assert bh.send_boss(verbose=False) == 0
+            assert BOSS['on'] is False, "再按一次应退回原来的状态"
+
+            # 密钥不对：握手后 hello 失败，必须报错而不是静默成功
+            with open(os.path.join(td, 'thief_bar_bridge.token'), 'w', encoding='utf-8') as f:
+                f.write('wrong-token')
+            assert bh.send_boss(verbose=False) == 1, "密钥错误应失败"
+            os.remove(os.path.join(td, 'thief_bar_bridge.token'))
+            assert bh.send_boss(verbose=False) == 1, "没有密钥应失败"
+        finally:
+            bh.WS_PORT, bh.APP_DIR = old_port, old_dir
+    passed += 1
+    print("[PASS] 全局老板键 WS 通道")
 
     server.running = False
     print(f"\n全部 {passed} 项测试通过")
