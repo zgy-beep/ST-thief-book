@@ -145,7 +145,8 @@
 | **`st-thief-book.js`** | **Web 桥接后端源码**：消息监听、黑白名单过滤引擎、整段分句状态机、WebSocket 同步与 ⚙️ 设置面板 |
 | **`thief_desktop_bar.py`** | **桌面端唯一阅读 UI**：轻量、无外部依赖的置顶透明状态栏，整段分屏/自动阅读/贴边隐藏/位置记忆/老板键 |
 | **`start_desktop.bat`** | **Windows 便捷启动脚本**：双击即可启动 Python 桌面端客户端 |
-| **`thief_bar_config.json`** | **桌面端本地配置文件**：保存窗口尺寸、透明度、主题（`bossStyle`）、字号、自动阅读及过滤配置项 |
+| **`thief_bar_config.example.json`** | **配置模板（可选项参考）**：窗口尺寸、透明度、主题（`bossStyle`）、字号、自动阅读、过滤规则等全部字段的默认值 |
+| **`thief_bar_config.json`** | **桌面端本地配置（运行时自动生成，已 gitignore，不进版本库）**：改设置即写回；不存在时用代码内默认值启动 |
 | **`thief_bar_bridge.token`** | 桥接密钥（运行时自动生成，独立存放，不进版本库） |
 | **`thief_bar_position.json`** | 阅读位置记忆（运行时自动落盘，不进版本库） |
 | **`thief_bar_window_position.json`** | 桌面窗口坐标（本机运行数据） |
